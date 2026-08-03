@@ -1,7 +1,7 @@
 import discord
 import os
 import gspread
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncio
@@ -34,31 +34,25 @@ VACATION_EXCEPTIONS = {
 NICKNAME_COLUMN = 'Discord клана (с клантегом)'
 SHEET_NAME = 'Таблица, где можно менять всё и вносить правки'
 
-# Columns to check and their error values
+# Columns to check and their error values (ТОЛЬКО КРИТИЧЕСКИЕ / КРАСНЫЕ)
 CHECKS = {
     'discord_echo': {
         'column': 'Discord ECHO (с клантегом)',
         'bad_values': ['Не указан', 'Не вступил'],
-        'action': 'указать правильный позывной с клантегом и без правила в Discord-сервере ECHO',
+        'action': 'указать правильный позывной с клантегом в Discord-сервере ECHO',
         'severity': 'red'
     },
     'discord_as_vdv': {
         'column': 'Discord AS VDV (с клантегом)',
         'bad_values': ['Не указан', 'Не вступил'],
-        'action': 'указать правильный позывной с клантегом и без правила в Discord-сервере AS VDV',
+        'action': 'указать правильный позывной с клантегом в Discord-сервере AS VDV',
         'severity': 'red'
     },
     'discord_tt': {
         'column': 'Discord TT (с клантегом)',
         'bad_values': ['Не указан', 'Не вступил'],
-        'action': 'указать правильный позывной с клантегом и без правила в Discord-сервере TT',
+        'action': 'указать правильный позывной с клантегом в Discord-сервере TT',
         'severity': 'red'
-    },
-    'steam_with_tag': {
-        'column': 'Steam (с клантегом)',
-        'bad_values': ['Неизвестен'],
-        'action': 'сообщить свой Steam профиль',
-        'severity': 'yellow'
     },
     'steam_bourbon_friend': {
         'column': 'Steam (в друзьях у Бурбона?)',
@@ -151,7 +145,7 @@ async def check_spreadsheet():
         spreadsheet = gc.open_by_url(SPREADSHEET_URL)
         sheet = spreadsheet.worksheet(SHEET_NAME)
         
-        # !!! ИЗМЕНЕНИЕ ЗДЕСЬ: Получаем данные строго с A1 по J28 !!!
+        # Получаем данные строго с A1 по J28
         data = sheet.get('A1:J28')
         
         if not data or len(data) < 2:
@@ -163,10 +157,9 @@ async def check_spreadsheet():
         # Остальные строки (индексы 1 и далее, то есть строки 2-28) - это данные
         rows = data[1:]
         
-        # Преобразуем список списков в список словарей (чтобы работать как с get_all_records)
+        # Преобразуем список списков в список словарей
         records = []
         for row in rows:
-            # Дополняем пустыми строками, если в ряду меньше элементов, чем заголовков
             padded_row = row + [''] * (len(headers) - len(row))
             record_dict = {headers[i]: padded_row[i] for i in range(len(headers))}
             records.append(record_dict)
@@ -229,9 +222,9 @@ async def check_spreadsheet():
 async def send_notification(thread, user_issues, users_not_found, current_time):
     """Формирует и отправляет сообщение с уведомлениями"""
     
+    # Оставили только 'red', так как 'yellow' больше не используется
     issues_by_type = {
-        'red': [],
-        'yellow': []
+        'red': []
     }
     
     for user, issues in user_issues.items():
@@ -244,9 +237,10 @@ async def send_notification(thread, user_issues, users_not_found, current_time):
     message_parts = []
     
     message_parts.append("🔔 **Проверяющий бот клана** 🔔\n\n")
-    message_parts.append("Это автоматическая проверка таблицы клана.\n")
-    message_parts.append("🔴 **Красные** проблемы — критические, требуют немедленного исправления\n")
-    message_parts.append("🟡 **Желтые** проблемы — менее важные, но просим исправить своевременно\n")
+    message_parts.append("Это автоматическая проверка клана — всех, кто не в отпуске. [Полная таблица с проблемами](https://enemygaming.netlify.app/temptable) — обновляется ежедневно.\n")
+    message_parts.append("Если вы исправили какую-либо проблему, поставьте лайк как реакцию на это сообщение\n")
+    message_parts.append("🔴 **Красные** проблемы — критические, требуют немедленного исправления. Бот проверяет только их\n")
+    message_parts.append("🟡 **Желтые** проблемы — менее важные, но тоже требуют своевременного исправления. Бот их не проверяет - опирайтесь на таблицу выше\n")
     message_parts.append(f"📅 Проверка от {current_time.strftime('%d.%m.%Y %H:%M')} МСК\n")
     message_parts.append("─" * 50 + "\n\n")
     
@@ -261,22 +255,6 @@ async def send_notification(thread, user_issues, users_not_found, current_time):
             red_issues_grouped[action].append(item['user'])
         
         for action, users in red_issues_grouped.items():
-            message_parts.append(f"**Нужно: {action}**\n")
-            user_mentions = [user.mention for user in users]
-            message_parts.append(", ".join(user_mentions))
-            message_parts.append("\n\n")
-    
-    if issues_by_type['yellow']:
-        message_parts.append("🟡 **МЕНЕЕ ВАЖНЫЕ ПРОБЛЕМЫ** 🟡\n\n")
-        
-        yellow_issues_grouped = {}
-        for item in issues_by_type['yellow']:
-            action = item['issue']['action']
-            if action not in yellow_issues_grouped:
-                yellow_issues_grouped[action] = []
-            yellow_issues_grouped[action].append(item['user'])
-        
-        for action, users in yellow_issues_grouped.items():
             message_parts.append(f"**Нужно: {action}**\n")
             user_mentions = [user.mention for user in users]
             message_parts.append(", ".join(user_mentions))
