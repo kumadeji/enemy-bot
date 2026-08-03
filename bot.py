@@ -32,7 +32,7 @@ VACATION_EXCEPTIONS = {
 
 # Column names
 NICKNAME_COLUMN = 'Discord клана (с клантегом)'
-SHEET_NAME = 'Таблица, где можно менять всё и вносить правки'
+SHEET_NAME = 'Основная таблица'
 
 # Columns to check and their error values (ТОЛЬКО КРИТИЧЕСКИЕ / КРАСНЫЕ)
 CHECKS = {
