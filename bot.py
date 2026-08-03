@@ -105,12 +105,22 @@ except Exception as e:
 # ============== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==============
 
 def is_on_vacation(nickname: str, current_date: datetime) -> bool:
-    """Проверяет, находится ли пользователь в отпуске"""
-    if nickname in VACATION_EXCEPTIONS:
-        start_date, end_date = VACATION_EXCEPTIONS[nickname]
-        current_date_only = current_date.date()
-        if start_date.date() <= current_date_only <= end_date.date():
-            return True
+    """Проверяет, находится ли пользователь в отпуске (с защитой от пробелов и регистра)"""
+    # Очищаем ник из таблицы от пробелов и приводим к нижнему регистру
+    clean_nickname = nickname.strip().lower()
+    current_date_only = current_date.date()
+    
+    for vac_name, (start_date, end_date) in VACATION_EXCEPTIONS.items():
+        # Сравниваем очищенные строки
+        if clean_nickname == vac_name.strip().lower():
+            if start_date.date() <= current_date_only <= end_date.date():
+                print(f"✅ {nickname} в отпуске (до {end_date.strftime('%d.%m.%Y')}), пропускаем.")
+                return True
+            
+    # Если ник не найден в списке отпусков, выводим это в консоль для проверки
+    if nickname.strip(): # чтобы не спамить для пустых строк
+        print(f"⚠️ Ник '{nickname}' не найден в списке отпусков или даты не подходят.")
+        
     return False
 
 async def find_discord_user(nickname: str, thread):
