@@ -237,7 +237,7 @@ async def send_notification(thread, user_issues, users_not_found, current_time):
     message_parts = []
     
     message_parts.append("🔔 **Проверяющий бот клана** 🔔\n\n")
-    message_parts.append("Это автоматическая проверка клана — всех, кто не в отпуске. [Полная таблица с проблемами](https://enemygaming.netlify.app/temptable) — обновляется ежедневно.\n")
+    message_parts.append("Это автоматическая проверка клана — всех, кто не в отпуске. [Полная таблица с проблемами](<https://enemygaming.netlify.app/temptable>) — обновляется ежедневно.\n")
     message_parts.append("Если вы исправили какую-либо проблему, поставьте лайк как реакцию на это сообщение\n")
     message_parts.append("🔴 **Красные** проблемы — критические, требуют немедленного исправления. Бот проверяет только их\n")
     message_parts.append("🟡 **Желтые** проблемы — менее важные, но тоже требуют своевременного исправления. Бот их не проверяет - опирайтесь на таблицу выше\n")
