@@ -22,12 +22,12 @@ MSK = pytz.timezone('Europe/Moscow')
 
 # Vacation exceptions (отпуска)
 VACATION_EXCEPTIONS = {
-    '@[En-Y]Mr.GreyGoose': (datetime(2026, 8, 4), datetime(2026, 8, 10)),
-    '@[En-Y]Bercekle': (datetime(2026, 7, 26), datetime(2026, 8, 26)),
-    '@[En-Y]Slay': (datetime(2026, 7, 27), datetime(2026, 8, 27)),
-    '@[En-Y]Killa': (datetime(2026, 7, 23), datetime(2026, 8, 23)),
-    '@[En-Y]v1c': (datetime(2026, 7, 23), datetime(2026, 8, 23)),
-    '@[En-Y]Russo': (datetime(2026, 7, 30), datetime(2026, 8, 10)),
+    '[En-Y]Mr.GreyGoose': (datetime(2026, 8, 4), datetime(2026, 8, 10)),
+    '[En-Y]Bercekle': (datetime(2026, 7, 26), datetime(2026, 8, 26)),
+    '[En-Y]Slay': (datetime(2026, 7, 27), datetime(2026, 8, 27)),
+    '[En-Y]Killa': (datetime(2026, 7, 23), datetime(2026, 8, 23)),
+    '[En-Y]v1c': (datetime(2026, 7, 23), datetime(2026, 8, 23)),
+    '[En-Y]Russo': (datetime(2026, 7, 30), datetime(2026, 8, 10)),
 }
 
 # Column names
@@ -247,7 +247,7 @@ async def send_notification(thread, user_issues, users_not_found, current_time):
     message_parts = []
     
     message_parts.append("🔔 **Проверяющий бот клана** 🔔\n\n")
-    message_parts.append("Это автоматическая проверка клана — всех, кто не в отпуске. [Полная таблица с проблемами](<https://enemygaming.netlify.app/temptable>) — обновляется ежедневно.\n")
+    message_parts.append("Это автоматическая проверка клана по таблице — всех, кто не в отпуске. **[Полная таблица](<https://enemygaming.netlify.app/temptable>)** — обновляется ежедневно.\n")
     message_parts.append("Если вы исправили какую-либо проблему, поставьте лайк как реакцию на это сообщение\n")
     message_parts.append("🔴 **Красные** проблемы — критические, требуют немедленного исправления. Бот проверяет только их\n")
     message_parts.append("🟡 **Желтые** проблемы — менее важные, но тоже требуют своевременного исправления. Бот их не проверяет - опирайтесь на таблицу выше\n")
