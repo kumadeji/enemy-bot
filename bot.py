@@ -1098,7 +1098,7 @@ async def handle_vacation_request(interaction: discord.Interaction, nickname: st
         
         embed = discord.Embed(
             title=es("🏖️ Отпуск требует утверждения"),
-            description=f"**{nickname}** запросил(а) отпуск",
+            description=f"**{nickname}** запросил отпуск",
             color=discord.Color.orange()
         )
         embed.add_field(name=es("📅 Период"), value=f"{start_str} - {end_str} ({duration} дней)", inline=True)
