@@ -5,7 +5,9 @@ import signal
 import atexit
 import gspread
 import re
-from datetime import datetime
+import json
+import uuid
+from datetime import datetime, timedelta
 from collections import deque
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -118,6 +120,24 @@ COLUMNS_TO_CHECK = [
 
 EXPECTED_INTRO_MAX_LEN = 700
 
+# ============== НОВЫЕ НАСТРОЙКИ ДЛЯ МЕРОПРИЯТИЙ ==============
+
+EVENTS_CHANNEL_ID = 1311705378140196926
+VACATION_CHANNEL_ID = 1284905224099598407
+ADMIN_CHANNEL_ID = 1470352063824265279
+
+CLAN_MEMBERS = [
+    "[En-Y]COKOJl", "[En-Y]Killa", "[En-Y]SIR", "[En-Y]Russo", "[En-Y]v1c",
+    "[En-Y]Bercekle", "[En-Y]BURBON", "[En-Y]Sterben", "[En-Y]Bushwacker",
+    "[En-Y]Prof. Kruglov", "[En-Y]Boba", "[En-Y]RainStars", "[En-Y]GDim",
+    "[En-Y]Sliva88", "[En-Y]Mr.GreyGoose", "[En-Y]Libertad", "[En-Y]Komarant",
+    "[En-Y]STARICHOK", "[En-Y]Sasce2044", "[En-Y]Metalist08", "[En-Y]Slay",
+    "[En-Y]Vampire", "[En-Y]MAKER", "[En-Y]GhostCTPAX"
+]
+
+EVENTS_FILE = 'events_data.json'
+VACATIONS_FILE = 'vacations.json'
+
 # ============== ИНИЦИАЛИЗАЦИЯ ==============
 
 intents = discord.Intents.default()
@@ -131,7 +151,8 @@ check_lock = asyncio.Lock()
 
 
 class MessageDeduplicator:
-    """Защита от повторной обработки одного и того же события on_message."""
+    """Защита от повторной обработки одного и того же события on_message
+    (например, при реконнекте gateway)."""
 
     def __init__(self, maxlen=500):
         self._order = deque(maxlen=maxlen)
@@ -291,6 +312,7 @@ async def send_chunked(thread, text, user_name=""):
 # ============== ПОСТРОЕНИЕ ТЕКСТОВ СООБЩЕНИЙ ==============
 
 def build_intro_lines(current_time: datetime) -> list:
+    """Возвращает список строк вводного сообщения."""
     return [
         "🔔 **Проверяющий бот клана** 🔔",
         "",
@@ -311,6 +333,7 @@ def build_intro_message(current_time: datetime) -> str:
 
 
 def build_user_message(discord_user, issues: list) -> str:
+    """Группирует проблемы пользователя по критичности и формирует текст."""
     red_issues = [i for i in issues if i['severity'] == 'red']
     yellow_issues = [i for i in issues if i['severity'] == 'yellow']
 
@@ -447,78 +470,538 @@ async def check_spreadsheet():
             except Exception:
                 pass
 
-# ============== ЭКСПЕРИМЕНТАЛЬНЫЙ ФУНКЦИОНАЛ ==============
+# ============== НОВЫЙ ФУНКЦИОНАЛ: МЕРОПРИЯТИЯ И ОТПУСКА ==============
 
-async def reproduce_message_test():
-    """Достаёт сообщение 1536366053737889813, выводит его содержание и отправляет копию в тестовую ветку."""
-    print("🧪 Экспериментальный функционал: воспроизведение сообщения 1536366053737889813")
+def load_json(filename, default=None):
+    """Загружает данные из JSON файла"""
+    if default is None:
+        default = {}
+    if not os.path.exists(filename):
+        return default
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Ошибка загрузки {filename}: {e}")
+        return default
+
+
+def save_json(filename, data):
+    """Сохраняет данные в JSON файл"""
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Ошибка сохранения {filename}: {e}")
+
+
+def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
+    """Проверяет отпуск: сначала hardcoded, потом динамические из JSON"""
+    # Сначала проверяем hardcoded отпуска
+    if is_on_vacation(nickname, current_date):
+        return True
+    
+    # Потом проверяем динамические отпуска
+    vacations = load_json(VACATIONS_FILE, {})
+    clean_nickname = nickname.strip().lower()
+    current_date_only = current_date.date()
+    
+    for vac_name, dates in vacations.items():
+        if clean_nickname == vac_name.strip().lower():
+            try:
+                start = datetime.fromisoformat(dates['start']).date()
+                end = datetime.fromisoformat(dates['end']).date()
+                if start <= current_date_only <= end:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def get_active_members(current_date: datetime) -> list:
+    """Возвращает список игроков клана, которые НЕ в отпуске"""
+    return [m for m in CLAN_MEMBERS if not is_on_vacation_dynamic(m, current_date)]
+
+
+# ============== UI КОМПОНЕНТЫ ДЛЯ МЕРОПРИЯТИЙ ==============
+
+class EventView(discord.ui.View):
+    """View с кнопками для отметки на мероприятие"""
+    def __init__(self, event_id: str):
+        super().__init__(timeout=None)
+        self.event_id = event_id
+    
+    @discord.ui.button(label="✅ Приду", style=discord.ButtonStyle.success, custom_id="event_accept")
+    async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_event_response(interaction, self.event_id, "accept")
+    
+    @discord.ui.button(label="❌ Не приду", style=discord.ButtonStyle.danger, custom_id="event_decline")
+    async def decline_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await handle_event_response(interaction, self.event_id, "decline")
+
+
+class AdminEventView(discord.ui.View):
+    """View с кнопками для админ-управления мероприятием"""
+    def __init__(self, event_id: str):
+        super().__init__(timeout=None)
+        self.event_id = event_id
+    
+    @discord.ui.button(label="🔄 Обновить список", style=discord.ButtonStyle.primary, custom_id="event_refresh")
+    async def refresh_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != ALLOWED_USER_ID:
+            await interaction.response.send_message("⛔ Только админ может обновлять!", ephemeral=True)
+            return
+        await refresh_event_message(interaction, self.event_id)
+    
+    @discord.ui.button(label="❌ Отменить мероприятие", style=discord.ButtonStyle.danger, custom_id="event_cancel")
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != ALLOWED_USER_ID:
+            await interaction.response.send_message("⛔ Только админ может отменять!", ephemeral=True)
+            return
+        await cancel_event(interaction, self.event_id)
+
+
+class VacationModal(discord.ui.Modal, title="🏖️ Оформление отпуска"):
+    """Модальное окно для оформления отпуска"""
+    start_date = discord.ui.TextInput(
+        label="Дата начала (ДД.ММ.ГГГГ)",
+        placeholder="15.08.2026",
+        required=True
+    )
+    end_date = discord.ui.TextInput(
+        label="Дата окончания (ДД.ММ.ГГГГ)",
+        placeholder="22.08.2026",
+        required=True
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        await handle_vacation_request(interaction, self.start_date.value, self.end_date.value)
+
+
+class VacationRequestView(discord.ui.View):
+    """View с кнопкой для оформления отпуска"""
+    def __init__(self):
+        super().__init__(timeout=None)
+    
+    @discord.ui.button(label="🏖️ Оформить отпуск", style=discord.ButtonStyle.primary, custom_id="vacation_request")
+    async def vacation_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        modal = VacationModal()
+        await interaction.response.send_modal(modal)
+
+
+# ============== ФУНКЦИИ УПРАВЛЕНИЯ МЕРОПРИЯТИЯМИ ==============
+
+async def handle_event_response(interaction: discord.Interaction, event_id: str, response_type: str):
+    """Обрабатывает нажатие кнопки ✅ или ❌"""
+    events = load_json(EVENTS_FILE, {})
+    if event_id not in events:
+        await interaction.response.send_message("❌ Мероприятие не найдено!", ephemeral=True)
+        return
+    
+    event = events[event_id]
+    nickname = interaction.user.display_name
+    current_date = datetime.now(MSK)
+    
+    # Проверка отпуска
+    if is_on_vacation_dynamic(nickname, current_date):
+        await interaction.response.send_message(
+            "🏖️ Вы сейчас в отпуске и не можете отмечаться на мероприятия!",
+            ephemeral=True
+        )
+        return
+    
+    # Обновление отметок
+    if response_type == "accept":
+        event['accepted'][nickname] = True
+        event['declined'].pop(nickname, None)
+        await interaction.response.send_message("✅ Вы записаны на мероприятие!", ephemeral=True)
+    else:
+        event['declined'][nickname] = True
+        event['accepted'].pop(nickname, None)
+        await interaction.response.send_message("❌ Вы отказались от участия!", ephemeral=True)
+    
+    save_json(EVENTS_FILE, events)
+    
+    # Обновляем сообщение
+    try:
+        channel = await client.fetch_channel(event['channel_id'])
+        message = await channel.fetch_message(event['message_id'])
+        embed = build_event_embed(event_id)
+        await message.edit(embed=embed)
+    except Exception as e:
+        print(f"Ошибка обновления сообщения: {e}")
+
+
+async def refresh_event_message(interaction: discord.Interaction, event_id: str):
+    """Обновляет сообщение мероприятия (пересчитывает списки)"""
+    events = load_json(EVENTS_FILE, {})
+    if event_id not in events:
+        await interaction.response.send_message("❌ Мероприятие не найдено!", ephemeral=True)
+        return
+    
+    event = events[event_id]
     
     try:
-        # Получаем гильдию через основную ветку
-        main_thread = await client.fetch_channel(THREAD_ID)
-        guild = main_thread.guild
-        
-        source_message = None
-        
-        # Ищем во всех каналах и потоках
-        channels_to_search = list(guild.channels) + list(guild.threads)
-        
-        for channel in channels_to_search:
-            if hasattr(channel, 'fetch_message'):
-                try:
-                    msg = await channel.fetch_message(1536366053737889813)
-                    source_message = msg
-                    print(f"✅ Сообщение найдено в канале: {channel.name} (ID: {channel.id})")
-                    break
-                except discord.NotFound:
-                    continue
-                except discord.Forbidden:
-                    continue
-                except Exception:
-                    continue
-                    
-        if not source_message:
-            print("❌ Не удалось найти сообщение 1536366053737889813 в доступных каналах гильдии.")
-            return
-
-        # Выводим содержание в консоль
-        print("-" * 40)
-        print("📄 ИЗВЛЕЧЕННОЕ СОДЕРЖАНИЕ СООБЩЕНИЯ:")
-        print(f"Текст:\n{source_message.content}")
-        if source_message.embeds:
-            print(f"Embed-сообщения: {len(source_message.embeds)} шт.")
-            for i, embed in enumerate(source_message.embeds):
-                print(f"  Embed {i+1} dict: {embed.to_dict()}")
-        if source_message.attachments:
-            print(f"Вложения: {len(source_message.attachments)} шт. ({[a.filename for a in source_message.attachments]})")
-        if source_message.components:
-             print(f"🎛️ Интерактивные кнопки: {len(source_message.components)} шт. (визуально не копируются)")
-        print("-" * 40)
-
-        # Целевая тестовая ветка
-        test_thread = await client.fetch_channel(1503003066641809418)
-
-        # Собираем файлы для отправки
-        files = [await a.to_file() for a in source_message.attachments] if source_message.attachments else []
-        
-        # Отправляем сообщение
-        if files:
-            await test_thread.send(content=source_message.content or None, embeds=source_message.embeds, files=files[:10])
-            # Лимит Discord 10 файлов на сообщение, отправляем остаток, если есть
-            if len(files) > 10:
-                for i in range(10, len(files), 10):
-                    await test_thread.send(files=files[i:i+10])
-        else:
-            if source_message.content or source_message.embeds:
-                await test_thread.send(content=source_message.content or None, embeds=source_message.embeds)
-                
-        print("✅ Экспериментальное сообщение успешно отправлено в тестовую ветку 1503003066641809418!")
-        print("⚠️ Примечание: кнопки (View) автоматически не копируются. Если в сообщении есть кнопки, скопируйте вывод из консоли сюда, и я напишу их логику.")
-
+        channel = await client.fetch_channel(event['channel_id'])
+        message = await channel.fetch_message(event['message_id'])
+        embed = build_event_embed(event_id)
+        await message.edit(embed=embed)
+        await interaction.response.send_message("✅ Список участников обновлен!", ephemeral=True)
     except Exception as e:
-        print(f"❌ Ошибка при воспроизведении: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"Ошибка обновления: {e}")
+        await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+
+
+async def cancel_event(interaction: discord.Interaction, event_id: str):
+    """Отменяет мероприятие"""
+    events = load_json(EVENTS_FILE, {})
+    if event_id in events:
+        event = events[event_id]
+        try:
+            channel = await client.fetch_channel(event['channel_id'])
+            message = await channel.fetch_message(event['message_id'])
+            await message.delete()
+        except Exception:
+            pass
+        
+        del events[event_id]
+        save_json(EVENTS_FILE, events)
+        await interaction.response.send_message("✅ Мероприятие отменено!", ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Мероприятие не найдено!", ephemeral=True)
+
+
+def build_event_embed(event_id: str) -> discord.Embed:
+    """Создает embed-сообщение для мероприятия"""
+    events = load_json(EVENTS_FILE, {})
+    event = events[event_id]
+    
+    current_date = datetime.now(MSK)
+    active_members = get_active_members(current_date)
+    
+    # Подсчет отметок
+    accepted = list(event.get('accepted', {}).keys())
+    declined = list(event.get('declined', {}).keys())
+    unmarked = [m for m in active_members if m not in accepted and m not in declined]
+    
+    embed = discord.Embed(
+        title=event['title'],
+        description=event['description'],
+        color=event.get('color', 15844367)
+    )
+    
+    # Время
+    start_ts = int(event['start_time'])
+    end_ts = int(event['end_time'])
+    embed.add_field(
+        name="⏰ Время",
+        value=f"<t:{start_ts}:F> - <t:{end_ts}:t>\n<:emoji:878391707727716413> <t:{start_ts}:R>",
+        inline=False
+    )
+    
+    # Отметки
+    if accepted:
+        embed.add_field(
+            name=f"<:accepted:713124484436983971> Придут ({len(accepted)})",
+            value=">>> " + "\n".join(accepted),
+            inline=True
+        )
+    if declined:
+        embed.add_field(
+            name=f"<:declined:713124484688642068> Не придут ({len(declined)})",
+            value=">>> " + "\n".join(declined),
+            inline=True
+        )
+    if unmarked:
+        embed.add_field(
+            name=f"❓ Не определились ({len(unmarked)})",
+            value=">>> " + "\n".join(unmarked),
+            inline=False
+        )
+    
+    embed.set_footer(text="Created by [En-Y]BURBON")
+    if event.get('image'):
+        embed.set_image(url=event['image'])
+    
+    return embed
+
+
+async def create_event(title: str, description: str, start_time: datetime, end_time: datetime, 
+                      image_url: str = None, color: int = 15844367):
+    """Создает новое мероприятие и публикует его"""
+    event_id = str(uuid.uuid4())
+    events = load_json(EVENTS_FILE, {})
+    
+    events[event_id] = {
+        'title': title,
+        'description': description,
+        'start_time': int(start_time.timestamp()),
+        'end_time': int(end_time.timestamp()),
+        'accepted': {},
+        'declined': {},
+        'image': image_url,
+        'color': color,
+        'channel_id': EVENTS_CHANNEL_ID,
+        'message_id': None
+    }
+    save_json(EVENTS_FILE, events)
+    
+    # Публикация
+    try:
+        channel = await client.fetch_channel(EVENTS_CHANNEL_ID)
+        embed = build_event_embed(event_id)
+        view = EventView(event_id)
+        
+        message = await channel.send(embed=embed, view=view)
+        events[event_id]['message_id'] = message.id
+        save_json(EVENTS_FILE, events)
+        
+        # Отправляем админ-панель отдельным сообщением
+        admin_embed = discord.Embed(
+            title="🛠️ Админ-панель мероприятия",
+            description=f"Мероприятие: **{title}**\nID: `{event_id}`",
+            color=discord.Color.blue()
+        )
+        admin_view = AdminEventView(event_id)
+        await channel.send(embed=admin_embed, view=admin_view)
+        
+        print(f"✅ Мероприятие '{title}' опубликовано")
+    except Exception as e:
+        print(f"❌ Ошибка публикации мероприятия: {e}")
+
+
+async def post_weekly_events():
+    """Автоматически публикует расписание на неделю (суббота и воскресенье)"""
+    print("📅 Публикация еженедельного расписания...")
+    
+    today = datetime.now(MSK)
+    
+    # Находим следующую субботу
+    days_until_saturday = (5 - today.weekday()) % 7
+    if days_until_saturday == 0 and today.hour >= 16:
+        days_until_saturday = 7
+    
+    saturday = today + timedelta(days=days_until_saturday)
+    saturday_start = saturday.replace(hour=16, minute=30, second=0, microsecond=0)
+    saturday_end = saturday.replace(hour=19, minute=30, second=0, microsecond=0)
+    
+    sunday = saturday + timedelta(days=1)
+    sunday_start = sunday.replace(hour=17, minute=45, second=0, microsecond=0)
+    sunday_end = sunday.replace(hour=22, minute=15, second=0, microsecond=0)
+    
+    # Создаем субботнее мероприятие
+    await create_event(
+        "СУББОТА - RTvT AS VDV",
+        "На субботу запланировано мероприятие на сервере AS VDV. Требуется прибыть на мероприятие и в голосовой канал \"Мероприятие\" за 15 минут до начала игры.",
+        saturday_start,
+        saturday_end
+    )
+    
+    await asyncio.sleep(2)  # Небольшая пауза между сообщениями
+    
+    # Создаем воскресное мероприятие
+    await create_event(
+        "ВОСКРЕСЕНЬЕ - TvT TT",
+        "На воскресенье запланировано мероприятие на сервере TT. Требуется прибыть на мероприятие и в голосовой канал \"Мероприятие\" за 15 минут до начала игры.",
+        sunday_start,
+        sunday_end
+    )
+
+
+async def handle_vacation_request(interaction: discord.Interaction, start_str: str, end_str: str):
+    """Обрабатывает запрос на оформление отпуска"""
+    try:
+        # Парсинг дат
+        start_date = datetime.strptime(start_str, "%d.%m.%Y")
+        end_date = datetime.strptime(end_str, "%d.%m.%Y")
+        
+        # Проверка длительности (от 7 дней до месяца)
+        duration = (end_date - start_date).days
+        if duration < 7:
+            await interaction.response.send_message(
+                "❌ Отпуск должен быть не менее 7 дней!",
+                ephemeral=True
+            )
+            return
+        if duration > 31:
+            await interaction.response.send_message(
+                "❌ Отпуск не может быть дольше 31 дня!",
+                ephemeral=True
+            )
+            return
+        
+        # Проверка, что даты в будущем
+        if start_date.date() < datetime.now(MSK).date():
+            await interaction.response.send_message(
+                "❌ Дата начала должна быть в будущем!",
+                ephemeral=True
+            )
+            return
+        
+        # Сохранение отпуска
+        vacations = load_json(VACATIONS_FILE, {})
+        nickname = interaction.user.display_name
+        
+        vacations[nickname] = {
+            'start': start_date.isoformat(),
+            'end': end_date.isoformat(),
+            'requested_at': datetime.now(MSK).isoformat()
+        }
+        save_json(VACATIONS_FILE, vacations)
+        
+        await interaction.response.send_message(
+            f"✅ Отпуск оформлен с {start_str} по {end_str}!\n"
+            f"Вы не сможете отмечаться на мероприятия в этот период.",
+            ephemeral=True
+        )
+        
+        print(f"🏖️ {nickname} оформил отпуск с {start_str} по {end_str}")
+        
+    except ValueError:
+        await interaction.response.send_message(
+            "❌ Неверный формат даты! Используйте ДД.ММ.ГГГГ (например, 15.08.2026)",
+            ephemeral=True
+        )
+    except Exception as e:
+        print(f"Ошибка оформления отпуска: {e}")
+        await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+
+
+# ============== КОМАНДЫ АДМИНА ==============
+
+async def parse_datetime(dt_str: str) -> datetime:
+    """Парсит дату и время в формате 'DD.MM.YYYY HH:MM'"""
+    try:
+        dt = datetime.strptime(dt_str, "%d.%m.%Y %H:%M")
+        return MSK.localize(dt)
+    except ValueError:
+        raise ValueError("Неверный формат! Используйте ДД.ММ.ГГГГ ЧЧ:ММ")
+
+
+async def handle_admin_command(message: discord.Message):
+    """Обрабатывает команды админа"""
+    if message.author.id != ALLOWED_USER_ID:
+        return
+    
+    content = message.content.strip()
+    parts = content.split(maxsplit=1)
+    
+    if len(parts) < 2:
+        return
+    
+    command = parts[1]
+    
+    try:
+        if command.startswith("event add"):
+            # Формат: !event add "Название" | "Описание" | "ДД.ММ.ГГГГ ЧЧ:ММ" | "ДД.ММ.ГГГГ ЧЧ:ММ"
+            args = command[len("event add"):].strip().split("|")
+            if len(args) < 4:
+                await message.channel.send("❌ Формат: `!event add \"Название\" | \"Описание\" | \"ДД.ММ.ГГГГ ЧЧ:ММ\" | \"ДД.ММ.ГГГГ ЧЧ:ММ\"`")
+                return
+            
+            title = args[0].strip().strip('"')
+            description = args[1].strip().strip('"')
+            start_time = await parse_datetime(args[2].strip().strip('"'))
+            end_time = await parse_datetime(args[3].strip().strip('"'))
+            
+            await create_event(title, description, start_time, end_time)
+            await message.add_reaction('✅')
+            
+        elif command.startswith("event cancel"):
+            # Формат: !event cancel <message_id>
+            args = command.split()
+            if len(args) < 3:
+                await message.channel.send("❌ Формат: `!event cancel <message_id>`")
+                return
+            
+            message_id = int(args[2])
+            events = load_json(EVENTS_FILE, {})
+            
+            for event_id, event in list(events.items()):
+                if event.get('message_id') == message_id:
+                    del events[event_id]
+                    save_json(EVENTS_FILE, events)
+                    await message.channel.send(f"✅ Мероприятие отменено!")
+                    await message.add_reaction('✅')
+                    return
+            
+            await message.channel.send("❌ Мероприятие не найдено!")
+            
+        elif command == "event list":
+            events = load_json(EVENTS_FILE, {})
+            if not events:
+                await message.channel.send("📭 Нет активных мероприятий")
+                return
+            
+            text = "📋 **Активные мероприятия:**\n\n"
+            for event_id, event in events.items():
+                start = datetime.fromtimestamp(event['start_time'], MSK)
+                text += f"**{event['title']}**\n"
+                text += f"ID: `{event_id}`\n"
+                text += f"Дата: {start.strftime('%d.%m.%Y %H:%M')}\n"
+                text += f"✅ Придут: {len(event.get('accepted', {}))}\n"
+                text += f"❌ Не придут: {len(event.get('declined', {}))}\n\n"
+            
+            await message.channel.send(text)
+            
+        elif command.startswith("vacation remove"):
+            # Формат: !vacation remove <nickname>
+            args = command.split(maxsplit=2)
+            if len(args) < 3:
+                await message.channel.send("❌ Формат: `!vacation remove [En-Y]Nickname`")
+                return
+            
+            nickname = args[2].strip()
+            vacations = load_json(VACATIONS_FILE, {})
+            
+            # Ищем по частичному совпадению
+            found = False
+            for vac_name in list(vacations.keys()):
+                if nickname.lower() in vac_name.lower():
+                    del vacations[vac_name]
+                    save_json(VACATIONS_FILE, vacations)
+                    await message.channel.send(f"✅ {vac_name} выведен из отпуска досрочно!")
+                    found = True
+                    break
+            
+            if not found:
+                await message.channel.send(f"❌ Игрок {nickname} не найден в отпусках!")
+            else:
+                await message.add_reaction('✅')
+            
+        elif command == "vacation list":
+            vacations = load_json(VACATIONS_FILE, {})
+            if not vacations:
+                await message.channel.send("🏖️ Нет активных отпусков")
+                return
+            
+            text = "🏖️ **Активные отпуска:**\n\n"
+            for nickname, dates in vacations.items():
+                start = datetime.fromisoformat(dates['start']).strftime('%d.%m.%Y')
+                end = datetime.fromisoformat(dates['end']).strftime('%d.%m.%Y')
+                text += f"**{nickname}**: {start} - {end}\n"
+            
+            await message.channel.send(text)
+            
+        elif command == "vacation setup":
+            # Публикует кнопку для оформления отпуска
+            channel = await client.fetch_channel(VACATION_CHANNEL_ID)
+            embed = discord.Embed(
+                title="🏖️ Оформление отпуска",
+                description=(
+                    "Здесь вы можете оформить отпуск на период от 7 до 31 дня.\n\n"
+                    "Во время отпуска вы не сможете отмечаться на мероприятия.\n"
+                    "Если вы хотите выйти из отпуска досрочно, обратитесь к администратору."
+                ),
+                color=discord.Color.green()
+            )
+            view = VacationRequestView()
+            await channel.send(embed=embed, view=view)
+            await message.add_reaction('✅')
+            
+    except Exception as e:
+        print(f"Ошибка обработки команды: {e}")
+        await message.channel.send(f"❌ Ошибка: {e}")
 
 
 # ============== СОБЫТИЯ DISCORD ==============
@@ -538,10 +1021,29 @@ async def on_ready():
             replace_existing=True
         )
 
+    # Добавляем еженедельную публикацию мероприятий (каждый понедельник в 12:00 МСК)
+    if not scheduler.get_job('weekly_events'):
+        scheduler.add_job(
+            post_weekly_events,
+            'cron',
+            day_of_week='mon',
+            hour=12,
+            minute=0,
+            id='weekly_events',
+            replace_existing=True
+        )
+        print("📅 Планировщик еженедельных мероприятий добавлен (понедельник, 12:00 МСК)")
+
     if not scheduler.running:
         scheduler.start()
-        print("Планировщик запущен. Следующая проверка через 2 дня в 18:00 МСК")
+        print("Планировщик запущен. Следующая проверка таблицы через 2 дня в 18:00 МСК")
         print("Для ручной проверки используйте команду: !check")
+    
+    # Регистрируем View для persistent кнопок
+    client.add_view(EventView("dummy"))
+    client.add_view(AdminEventView("dummy"))
+    client.add_view(VacationRequestView())
+    print("✅ UI компоненты зарегистрированы")
 
 
 @client.event
@@ -551,17 +1053,34 @@ async def on_message(message):
 
     if message.author == client.user:
         return
-    if message.author.id != ALLOWED_USER_ID:
-        return
-
-    # --- НОВЫЙ ЭКСПЕРИМЕНТАЛЬНЫЙ ФУНКЦИОНАЛ ---
-    if message.content.startswith('!reproduce'):
-        await message.channel.send('🧪 Запускаю эксперимент по копированию сообщения...')
-        await reproduce_message_test()
+    
+    # Команды админа (только в админ-канале)
+    if message.channel.id == ADMIN_CHANNEL_ID and message.author.id == ALLOWED_USER_ID:
+        if message.content.startswith('!'):
+            await handle_admin_command(message)
+            return
+    
+    # Команда для публикации кнопки отпуска (только админ в любом канале)
+    if message.author.id == ALLOWED_USER_ID and message.content == '!vacation setup':
+        channel = await client.fetch_channel(VACATION_CHANNEL_ID)
+        embed = discord.Embed(
+            title="🏖️ Оформление отпуска",
+            description=(
+                "Здесь вы можете оформить отпуск на период от 7 до 31 дня.\n\n"
+                "Во время отпуска вы не сможете отмечаться на мероприятия.\n"
+                "Если вы хотите выйти из отпуска досрочно, обратитесь к администратору."
+            ),
+            color=discord.Color.green()
+        )
+        view = VacationRequestView()
+        await channel.send(embed=embed, view=view)
         await message.add_reaction('✅')
         return
 
-    # --- СТАРЫЙ ФУНКЦИОНАЛ ---
+    # Старый функционал
+    if message.author.id != ALLOWED_USER_ID:
+        return
+
     if message.content.startswith('!check'):
         if check_lock.locked():
             await message.channel.send('⚠️ Проверка уже выполняется, подождите.')
