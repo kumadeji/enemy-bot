@@ -19,7 +19,6 @@ LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.bot.lock'
 
 
 def _pid_is_alive(pid: int) -> bool:
-    """Проверяет, жив ли процесс с данным PID (кроссплатформенно)."""
     try:
         import psutil
         return psutil.pid_exists(pid)
@@ -86,7 +85,6 @@ acquire_single_instance_lock()
 THREAD_ID = 1530860224724996237
 PREFIX = '!s '
 
-# Список администраторов (комбат и его заместители)
 ADMIN_USER_IDS = [
     316641571284058113,
     766919669838905364,
@@ -131,6 +129,7 @@ EXPECTED_INTRO_MAX_LEN = 700
 EVENTS_CHANNEL_ID = 1311705378140196926
 VACATION_CHANNEL_ID = 1284905224099598407
 ADMIN_CHANNEL_ID = 1470352063824265279
+VOICE_CHANNEL_URL = "https://discord.com/channels/734494109032513699/1284893513921728582"
 
 CLAN_MEMBERS = [
     "[En-Y]COKOJl", "[En-Y]Killa", "[En-Y]SIR", "[En-Y]Russo", "[En-Y]v1c",
@@ -146,7 +145,7 @@ VACATIONS_FILE = 'vacations.json'
 
 VACATION_RULES = """📋 **ПРАВИЛА ПОДАЧИ РАПОРТА**
 
-⚠️ **Важно:** Если ты отсутствуешь более 7 дней, обязательно оформи отпуск, чтобы не быть исключённым из клана за низкую активность.
+⚠️ **Важно:** Если ты отсутствуешь более 7 дней, оформи отпуск, чтобы не быть исключённым из клана за низкую активность.
 
 **📌 Основные правила:**
 • Отпуск оформляется на срок от **7 дней до 1 месяца**
@@ -162,9 +161,8 @@ VACATION_RULES = """📋 **ПРАВИЛА ПОДАЧИ РАПОРТА**
 
 **❌ Неуважительные причины (отпуск отклоняется):**
 • Усталость от игры
-• Заявление игрока, замеченного в постоянной сторонней игре
 
-**💡 Совет:** Указывай честную и конкретную причину. Это помогает командованию планировать состав на игры.
+**💡 Совет:** Указывай честную и конкретную причину. Это помогает командованию планировать состав на игры. Отпуск может быть аннулирован, если вы будете находится в отпуске, но постоянно играть в игры во время проводимых мероприятий в клане.
 """
 
 # ============== ИНИЦИАЛИЗАЦИЯ ==============
@@ -180,8 +178,6 @@ check_lock = asyncio.Lock()
 
 
 class MessageDeduplicator:
-    """Защита от повторной обработки одного и того же события on_message"""
-
     def __init__(self, maxlen=500):
         self._order = deque(maxlen=maxlen)
         self._seen = set()
@@ -306,8 +302,24 @@ async def find_discord_user(nickname: str, thread):
         return None
 
 
+async def find_member_by_nickname(nickname: str):
+    """Ищет участника сервера по нику"""
+    try:
+        channel = await client.fetch_channel(VACATION_CHANNEL_ID)
+        guild = channel.guild
+        for member in guild.members:
+            if member.display_name == nickname:
+                return member
+        for member in guild.members:
+            if nickname.lower() in member.display_name.lower():
+                return member
+        return None
+    except Exception as e:
+        print(f"Ошибка поиска участника: {e}")
+        return None
+
+
 async def send_chunked(thread, text, user_name=""):
-    """Надёжная разбивка длинных сообщений на части"""
     if not text:
         return
 
@@ -340,7 +352,7 @@ async def send_chunked(thread, text, user_name=""):
 
 def build_intro_lines(current_time: datetime) -> list:
     return [
-        "🔔 **Проверяющий бот клана** 🔔",
+        "🔔 **Проверка ошибок с регистрациями** 🔔",
         "",
         "Это автоматическая проверка клана по таблице — всех, кто не в отпуске. "
         "**[Полная таблица](<https://enemygaming.netlify.app/temptable>)** — обновляется ежедневно.",
@@ -391,8 +403,6 @@ def build_user_message(discord_user, issues: list) -> str:
 
 
 async def check_spreadsheet():
-    """Основная функция проверки таблицы"""
-
     if check_lock.locked():
         print("⚠️ Проверка уже выполняется, пропускаем.")
         return
@@ -518,7 +528,6 @@ def save_json(filename, data):
 
 
 def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
-    """Проверяет отпуск: сначала hardcoded, потом динамические из JSON"""
     if is_on_vacation(nickname, current_date):
         return True
     
@@ -545,7 +554,6 @@ def get_active_members(current_date: datetime) -> list:
 
 
 async def get_vacation_role(guild):
-    """Получает или создает роль 'Отпуск'"""
     role = discord.utils.get(guild.roles, name="Отпуск")
     if not role:
         try:
@@ -562,7 +570,6 @@ async def get_vacation_role(guild):
 
 
 async def update_vacation_role(member, has_vacation: bool):
-    """Добавляет или снимает роль 'Отпуск'"""
     try:
         guild = member.guild
         role = await get_vacation_role(guild)
@@ -582,8 +589,6 @@ async def update_vacation_role(member, has_vacation: bool):
 
 
 # ============== UI КОМПОНЕНТЫ ==============
-
-# --- МОДАЛЬНЫЕ ОКНА ---
 
 class VacationModal(discord.ui.Modal, title="🏖️ Оформление отпуска"):
     start_date = discord.ui.TextInput(
@@ -609,9 +614,49 @@ class VacationModal(discord.ui.Modal, title="🏖️ Оформление отп
     async def on_submit(self, interaction: discord.Interaction):
         await handle_vacation_request(
             interaction, 
+            interaction.user.display_name,
             self.start_date.value, 
             self.end_date.value,
-            self.reason.value
+            self.reason.value,
+            by_admin=False
+        )
+
+
+class AdminVacationModal(discord.ui.Modal, title="🏖️ Отпуск для игрока (комбат)"):
+    player_name = discord.ui.TextInput(
+        label="Ник игрока (как в Discord)",
+        placeholder="[En-Y]Killa",
+        required=True,
+        max_length=35
+    )
+    start_date = discord.ui.TextInput(
+        label="Дата начала (ДД.ММ.ГГГГ)",
+        placeholder="15.08.2026",
+        required=True,
+        max_length=10
+    )
+    end_date = discord.ui.TextInput(
+        label="Дата окончания (ДД.ММ.ГГГГ)",
+        placeholder="22.08.2026",
+        required=True,
+        max_length=10
+    )
+    reason = discord.ui.TextInput(
+        label="Причина отпуска",
+        placeholder="Командировка, семейные обстоятельства и т.д.",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=500
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        await handle_vacation_request(
+            interaction,
+            self.player_name.value,
+            self.start_date.value,
+            self.end_date.value,
+            self.reason.value,
+            by_admin=True
         )
 
 
@@ -672,13 +717,13 @@ class DeleteMessageModal(discord.ui.Modal, title="🗑️ Удаление со�
 
 
 class EventCreateModal(discord.ui.Modal, title="📅 Создание мероприятия"):
-    title = discord.ui.TextInput(
+    event_title = discord.ui.TextInput(
         label="Название мероприятия",
         placeholder="СУББОТА - RTvT AS VDV",
         required=True,
         max_length=100
     )
-    description = discord.ui.TextInput(
+    event_description = discord.ui.TextInput(
         label="Описание",
         style=discord.TextStyle.paragraph,
         placeholder="Описание мероприятия...",
@@ -706,8 +751,8 @@ class EventCreateModal(discord.ui.Modal, title="📅 Создание мероп
             end = MSK.localize(end)
             
             await create_event(
-                self.title.value,
-                self.description.value,
+                self.event_title.value,
+                self.event_description.value,
                 start,
                 end
             )
@@ -718,10 +763,7 @@ class EventCreateModal(discord.ui.Modal, title="📅 Создание мероп
             await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
 
 
-# --- КНОПКИ И МЕНЮ ---
-
 class AdminMainMenuView(discord.ui.View):
-    """Главное меню администратора (комбат и его заместители)"""
     def __init__(self):
         super().__init__(timeout=None)
     
@@ -732,6 +774,22 @@ class AdminMainMenuView(discord.ui.View):
             return
         modal = EventCreateModal()
         await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="📅 Мероприятия недели", style=discord.ButtonStyle.primary, custom_id="admin_force_weekly")
+    async def force_weekly_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await post_weekly_events()
+        await interaction.followup.send("✅ Мероприятия на эту неделю опубликованы!", ephemeral=True)
+    
+    @discord.ui.button(label="📋 Список мероприятий", style=discord.ButtonStyle.secondary, custom_id="admin_event_list")
+    async def event_list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
+            return
+        await show_event_list(interaction)
     
     @discord.ui.button(label="📝 Отправить сообщение", style=discord.ButtonStyle.success, custom_id="admin_send_message")
     async def send_message_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -749,19 +807,27 @@ class AdminMainMenuView(discord.ui.View):
         modal = DeleteMessageModal()
         await interaction.response.send_modal(modal)
     
-    @discord.ui.button(label="🏖️ Управление отпусками", style=discord.ButtonStyle.secondary, custom_id="admin_vacation_menu")
-    async def vacation_menu_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    @discord.ui.button(label="🏖️ Отпуск для игрока", style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player")
+    async def vacation_for_player_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
+            return
+        modal = AdminVacationModal()
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="📋 Правила отпусков", style=discord.ButtonStyle.secondary, custom_id="admin_vacation_rules")
+    async def vacation_rules_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
+            return
+        await publish_vacation_info(interaction)
+    
+    @discord.ui.button(label="🏖️ Список отпусков", style=discord.ButtonStyle.secondary, custom_id="admin_vacation_list")
+    async def vacation_list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
             return
         await show_vacation_list(interaction)
-    
-    @discord.ui.button(label="📋 Список мероприятий", style=discord.ButtonStyle.secondary, custom_id="admin_event_list")
-    async def event_list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
-            return
-        await show_event_list(interaction)
     
     @discord.ui.button(label="🔍 Проверить таблицу", style=discord.ButtonStyle.success, custom_id="admin_check_table")
     async def check_table_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -773,10 +839,16 @@ class AdminMainMenuView(discord.ui.View):
             return
         await interaction.response.send_message("🔍 Запускаю проверку таблицы...", ephemeral=True)
         await check_spreadsheet()
+    
+    @discord.ui.button(label="❓ Справка", style=discord.ButtonStyle.secondary, custom_id="admin_faq")
+    async def faq_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
+            return
+        await send_faq(interaction)
 
 
 class VacationRequestView(discord.ui.View):
-    """Кнопка для оформления отпуска игроками"""
     def __init__(self):
         super().__init__(timeout=None)
     
@@ -787,18 +859,16 @@ class VacationRequestView(discord.ui.View):
 
 
 class VacationMessageView(discord.ui.View):
-    """Кнопки в сообщении об отпуске"""
     def __init__(self, nickname: str):
         super().__init__(timeout=None)
         self.nickname = nickname
     
     @discord.ui.button(label="✅ Завершить отпуск досрочно", style=discord.ButtonStyle.success, custom_id="vacation_end_early")
     async def end_early_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Только сам игрок или админ может закрыть
         if interaction.user.display_name != self.nickname and interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Только сам игрок или командование может закрыть отпуск!", ephemeral=True)
             return
-        await close_vacation(interaction, self.nickname, early=True)
+        await close_vacation(interaction, self.nickname, early=True, by_admin=False)
     
     @discord.ui.button(label="🔴 Закрыть отпуск (комбат)", style=discord.ButtonStyle.danger, custom_id="vacation_admin_close")
     async def admin_close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -809,7 +879,6 @@ class VacationMessageView(discord.ui.View):
 
 
 class EventView(discord.ui.View):
-    """Кнопки для отметки на мероприятие"""
     def __init__(self, event_id: str):
         super().__init__(timeout=None)
         self.event_id = event_id
@@ -824,7 +893,6 @@ class EventView(discord.ui.View):
 
 
 class AdminEventView(discord.ui.View):
-    """Кнопки для управления мероприятием"""
     def __init__(self, event_id: str):
         super().__init__(timeout=None)
         self.event_id = event_id
@@ -846,8 +914,26 @@ class AdminEventView(discord.ui.View):
 
 # ============== ФУНКЦИИ ОТПУСКОВ ==============
 
-async def handle_vacation_request(interaction: discord.Interaction, start_str: str, end_str: str, reason: str):
-    """Обрабатывает запрос на оформление отпуска"""
+async def publish_vacation_info(interaction: discord.Interaction):
+    try:
+        channel = await client.fetch_channel(VACATION_CHANNEL_ID)
+        
+        embed = discord.Embed(
+            title="🏖️ СИСТЕМА ОТПУСКОВ КЛАНА",
+            description=VACATION_RULES,
+            color=discord.Color.green()
+        )
+        embed.set_footer(text="Нажмите кнопку ниже, чтобы оформить отпуск")
+        
+        view = VacationRequestView()
+        await channel.send(embed=embed, view=view)
+        
+        await interaction.response.send_message("✅ Правила отпусков опубликованы!", ephemeral=True)
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+
+
+async def handle_vacation_request(interaction: discord.Interaction, nickname: str, start_str: str, end_str: str, reason: str, by_admin: bool):
     try:
         start_date = datetime.strptime(start_str, "%d.%m.%Y")
         end_date = datetime.strptime(end_str, "%d.%m.%Y")
@@ -864,8 +950,16 @@ async def handle_vacation_request(interaction: discord.Interaction, start_str: s
             await interaction.response.send_message("❌ Дата начала должна быть в будущем!", ephemeral=True)
             return
         
+        member = await find_member_by_nickname(nickname)
+        if not member:
+            await interaction.response.send_message(f"❌ Игрок {nickname} не найден на сервере!", ephemeral=True)
+            return
+        
         vacations = load_json(VACATIONS_FILE, {})
-        nickname = interaction.user.display_name
+        
+        if nickname in vacations and vacations[nickname].get('status') == 'active':
+            await interaction.response.send_message(f"⚠️ У {nickname} уже есть активный отпуск!", ephemeral=True)
+            return
         
         vacations[nickname] = {
             'start': start_date.isoformat(),
@@ -874,14 +968,13 @@ async def handle_vacation_request(interaction: discord.Interaction, start_str: s
             'requested_at': datetime.now(MSK).isoformat(),
             'status': 'active',
             'message_id': None,
-            'channel_id': None
+            'channel_id': None,
+            'created_by': interaction.user.display_name if by_admin else 'Сам игрок'
         }
         save_json(VACATIONS_FILE, vacations)
         
-        # Добавляем роль
-        await update_vacation_role(interaction.user, True)
+        await update_vacation_role(member, True)
         
-        # Публикуем сообщение об отпуске
         channel = await client.fetch_channel(VACATION_CHANNEL_ID)
         
         embed = discord.Embed(
@@ -891,24 +984,32 @@ async def handle_vacation_request(interaction: discord.Interaction, start_str: s
         )
         embed.add_field(name="📅 Период", value=f"{start_str} - {end_str} ({duration} дней)", inline=True)
         embed.add_field(name="📝 Причина", value=reason, inline=False)
-        embed.add_field(name="ℹ️ Статус", value="Активен", inline=False)
-        embed.set_footer(text="Во время отпуска вам не нужно отмечаться в расписании на игры")
+        if by_admin:
+            embed.add_field(name="👤 Оформил", value=f"Комбат/зам: {interaction.user.display_name}", inline=False)
+        embed.add_field(name="ℹ️ Статус", value="✅ Активен", inline=False)
+        embed.set_footer(text="Во время отпуска вам не нужно отмечаться в расписании мероприятий")
         
         view = VacationMessageView(nickname)
         message = await channel.send(embed=embed, view=view)
         
-        # Сохраняем ID сообщения
         vacations[nickname]['message_id'] = message.id
         vacations[nickname]['channel_id'] = channel.id
         save_json(VACATIONS_FILE, vacations)
         
-        await interaction.response.send_message(
-            f"✅ Отпуск оформлен с {start_str} по {end_str}!\n"
-            f"Во время отпуска вам не нужно будет отмечаться в расписании на игры.",
-            ephemeral=True
-        )
+        if by_admin:
+            await interaction.response.send_message(
+                f"✅ Отпуск для {nickname} оформлен с {start_str} по {end_str}!\n"
+                f"Во время отпуска ему не нужно будет отмечаться в расписании мероприятий.",
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(
+                f"✅ Отпуск оформлен с {start_str} по {end_str}!\n"
+                f"Во время отпуска вам не нужно будет отмечаться в расписании мероприятий.",
+                ephemeral=True
+            )
         
-        print(f"🏖️ {nickname} оформил отпуск с {start_str} по {end_str}. Причина: {reason}")
+        print(f"🏖️ {nickname} оформил отпуск с {start_str} по {end_str}. Причина: {reason}. Админ: {by_admin}")
         
     except ValueError:
         await interaction.response.send_message(
@@ -921,7 +1022,6 @@ async def handle_vacation_request(interaction: discord.Interaction, start_str: s
 
 
 async def close_vacation(interaction: discord.Interaction, nickname: str, early: bool = False, by_admin: bool = False):
-    """Закрывает отпуск игрока"""
     vacations = load_json(VACATIONS_FILE, {})
     
     if nickname not in vacations:
@@ -933,26 +1033,26 @@ async def close_vacation(interaction: discord.Interaction, nickname: str, early:
         await interaction.response.send_message("⚠️ Отпуск уже закрыт!", ephemeral=True)
         return
     
-    # Закрываем отпуск
     vacation['status'] = 'ended_early' if early else 'ended_scheduled'
     vacation['closed_at'] = datetime.now(MSK).isoformat()
     vacation['closed_by'] = interaction.user.display_name
     save_json(VACATIONS_FILE, vacations)
     
-    # Снимаем роль
-    member = await find_discord_user(nickname, await client.fetch_channel(VACATION_CHANNEL_ID))
+    member = await find_member_by_nickname(nickname)
     if member:
         await update_vacation_role(member, False)
     
-    # Обновляем сообщение об отпуске
     try:
         channel = await client.fetch_channel(vacation['channel_id'])
         message = await channel.fetch_message(vacation['message_id'])
         
-        embed = message.embeds[0] if message.embeds else None
-        if embed:
+        if message.embeds:
+            embed = message.embeds[0]
             status_text = "❌ Завершен досрочно" if early else "✅ Завершен по истечению срока"
-            embed.set_field_at(2, name="ℹ️ Статус", value=status_text, inline=False)
+            for i, field in enumerate(embed.fields):
+                if field.name == "ℹ️ Статус":
+                    embed.set_field_at(i, name="ℹ️ Статус", value=status_text, inline=False)
+                    break
             embed.color = discord.Color.red() if early else discord.Color.greyple()
             await message.edit(embed=embed, view=None)
     except Exception as e:
@@ -967,7 +1067,6 @@ async def close_vacation(interaction: discord.Interaction, nickname: str, early:
 
 
 async def show_vacation_list(interaction: discord.Interaction):
-    """Показывает список отпусков с кнопками закрытия"""
     vacations = load_json(VACATIONS_FILE, {})
     active_vacations = {k: v for k, v in vacations.items() if v.get('status') == 'active'}
     
@@ -980,15 +1079,16 @@ async def show_vacation_list(interaction: discord.Interaction):
         start = datetime.fromisoformat(data['start']).strftime('%d.%m.%Y')
         end = datetime.fromisoformat(data['end']).strftime('%d.%m.%Y')
         text += f"**{nickname}**: {start} - {end}\n"
-        text += f"Причина: {data.get('reason', 'Не указана')}\n\n"
+        text += f"Причина: {data.get('reason', 'Не указана')}\n"
+        text += f"Оформил: {data.get('created_by', 'Сам игрок')}\n\n"
     
     await interaction.response.send_message(text, ephemeral=True)
 
 
 async def check_expired_vacations():
-    """Проверяет и автоматически закрывает истекшие отпуска"""
     vacations = load_json(VACATIONS_FILE, {})
     current_date = datetime.now(MSK).date()
+    changed = False
     
     for nickname, data in vacations.items():
         if data.get('status') != 'active':
@@ -997,28 +1097,28 @@ async def check_expired_vacations():
         try:
             end_date = datetime.fromisoformat(data['end']).date()
             if end_date < current_date:
-                # Отпуск истек - закрываем автоматически
                 data['status'] = 'ended_scheduled'
                 data['closed_at'] = datetime.now(MSK).isoformat()
                 data['closed_by'] = 'Система (автоматически)'
+                changed = True
                 
-                # Снимаем роль
                 try:
-                    channel = await client.fetch_channel(VACATION_CHANNEL_ID)
-                    member = await find_discord_user(nickname, channel)
+                    member = await find_member_by_nickname(nickname)
                     if member:
                         await update_vacation_role(member, False)
                 except Exception:
                     pass
                 
-                # Обновляем сообщение
                 try:
                     if data.get('message_id') and data.get('channel_id'):
                         channel = await client.fetch_channel(data['channel_id'])
                         message = await channel.fetch_message(data['message_id'])
                         if message.embeds:
                             embed = message.embeds[0]
-                            embed.set_field_at(2, name="ℹ️ Статус", value="✅ Завершен по истечению срока", inline=False)
+                            for i, field in enumerate(embed.fields):
+                                if field.name == "ℹ️ Статус":
+                                    embed.set_field_at(i, name="ℹ️ Статус", value="✅ Завершен по истечению срока", inline=False)
+                                    break
                             embed.color = discord.Color.greyple()
                             await message.edit(embed=embed, view=None)
                 except Exception:
@@ -1028,13 +1128,13 @@ async def check_expired_vacations():
         except Exception as e:
             print(f"Ошибка проверки отпуска {nickname}: {e}")
     
-    save_json(VACATIONS_FILE, vacations)
+    if changed:
+        save_json(VACATIONS_FILE, vacations)
 
 
 # ============== ФУНКЦИИ МЕРОПРИЯТИЙ ==============
 
 async def handle_event_response(interaction: discord.Interaction, event_id: str, response_type: str):
-    """Обрабатывает нажатие кнопки ✅ или ❌"""
     events = load_json(EVENTS_FILE, {})
     if event_id not in events:
         await interaction.response.send_message("❌ Мероприятие не найдено!", ephemeral=True)
@@ -1046,7 +1146,7 @@ async def handle_event_response(interaction: discord.Interaction, event_id: str,
     
     if is_on_vacation_dynamic(nickname, current_date):
         await interaction.response.send_message(
-            "🏖️ Вы сейчас в отпуске. Во время отпуска вам не нужно отмечаться в расписании на игры.",
+            "🏖️ Вы сейчас в отпуске. Во время отпуска вам не нужно отмечаться в расписании мероприятий.",
             ephemeral=True
         )
         return
@@ -1072,7 +1172,6 @@ async def handle_event_response(interaction: discord.Interaction, event_id: str,
 
 
 async def refresh_event_message(interaction: discord.Interaction, event_id: str):
-    """Обновляет сообщение мероприятия"""
     events = load_json(EVENTS_FILE, {})
     if event_id not in events:
         await interaction.response.send_message("❌ Мероприятие не найдено!", ephemeral=True)
@@ -1092,7 +1191,6 @@ async def refresh_event_message(interaction: discord.Interaction, event_id: str)
 
 
 async def cancel_event(interaction: discord.Interaction, event_id: str):
-    """Отменяет мероприятие"""
     events = load_json(EVENTS_FILE, {})
     if event_id in events:
         event = events[event_id]
@@ -1111,7 +1209,6 @@ async def cancel_event(interaction: discord.Interaction, event_id: str):
 
 
 def build_event_embed(event_id: str) -> discord.Embed:
-    """Создает embed-сообщение для мероприятия"""
     events = load_json(EVENTS_FILE, {})
     event = events[event_id]
     
@@ -1155,7 +1252,6 @@ def build_event_embed(event_id: str) -> discord.Embed:
             inline=False
         )
     
-    embed.set_footer(text="Created by [En-Y]BURBON")
     if event.get('image'):
         embed.set_image(url=event['image'])
     
@@ -1164,7 +1260,6 @@ def build_event_embed(event_id: str) -> discord.Embed:
 
 async def create_event(title: str, description: str, start_time: datetime, end_time: datetime, 
                       image_url: str = None, color: int = 15844367):
-    """Создает новое мероприятие и публикует его"""
     event_id = str(uuid.uuid4())
     events = load_json(EVENTS_FILE, {})
     
@@ -1178,7 +1273,8 @@ async def create_event(title: str, description: str, start_time: datetime, end_t
         'image': image_url,
         'color': color,
         'channel_id': EVENTS_CHANNEL_ID,
-        'message_id': None
+        'message_id': None,
+        'reminder_sent': False  # Флаг для напоминания за 15 минут
     }
     save_json(EVENTS_FILE, events)
     
@@ -1205,7 +1301,6 @@ async def create_event(title: str, description: str, start_time: datetime, end_t
 
 
 async def show_event_list(interaction: discord.Interaction):
-    """Показывает список мероприятий"""
     events = load_json(EVENTS_FILE, {})
     if not events:
         await interaction.response.send_message("📭 Нет активных мероприятий", ephemeral=True)
@@ -1218,19 +1313,20 @@ async def show_event_list(interaction: discord.Interaction):
         text += f"ID: `{event_id}`\n"
         text += f"Дата: {start.strftime('%d.%m.%Y %H:%M')}\n"
         text += f"✅ Придут: {len(event.get('accepted', {}))}\n"
-        text += f"❌ Не придут: {len(event.get('declined', {}))}\n\n"
+        text += f"❌ Не придут: {len(event.get('declined', {}))}\n"
+        text += f"🔔 Напоминание: {'✅ Отправлено' if event.get('reminder_sent') else '⏳ Ожидается'}\n\n"
     
     await interaction.response.send_message(text, ephemeral=True)
 
 
 async def post_weekly_events():
-    """Автоматически публикует расписание на неделю"""
-    print("📅 Публикация еженедельного расписания...")
+    """Публикует мероприятия на эту неделю (суббота и воскресенье)"""
+    print("📅 Публикация мероприятий на эту неделю...")
     
     today = datetime.now(MSK)
     
     days_until_saturday = (5 - today.weekday()) % 7
-    if days_until_saturday == 0 and today.hour >= 16:
+    if days_until_saturday == 0 and today.hour >= 19:
         days_until_saturday = 7
     
     saturday = today + timedelta(days=days_until_saturday)
@@ -1243,7 +1339,7 @@ async def post_weekly_events():
     
     await create_event(
         "СУББОТА - RTvT AS VDV",
-        "На субботу запланировано мероприятие на сервере AS VDV. Требуется прибыть на мероприятие и в голосовой канал \"Мероприятие\" за 15 минут до начала игры.",
+        "Бойцы, на субботу запланировано мероприятие на сервере AS VDV. Требуется прибыть на мероприятие и в голосовой канал \"Мероприятие\" за 15 минут до начала игры.",
         saturday_start,
         saturday_end
     )
@@ -1252,16 +1348,83 @@ async def post_weekly_events():
     
     await create_event(
         "ВОСКРЕСЕНЬЕ - TvT TT",
-        "На воскресенье запланировано мероприятие на сервере TT. Требуется прибыть на мероприятие и в голосовой канал \"Мероприятие\" за 15 минут до начала игры.",
+        "Бойцы, на воскресенье запланировано мероприятие на сервере TT. Требуется прибыть на мероприятие и в голосовой канал \"Мероприятие\" за 15 минут до начала игры.",
         sunday_start,
         sunday_end
     )
 
 
+# ============== НОВАЯ ФУНКЦИЯ: НАПОМИНАНИЯ ЗА 15 МИНУТ ==============
+
+async def check_event_reminders():
+    """Проверяет все мероприятия и отправляет напоминания за 15 минут до начала"""
+    events = load_json(EVENTS_FILE, {})
+    current_time = datetime.now(MSK)
+    changed = False
+    
+    for event_id, event in events.items():
+        # Пропускаем уже отправленные напоминания
+        if event.get('reminder_sent', False):
+            continue
+        
+        try:
+            event_start = datetime.fromtimestamp(event['start_time'], MSK)
+            time_until_start = event_start - current_time
+            
+            # Если до начала от 0 до 15 минут (и уже не началось)
+            if timedelta(0) <= time_until_start <= timedelta(minutes=15):
+                accepted = list(event.get('accepted', {}).keys())
+                
+                if not accepted:
+                    print(f"⚠️ Напоминание для '{event['title']}': нет зарегистрировавшихся")
+                    event['reminder_sent'] = True
+                    changed = True
+                    continue
+                
+                # Отправляем напоминание
+                try:
+                    channel = await client.fetch_channel(event['channel_id'])
+                    
+                    # Ищем member объекты для упоминаний
+                    mentions = []
+                    for nickname in accepted:
+                        member = await find_member_by_nickname(nickname)
+                        if member:
+                            mentions.append(member.mention)
+                        else:
+                            mentions.append(f"**{nickname}**")
+                    
+                    mentions_text = " ".join(mentions)
+                    
+                    reminder_text = (
+                        f"🔔 **Бойцы, внимание: {event['title']}** 🔔\n\n"
+                        f"{mentions_text}\n\n"
+                        f"⚡ Мероприятие начнется через **{int(time_until_start.total_seconds() // 60)} минут**!\n\n"
+                        f"📍 Ждем всех на сборах! Заходите в голосовой канал:\n"
+                        f"👉 **[#мероприятие](<{VOICE_CHANNEL_URL}>)**\n\n"
+                        f"Не забудьте подготовиться к началу мероприятия!"
+                    )
+                    
+                    await channel.send(reminder_text)
+                    
+                    event['reminder_sent'] = True
+                    changed = True
+                    
+                    print(f"✅ Напоминание отправлено для '{event['title']}' ({len(accepted)} игроков)")
+                    
+                except Exception as e:
+                    print(f"❌ Ошибка отправки напоминания для '{event['title']}': {e}")
+        
+        except Exception as e:
+            print(f"Ошибка проверки напоминания для {event_id}: {e}")
+    
+    if changed:
+        save_json(EVENTS_FILE, events)
+
+
 # ============== КОМАНДЫ ==============
 
-async def send_faq(message: discord.Message):
-    """Отправляет простую справку"""
+async def send_faq(interaction_or_message):
     faq_text = """📖 **СПРАВКА БОТА**
 
 **🎯 Основные функции:**
@@ -1274,26 +1437,34 @@ async def send_faq(message: discord.Message):
 • Автопубликация по понедельникам в 12:00 МСК
 • Суббота 16:30-19:30 (RTvT AS VDV)
 • Воскресенье 17:45-22:15 (TvT TT)
+• Кнопка "📅 Мероприятия недели" для ручной публикации
 • Игроки отмечаются кнопками ✅/❌
+• **Автоматические напоминания за 15 минут до начала**
 
 **🏖️ Отпуска**
-• Игроки оформляют сами через кнопку
+• Игроки оформляют сами через кнопку в канале отпусков
+• Комбат может оформить отпуск любому игроку
 • Срок: 7-31 день
 • Нужна уважительная причина
 • Во время отпуска не нужно отмечаться на игры
 • Автоматическая роль "Отпуск"
+• Досрочное закрытие кнопкой
 
 **🛠️ Для комбата и заместителей:**
 Все функции через кнопки в админ-канале:
-• Создание/удаление мероприятий
-• Отправка/удаление сообщений
-• Управление отпусками
+• Создание/отмена мероприятий
+• Отправка/удаление сообщений в любой канал
+• Оформление отпусков для игроков
+• Публикация правил отпусков
 • Проверка таблицы
 
 **💡 Совет:** Напишите `!faq` в админском канале для этой справки.
 """
-    await send_chunked(message.channel, faq_text, "FAQ")
-    await message.add_reaction('✅')
+    if hasattr(interaction_or_message, 'response'):
+        await interaction_or_message.response.send_message(faq_text, ephemeral=True)
+    else:
+        await send_chunked(interaction_or_message.channel, faq_text, "FAQ")
+        await interaction_or_message.add_reaction('✅')
 
 
 # ============== СОБЫТИЯ DISCORD ==============
@@ -1325,7 +1496,6 @@ async def on_ready():
         )
         print("📅 Планировщик еженедельных мероприятий добавлен")
 
-    # Проверка истекших отпусков каждый час
     if not scheduler.get_job('vacation_check'):
         scheduler.add_job(
             check_expired_vacations,
@@ -1336,18 +1506,27 @@ async def on_ready():
         )
         print("🏖️ Планировщик проверки отпусков добавлен (каждый час)")
 
+    # НОВОЕ: Планировщик напоминаний для мероприятий (каждую минуту)
+    if not scheduler.get_job('event_reminders'):
+        scheduler.add_job(
+            check_event_reminders,
+            'interval',
+            minutes=1,
+            id='event_reminders',
+            replace_existing=True
+        )
+        print("🔔 Планировщик напоминаний мероприятий добавлен (каждую минуту)")
+
     if not scheduler.running:
         scheduler.start()
         print("Планировщик запущен")
     
-    # Регистрируем View для persistent кнопок
     client.add_view(AdminMainMenuView())
     client.add_view(VacationRequestView())
     client.add_view(EventView("dummy"))
     client.add_view(AdminEventView("dummy"))
     print("✅ UI компоненты зарегистрированы")
     
-    # Публикуем админ-меню при запуске
     try:
         admin_channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
         embed = discord.Embed(
@@ -1355,11 +1534,12 @@ async def on_ready():
             description=(
                 "Здесь вы можете управлять всеми функциями бота через кнопки.\n\n"
                 "**Доступные действия:**\n"
-                "• 📅 Создание мероприятий\n"
-                "• 📝 Отправка сообщений в любой канал\n"
-                "• 🗑️ Удаление сообщений\n"
-                "• 🏖️ Управление отпусками\n"
-                "• 🔍 Проверка таблицы\n\n"
+                "• 📅 Создание и публикация мероприятий\n"
+                "• 📝 Отправка/удаление сообщений в любой канал\n"
+                "• 🏖️ Оформление отпусков для игроков\n"
+                "• 📋 Публикация правил отпусков\n"
+                "• 🔍 Проверка таблицы\n"
+                "• 🔔 Автоматические напоминания за 15 минут до мероприятий\n\n"
                 "Напишите `!faq` для краткой справки."
             ),
             color=discord.Color.blue()
@@ -1379,13 +1559,11 @@ async def on_message(message):
     if message.author == client.user:
         return
     
-    # Единственная текстовая команда - !faq
     if message.channel.id == ADMIN_CHANNEL_ID and message.author.id in ADMIN_USER_IDS:
         if message.content.strip().lower() == '!faq':
             await send_faq(message)
             return
     
-    # Старый функционал (только для админов)
     if message.author.id not in ADMIN_USER_IDS:
         return
 
