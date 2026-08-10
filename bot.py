@@ -84,7 +84,7 @@ acquire_single_instance_lock()
 # ============== УТИЛИТА ДЛЯ ЗАМЕНЫ ПРОБЕЛОВ ПОСЛЕ ЭМОДЗИ ==============
 
 def es(text):
-    """Заменяет обычный пробел после эмодзи на символ ㅤ (U+3164)"""
+    """Заменяет обычный пробел после эмодзи на символ   (U+3164)"""
     replacements = {
         '🔔 ': '🔔ㅤ', '📌 ': '📌ㅤ', '✅ ': '✅ㅤ', '❌ ': '❌ㅤ',
         '❓ ': '❓ㅤ', '💡 ': '💡ㅤ', '🏖️ ': '🏖️ㅤ', '🏖 ': '🏖ㅤ',
@@ -450,7 +450,7 @@ async def check_spreadsheet():
         return
 
     async with check_lock:
-        print(f"🔍ㅤНачинаем проверку таблицы в {datetime.now(MSK).strftime('%H:%M:%S')}")
+        print(f"🔍 Начинаем проверку таблицы в {datetime.now(MSK).strftime('%H:%M:%S')}")
 
         try:
             if not gc:
@@ -489,7 +489,7 @@ async def check_spreadsheet():
 
                 # Проверяем только утверждённые отпуска из JSON
                 if is_on_vacation_dynamic(nickname, current_time):
-                    print(f"✅ㅤ{nickname} в отпуске, пропускаем проверку.")
+                    print(f"✅ {nickname} в отпуске, пропускаем проверку.")
                     continue
 
                 issues = []
@@ -518,7 +518,7 @@ async def check_spreadsheet():
                 intro = build_intro_message(current_time)
 
                 if len(intro) > EXPECTED_INTRO_MAX_LEN:
-                    print(f"⚠️ㅤВНИМАНИЕ: intro подозрительно длинный ({len(intro)} символов, "
+                    print(f"⚠️ ВНИМАНИЕ: intro подозрительно длинный ({len(intro)} символов, "
                           f"ожидалось не более {EXPECTED_INTRO_MAX_LEN}). "
                           f"Похоже на дублирование текста в коде! Отправка intro отменена.")
                 else:
@@ -536,15 +536,15 @@ async def check_spreadsheet():
                     )
                     await send_chunked(thread, not_found_msg, "список ненайденных")
 
-                print(f"✅ㅤПроверка завершена. Отправлено уведомлений: {len(user_issues)}")
+                print(f"✅ Проверка завершена. Отправлено уведомлений: {len(user_issues)}")
             else:
-                print("✅ㅤПроблем не обнаружено")
+                print("✅ Проблем не обнаружено")
 
         except Exception as e:
             print(f"Ошибка при проверке: {e}")
             try:
                 thread = await client.fetch_channel(THREAD_ID)
-                await thread.send(f"❌ㅤОшибка при проверке таблицы: {e}")
+                await thread.send(f"❌ Ошибка при проверке таблицы: {e}")
             except Exception:
                 pass
 
@@ -1063,9 +1063,11 @@ async def handle_vacation_request(interaction: discord.Interaction, nickname: st
             await interaction.response.send_message(es("❌ Отпуск не может быть дольше 31 дня!"), ephemeral=True)
             return
         
-        if start_date.date() < datetime.now(MSK).date():
-            await interaction.response.send_message(es("❌ Дата начала должна быть в будущем!"), ephemeral=True)
-            return
+        # Проверка даты только для обычных игроков, НЕ для админов
+        if not by_admin:
+            if start_date.date() < datetime.now(MSK).date():
+                await interaction.response.send_message(es("❌ Дата начала должна быть в будущем!"), ephemeral=True)
+                return
         
         member = await find_member_by_nickname(nickname)
         if not member:
@@ -1578,7 +1580,7 @@ async def create_event(title: str, description: str, start_time: datetime, end_t
         events[event_id]['message_id'] = message.id
         
         # Создаём ветку на посту мероприятия
-        thread = await message.create_thread(name=f"💬ㅤ{title}")
+        thread = await message.create_thread(name=f"💬 {title}")
         events[event_id]['thread_id'] = thread.id
         
         # Ищем роль "Боец ArmA"
@@ -1589,15 +1591,15 @@ async def create_event(title: str, description: str, start_time: datetime, end_t
                 f"{role_mention}\n\n" +
                 es("📢 Бойцы, запланировано мероприятие! Ждем ваших отметок!")
             )
-            print(f"✅ㅤУпоминание роли 'Боец ArmA' отправлено в ветку '{title}'")
+            print(f"✅ Упоминание роли 'Боец ArmA' отправлено в ветку '{title}'")
         else:
-            print("⚠️ㅤРоль 'Боец ArmA' не найдена на сервере")
+            print("⚠️ Роль 'Боец ArmA' не найдена на сервере")
         
         save_json(EVENTS_FILE, events)
-        print(f"✅ㅤМероприятие '{title}' опубликовано")
+        print(f"✅ Мероприятие '{title}' опубликовано")
         
     except Exception as e:
-        print(f"❌ㅤОшибка публикации мероприятия: {e}")
+        print(f"❌ Ошибка публикации мероприятия: {e}")
 
 async def show_event_list(interaction: discord.Interaction):
     events = load_json(EVENTS_FILE, {})
