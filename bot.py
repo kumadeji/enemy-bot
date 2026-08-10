@@ -884,129 +884,9 @@ async def parse_datetime(dt_str: str) -> datetime:
         raise ValueError("Неверный формат! Используйте ДД.ММ.ГГГГ ЧЧ:ММ")
 
 
-async def handle_admin_command(message: discord.Message):
-    """Обрабатывает команды админа"""
-    if message.author.id not in ADMIN_USER_IDS:
-        return
-    
-    content = message.content.strip()
-    parts = content.split(maxsplit=1)
-    
-    if len(parts) < 2:
-        return
-    
-    command = parts[1]
-    
-    try:
-        if command.startswith("event add"):
-            # Формат: !event add "Название" | "Описание" | "ДД.ММ.ГГГГ ЧЧ:ММ" | "ДД.ММ.ГГГГ ЧЧ:ММ"
-            args = command[len("event add"):].strip().split("|")
-            if len(args) < 4:
-                await message.channel.send("❌ Формат: `!event add \"Название\" | \"Описание\" | \"ДД.ММ.ГГГГ ЧЧ:ММ\" | \"ДД.ММ.ГГГГ ЧЧ:ММ\"`")
-                return
-            
-            title = args[0].strip().strip('"')
-            description = args[1].strip().strip('"')
-            start_time = await parse_datetime(args[2].strip().strip('"'))
-            end_time = await parse_datetime(args[3].strip().strip('"'))
-            
-            await create_event(title, description, start_time, end_time)
-            await message.add_reaction('✅')
-            
-        elif command.startswith("event cancel"):
-            # Формат: !event cancel <message_id>
-            args = command.split()
-            if len(args) < 3:
-                await message.channel.send("❌ Формат: `!event cancel <message_id>`")
-                return
-            
-            message_id = int(args[2])
-            events = load_json(EVENTS_FILE, {})
-            
-            for event_id, event in list(events.items()):
-                if event.get('message_id') == message_id:
-                    del events[event_id]
-                    save_json(EVENTS_FILE, events)
-                    await message.channel.send(f"✅ Мероприятие отменено!")
-                    await message.add_reaction('✅')
-                    return
-            
-            await message.channel.send("❌ Мероприятие не найдено!")
-            
-        elif command == "event list":
-            events = load_json(EVENTS_FILE, {})
-            if not events:
-                await message.channel.send("📭 Нет активных мероприятий")
-                return
-            
-            text = "📋 **Активные мероприятия:**\n\n"
-            for event_id, event in events.items():
-                start = datetime.fromtimestamp(event['start_time'], MSK)
-                text += f"**{event['title']}**\n"
-                text += f"ID: `{event_id}`\n"
-                text += f"Дата: {start.strftime('%d.%m.%Y %H:%M')}\n"
-                text += f"✅ Придут: {len(event.get('accepted', {}))}\n"
-                text += f"❌ Не придут: {len(event.get('declined', {}))}\n\n"
-            
-            await message.channel.send(text)
-            
-        elif command.startswith("vacation remove"):
-            # Формат: !vacation remove <nickname>
-            args = command.split(maxsplit=2)
-            if len(args) < 3:
-                await message.channel.send("❌ Формат: `!vacation remove [En-Y]Nickname`")
-                return
-            
-            nickname = args[2].strip()
-            vacations = load_json(VACATIONS_FILE, {})
-            
-            # Ищем по частичному совпадению
-            found = False
-            for vac_name in list(vacations.keys()):
-                if nickname.lower() in vac_name.lower():
-                    del vacations[vac_name]
-                    save_json(VACATIONS_FILE, vacations)
-                    await message.channel.send(f"✅ {vac_name} выведен из отпуска досрочно!")
-                    found = True
-                    break
-            
-            if not found:
-                await message.channel.send(f"❌ Игрок {nickname} не найден в отпусках!")
-            else:
-                await message.add_reaction('✅')
-            
-        elif command == "vacation list":
-            vacations = load_json(VACATIONS_FILE, {})
-            if not vacations:
-                await message.channel.send("🏖️ Нет активных отпусков")
-                return
-            
-            text = "🏖️ **Активные отпуска:**\n\n"
-            for nickname, dates in vacations.items():
-                start = datetime.fromisoformat(dates['start']).strftime('%d.%m.%Y')
-                end = datetime.fromisoformat(dates['end']).strftime('%d.%m.%Y')
-                text += f"**{nickname}**: {start} - {end}\n"
-            
-            await message.channel.send(text)
-            
-        elif command == "vacation setup":
-            # Публикует кнопку для оформления отпуска
-            channel = await client.fetch_channel(VACATION_CHANNEL_ID)
-            embed = discord.Embed(
-                title="🏖️ Оформление отпуска",
-                description=(
-                    "Здесь вы можете оформить отпуск на период от 7 до 31 дня.\n\n"
-                    "Во время отпуска вы не сможете отмечаться на мероприятия.\n"
-                    "Если вы хотите выйти из отпуска досрочно, обратитесь к администратору."
-                ),
-                color=discord.Color.green()
-            )
-            view = VacationRequestView()
-            await channel.send(embed=embed, view=view)
-            await message.add_reaction('✅')
-            
-        elif command == "faq":
-            faq_text = """📖 **СПРАВКА ПО ФУНКЦИЯМ БОТА** 📖
+async def send_faq(message: discord.Message):
+    """Отправляет подробную справку по функциям бота"""
+    faq_text = """📖 **СПРАВКА ПО ФУНКЦИЯМ БОТА** 📖
 
 **═══════════════════════════════════════**
 **🔍 ПРОВЕРКА ТАБЛИЦЫ (Основная функция)**
@@ -1129,9 +1009,175 @@ async def handle_admin_command(message: discord.Message):
 • !vacation setup → Опубликовать кнопку для игроков
 • !vacation list → Посмотреть всех в отпуске
 • !vacation remove [En-Y]Killa → Вывести из отпуска
+
+
+**═══════════════════════════════════════**
+**⚠️ ВАЖНЫЕ ЗАМЕЧАНИЯ**
+**═══════════════════════════════════════**
+
+• Все команды работают только в админском канале
+• Все админские команды доступны только трем администраторам
+• Данные мероприятий и отпусков сохраняются автоматически
+• Бот автоматически перезапускается при обновлениях кода
+• Игроки в отпуске автоматически исключаются из всех проверок
+
+**═══════════════════════════════════════**
+**📞 ПОДДЕРЖКА**
+**═══════════════════════════════════════**
+
+Если возникли проблемы или вопросы:
+1. Проверьте логи бота на сервере
+2. Убедитесь, что файлы `events_data.json` и `vacations.json` существуют
+3. Проверьте права бота в Discord (отправка сообщений, управление ролями)
+4. Обратитесь к разработчику бота
+
+**═══════════════════════════════════════**
 """
-            await send_chunked(message.channel, faq_text, "FAQ")
-            await message.add_reaction('✅')
+    await send_chunked(message.channel, faq_text, "FAQ")
+    await message.add_reaction('✅')
+
+
+async def handle_admin_command(message: discord.Message):
+    """Обрабатывает команды админа"""
+    if message.author.id not in ADMIN_USER_IDS:
+        return
+    
+    content = message.content.strip()
+    
+    if not content.startswith('!'):
+        return
+    
+    # Убираем префикс !
+    command_text = content[1:]
+    
+    # Разделяем на команду и аргументы
+    parts = command_text.split(maxsplit=1)
+    command_name = parts[0] if parts else ""
+    command_args = parts[1] if len(parts) > 1 else ""
+    
+    try:
+        # Команда !faq (без аргументов)
+        if command_name == "faq":
+            await send_faq(message)
+            return
+        
+        # Команды мероприятий: !event add/cancel/list
+        elif command_name == "event":
+            if command_args.startswith("add"):
+                # Формат: !event add "Название" | "Описание" | "ДД.ММ.ГГГГ ЧЧ:ММ" | "ДД.ММ.ГГГГ ЧЧ:ММ"
+                args = command_args[len("add"):].strip().split("|")
+                if len(args) < 4:
+                    await message.channel.send("❌ Формат: `!event add \"Название\" | \"Описание\" | \"ДД.ММ.ГГГГ ЧЧ:ММ\" | \"ДД.ММ.ГГГГ ЧЧ:ММ\"`")
+                    return
+                
+                title = args[0].strip().strip('"')
+                description = args[1].strip().strip('"')
+                start_time = await parse_datetime(args[2].strip().strip('"'))
+                end_time = await parse_datetime(args[3].strip().strip('"'))
+                
+                await create_event(title, description, start_time, end_time)
+                await message.add_reaction('✅')
+                
+            elif command_args.startswith("cancel"):
+                # Формат: !event cancel <message_id>
+                args = command_args.split()
+                if len(args) < 2:
+                    await message.channel.send("❌ Формат: `!event cancel <message_id>`")
+                    return
+                
+                message_id = int(args[1])
+                events = load_json(EVENTS_FILE, {})
+                
+                for event_id, event in list(events.items()):
+                    if event.get('message_id') == message_id:
+                        del events[event_id]
+                        save_json(EVENTS_FILE, events)
+                        await message.channel.send(f"✅ Мероприятие отменено!")
+                        await message.add_reaction('✅')
+                        return
+                
+                await message.channel.send("❌ Мероприятие не найдено!")
+                
+            elif command_args == "list":
+                events = load_json(EVENTS_FILE, {})
+                if not events:
+                    await message.channel.send("📭 Нет активных мероприятий")
+                    return
+                
+                text = "📋 **Активные мероприятия:**\n\n"
+                for event_id, event in events.items():
+                    start = datetime.fromtimestamp(event['start_time'], MSK)
+                    text += f"**{event['title']}**\n"
+                    text += f"ID: `{event_id}`\n"
+                    text += f"Дата: {start.strftime('%d.%m.%Y %H:%M')}\n"
+                    text += f"✅ Придут: {len(event.get('accepted', {}))}\n"
+                    text += f"❌ Не придут: {len(event.get('declined', {}))}\n\n"
+                
+                await message.channel.send(text)
+            else:
+                await message.channel.send("❌ Неизвестная команда! Используйте `!event add`, `!event cancel` или `!event list`")
+        
+        # Команды отпусков: !vacation remove/list/setup
+        elif command_name == "vacation":
+            if command_args.startswith("remove"):
+                # Формат: !vacation remove <nickname>
+                args = command_args.split(maxsplit=1)
+                if len(args) < 2:
+                    await message.channel.send("❌ Формат: `!vacation remove [En-Y]Nickname`")
+                    return
+                
+                nickname = args[1].strip()
+                vacations = load_json(VACATIONS_FILE, {})
+                
+                # Ищем по частичному совпадению
+                found = False
+                for vac_name in list(vacations.keys()):
+                    if nickname.lower() in vac_name.lower():
+                        del vacations[vac_name]
+                        save_json(VACATIONS_FILE, vacations)
+                        await message.channel.send(f"✅ {vac_name} выведен из отпуска досрочно!")
+                        found = True
+                        break
+                
+                if not found:
+                    await message.channel.send(f"❌ Игрок {nickname} не найден в отпусках!")
+                else:
+                    await message.add_reaction('✅')
+                    
+            elif command_args == "list":
+                vacations = load_json(VACATIONS_FILE, {})
+                if not vacations:
+                    await message.channel.send("🏖️ Нет активных отпусков")
+                    return
+                
+                text = "🏖️ **Активные отпуска:**\n\n"
+                for nickname, dates in vacations.items():
+                    start = datetime.fromisoformat(dates['start']).strftime('%d.%m.%Y')
+                    end = datetime.fromisoformat(dates['end']).strftime('%d.%m.%Y')
+                    text += f"**{nickname}**: {start} - {end}\n"
+                
+                await message.channel.send(text)
+                
+            elif command_args == "setup":
+                # Публикует кнопку для оформления отпуска
+                channel = await client.fetch_channel(VACATION_CHANNEL_ID)
+                embed = discord.Embed(
+                    title="🏖️ Оформление отпуска",
+                    description=(
+                        "Здесь вы можете оформить отпуск на период от 7 до 31 дня.\n\n"
+                        "Во время отпуска вы не сможете отмечаться на мероприятия.\n"
+                        "Если вы хотите выйти из отпуска досрочно, обратитесь к администратору."
+                    ),
+                    color=discord.Color.green()
+                )
+                view = VacationRequestView()
+                await channel.send(embed=embed, view=view)
+                await message.add_reaction('✅')
+            else:
+                await message.channel.send("❌ Неизвестная команда! Используйте `!vacation remove`, `!vacation list` или `!vacation setup`")
+        
+        else:
+            await message.channel.send(f"❌ Неизвестная команда `!{command_name}`. Напишите `!faq` для справки.")
             
     except Exception as e:
         print(f"Ошибка обработки команды: {e}")
