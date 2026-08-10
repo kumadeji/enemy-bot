@@ -183,7 +183,7 @@ VACATION_RULES = es("""
 **❌ Неуважительные причины:**
 * Усталость от игры
 
-*💡 Боец, указывай честную и конкретную причину! Это помогает командованию планировать состав на игры. Отпуск может быть аннулирован, если вы будете находится в отпуске, но постоянно играть в игры во время проводимых мероприятий в клане.*
+Боец, указывай честную и конкретную причину! Это помогает командованию планировать состав на игры. Отпуск может быть аннулирован, если вы будете находится в отпуске, но постоянно играть в игры во время проводимых мероприятий в клане.
 """)
 
 # ============== ИНИЦИАЛИЗАЦИЯ ==============
@@ -1594,17 +1594,32 @@ async def create_event(title: str, description: str, start_time: datetime, end_t
     
     try:
         channel = await client.fetch_channel(EVENTS_CHANNEL_ID)
+        guild = channel.guild
+        
+        # Ищем роль "Боец ArmA"
+        role_mention = ""
+        role = discord.utils.get(guild.roles, name="Боец ArmA")
+        if role:
+            role_mention = f"{role.mention}\n\n"
+            print(f"✅ㅤНайдена роль 'Боец ArmA' (ID: {role.id})")
+        else:
+            print("⚠️ㅤРоль 'Боец ArmA' не найдена на сервере")
+        
         embed = await build_event_embed(event_id)
+        
+        # Добавляем упоминание роли в начало описания
+        if role_mention:
+            embed.description = role_mention + embed.description
+        
         view = EventView(event_id)
         
         message = await channel.send(embed=embed, view=view)
         events[event_id]['message_id'] = message.id
         save_json(EVENTS_FILE, events)
         
-        print(f"✅ Мероприятие '{title}' опубликовано")
+        print(f"✅ㅤМероприятие '{title}' опубликовано")
     except Exception as e:
-        print(f"❌ Ошибка публикации мероприятия: {e}")
-
+        print(f"❌ㅤОшибка публикации мероприятия: {e}")
 
 async def show_event_list(interaction: discord.Interaction):
     events = load_json(EVENTS_FILE, {})
