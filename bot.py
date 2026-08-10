@@ -81,7 +81,7 @@ acquire_single_instance_lock()
 
 # ============== НАСТРОЙКИ ==============
 
-THREAD_ID = 1503003066641809418
+THREAD_ID = 1530860224724996237
 ALLOWED_USER_ID = 115475534544109573
 PREFIX = '!s '
 
