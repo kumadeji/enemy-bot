@@ -116,9 +116,6 @@ COLUMNS_TO_CHECK = [
     'Сайт TT (без клантега - исправить только через администрацию)'
 ]
 
-# Максимально ожидаемая длина вводного сообщения.
-# Если фактическая длина больше — значит, при копировании файла
-# текст случайно продублировался, отправлять его нельзя.
 EXPECTED_INTRO_MAX_LEN = 700
 
 # ============== ИНИЦИАЛИЗАЦИЯ ==============
@@ -134,8 +131,7 @@ check_lock = asyncio.Lock()
 
 
 class MessageDeduplicator:
-    """Защита от повторной обработки одного и того же события on_message
-    (например, при реконнекте gateway)."""
+    """Защита от повторной обработки одного и того же события on_message."""
 
     def __init__(self, maxlen=500):
         self._order = deque(maxlen=maxlen)
@@ -295,11 +291,6 @@ async def send_chunked(thread, text, user_name=""):
 # ============== ПОСТРОЕНИЕ ТЕКСТОВ СООБЩЕНИЙ ==============
 
 def build_intro_lines(current_time: datetime) -> list:
-    """Возвращает список строк вводного сообщения.
-    Каждая строка — отдельный элемент списка, поэтому случайное
-    дублирование блока сразу вызовет синтаксическую ошибку
-    (нужна запятая) или будет визуально заметно — молча склеиться,
-    как в случае с конкатенацией литералов, это не может."""
     return [
         "🔔 **Проверяющий бот клана** 🔔",
         "",
@@ -320,19 +311,6 @@ def build_intro_message(current_time: datetime) -> str:
 
 
 def build_user_message(discord_user, issues: list) -> str:
-    """Группирует проблемы пользователя по критичности и формирует текст:
-
-    👤 @Пользователь
-
-    🔴 Критические проблемы, требующие скорейшего исправления:
-    * <текст проблемы 1>
-    * <текст проблемы 2>
-
-    🟡 Важные, но менее критические проблемы, также требующие своевременного исправления:
-    * <текст проблемы 1>
-
-    ──────────────────────────────────────────────────
-    """
     red_issues = [i for i in issues if i['severity'] == 'red']
     yellow_issues = [i for i in issues if i['severity'] == 'yellow']
 
@@ -469,6 +447,80 @@ async def check_spreadsheet():
             except Exception:
                 pass
 
+# ============== ЭКСПЕРИМЕНТАЛЬНЫЙ ФУНКЦИОНАЛ ==============
+
+async def reproduce_message_test():
+    """Достаёт сообщение 1536366053737889813, выводит его содержание и отправляет копию в тестовую ветку."""
+    print("🧪 Экспериментальный функционал: воспроизведение сообщения 1536366053737889813")
+    
+    try:
+        # Получаем гильдию через основную ветку
+        main_thread = await client.fetch_channel(THREAD_ID)
+        guild = main_thread.guild
+        
+        source_message = None
+        
+        # Ищем во всех каналах и потоках
+        channels_to_search = list(guild.channels) + list(guild.threads)
+        
+        for channel in channels_to_search:
+            if hasattr(channel, 'fetch_message'):
+                try:
+                    msg = await channel.fetch_message(1536366053737889813)
+                    source_message = msg
+                    print(f"✅ Сообщение найдено в канале: {channel.name} (ID: {channel.id})")
+                    break
+                except discord.NotFound:
+                    continue
+                except discord.Forbidden:
+                    continue
+                except Exception:
+                    continue
+                    
+        if not source_message:
+            print("❌ Не удалось найти сообщение 1536366053737889813 в доступных каналах гильдии.")
+            return
+
+        # Выводим содержание в консоль
+        print("-" * 40)
+        print("📄 ИЗВЛЕЧЕННОЕ СОДЕРЖАНИЕ СООБЩЕНИЯ:")
+        print(f"Текст:\n{source_message.content}")
+        if source_message.embeds:
+            print(f"Embed-сообщения: {len(source_message.embeds)} шт.")
+            for i, embed in enumerate(source_message.embeds):
+                print(f"  Embed {i+1} dict: {embed.to_dict()}")
+        if source_message.attachments:
+            print(f"Вложения: {len(source_message.attachments)} шт. ({[a.filename for a in source_message.attachments]})")
+        if source_message.components:
+             print(f"🎛️ Интерактивные кнопки: {len(source_message.components)} шт. (визуально не копируются)")
+        print("-" * 40)
+
+        # Целевая тестовая ветка
+        test_thread = await client.fetch_channel(1503003066641809418)
+
+        # Собираем файлы для отправки
+        files = [await a.to_file() for a in source_message.attachments] if source_message.attachments else []
+        
+        # Отправляем сообщение
+        if files:
+            await test_thread.send(content=source_message.content or None, embeds=source_message.embeds, files=files[:10])
+            # Лимит Discord 10 файлов на сообщение, отправляем остаток, если есть
+            if len(files) > 10:
+                for i in range(10, len(files), 10):
+                    await test_thread.send(files=files[i:i+10])
+        else:
+            if source_message.content or source_message.embeds:
+                await test_thread.send(content=source_message.content or None, embeds=source_message.embeds)
+                
+        print("✅ Экспериментальное сообщение успешно отправлено в тестовую ветку 1503003066641809418!")
+        print("⚠️ Примечание: кнопки (View) автоматически не копируются. Если в сообщении есть кнопки, скопируйте вывод из консоли сюда, и я напишу их логику.")
+
+    except Exception as e:
+        print(f"❌ Ошибка при воспроизведении: {e}")
+        import traceback
+        traceback.print_exc()
+
+
 # ============== СОБЫТИЯ DISCORD ==============
 
 @client.event
@@ -502,6 +554,14 @@ async def on_message(message):
     if message.author.id != ALLOWED_USER_ID:
         return
 
+    # --- НОВЫЙ ЭКСПЕРИМЕНТАЛЬНЫЙ ФУНКЦИОНАЛ ---
+    if message.content.startswith('!reproduce'):
+        await message.channel.send('🧪 Запускаю эксперимент по копированию сообщения...')
+        await reproduce_message_test()
+        await message.add_reaction('✅')
+        return
+
+    # --- СТАРЫЙ ФУНКЦИОНАЛ ---
     if message.content.startswith('!check'):
         if check_lock.locked():
             await message.channel.send('⚠️ Проверка уже выполняется, подождите.')
