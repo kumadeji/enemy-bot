@@ -767,7 +767,8 @@ class AdminMainMenuView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
     
-    @discord.ui.button(label="📅 Создать мероприятие", style=discord.ButtonStyle.primary, custom_id="admin_create_event")
+    # ═══════════ РЯД 1: МЕРОПРИЯТИЯ ═══════════
+    @discord.ui.button(label="📅 Создать мероприятие", style=discord.ButtonStyle.primary, custom_id="admin_create_event", row=0)
     async def create_event_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
@@ -775,7 +776,7 @@ class AdminMainMenuView(discord.ui.View):
         modal = EventCreateModal()
         await interaction.response.send_modal(modal)
     
-    @discord.ui.button(label="📅 Мероприятия недели", style=discord.ButtonStyle.primary, custom_id="admin_force_weekly")
+    @discord.ui.button(label="📅 Мероприятия недели", style=discord.ButtonStyle.primary, custom_id="admin_force_weekly", row=0)
     async def force_weekly_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
@@ -784,14 +785,15 @@ class AdminMainMenuView(discord.ui.View):
         await post_weekly_events()
         await interaction.followup.send("✅ Мероприятия на эту неделю опубликованы!", ephemeral=True)
     
-    @discord.ui.button(label="📋 Список мероприятий", style=discord.ButtonStyle.secondary, custom_id="admin_event_list")
+    @discord.ui.button(label="📋 Список мероприятий", style=discord.ButtonStyle.secondary, custom_id="admin_event_list", row=0)
     async def event_list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
             return
         await show_event_list(interaction)
     
-    @discord.ui.button(label="📝 Отправить сообщение", style=discord.ButtonStyle.success, custom_id="admin_send_message")
+    # ═══════════ РЯД 2: СООБЩЕНИЯ ═══════════
+    @discord.ui.button(label="📝 Отправить сообщение", style=discord.ButtonStyle.success, custom_id="admin_send_message", row=1)
     async def send_message_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
@@ -799,7 +801,7 @@ class AdminMainMenuView(discord.ui.View):
         modal = SendMessageModal()
         await interaction.response.send_modal(modal)
     
-    @discord.ui.button(label="🗑️ Удалить сообщение", style=discord.ButtonStyle.danger, custom_id="admin_delete_message")
+    @discord.ui.button(label="🗑️ Удалить сообщение", style=discord.ButtonStyle.danger, custom_id="admin_delete_message", row=1)
     async def delete_message_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
@@ -807,7 +809,8 @@ class AdminMainMenuView(discord.ui.View):
         modal = DeleteMessageModal()
         await interaction.response.send_modal(modal)
     
-    @discord.ui.button(label="🏖️ Отпуск для игрока", style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player")
+    # ═══════════ РЯД 3: ОТПУСКА ═══════════
+    @discord.ui.button(label="🏖️ Отпуск для игрока", style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player", row=2)
     async def vacation_for_player_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
@@ -815,21 +818,22 @@ class AdminMainMenuView(discord.ui.View):
         modal = AdminVacationModal()
         await interaction.response.send_modal(modal)
     
-    @discord.ui.button(label="📋 Правила отпусков", style=discord.ButtonStyle.secondary, custom_id="admin_vacation_rules")
+    @discord.ui.button(label="📋 Правила отпусков", style=discord.ButtonStyle.secondary, custom_id="admin_vacation_rules", row=2)
     async def vacation_rules_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
             return
         await publish_vacation_info(interaction)
     
-    @discord.ui.button(label="🏖️ Список отпусков", style=discord.ButtonStyle.secondary, custom_id="admin_vacation_list")
+    @discord.ui.button(label="🏖️ Список отпусков", style=discord.ButtonStyle.secondary, custom_id="admin_vacation_list", row=2)
     async def vacation_list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
             return
         await show_vacation_list(interaction)
     
-    @discord.ui.button(label="🔍 Проверить таблицу", style=discord.ButtonStyle.success, custom_id="admin_check_table")
+    # ═══════════ РЯД 4: УТИЛИТЫ ═══════════
+    @discord.ui.button(label="🔍 Проверить таблицу", style=discord.ButtonStyle.success, custom_id="admin_check_table", row=3)
     async def check_table_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
@@ -840,7 +844,7 @@ class AdminMainMenuView(discord.ui.View):
         await interaction.response.send_message("🔍 Запускаю проверку таблицы...", ephemeral=True)
         await check_spreadsheet()
     
-    @discord.ui.button(label="❓ Справка", style=discord.ButtonStyle.secondary, custom_id="admin_faq")
+    @discord.ui.button(label="❓ Справка", style=discord.ButtonStyle.secondary, custom_id="admin_faq", row=3)
     async def faq_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message("⛔ Доступно только комбату и его заместителям!", ephemeral=True)
@@ -1439,7 +1443,7 @@ async def send_faq(interaction_or_message):
 • Воскресенье 17:45-22:15 (TvT TT)
 • Кнопка "📅 Мероприятия недели" для ручной публикации
 • Игроки отмечаются кнопками ✅/❌
-• **Автоматические напоминания за 15 минут до начала**
+• Автоматические напоминания за 15 минут до начала
 
 **🏖️ Отпуска**
 • Игроки оформляют сами через кнопку в канале отпусков
@@ -1457,8 +1461,6 @@ async def send_faq(interaction_or_message):
 • Оформление отпусков для игроков
 • Публикация правил отпусков
 • Проверка таблицы
-
-**💡 Совет:** Напишите `!faq` в админском канале для этой справки.
 """
     if hasattr(interaction_or_message, 'response'):
         await interaction_or_message.response.send_message(faq_text, ephemeral=True)
@@ -1506,7 +1508,6 @@ async def on_ready():
         )
         print("🏖️ Планировщик проверки отпусков добавлен (каждый час)")
 
-    # НОВОЕ: Планировщик напоминаний для мероприятий (каждую минуту)
     if not scheduler.get_job('event_reminders'):
         scheduler.add_job(
             check_event_reminders,
@@ -1532,15 +1533,10 @@ async def on_ready():
         embed = discord.Embed(
             title="🛠️ Панель управления комбата и заместителей",
             description=(
-                "Здесь вы можете управлять всеми функциями бота через кнопки.\n\n"
-                "**Доступные действия:**\n"
-                "• 📅 Создание и публикация мероприятий\n"
-                "• 📝 Отправка/удаление сообщений в любой канал\n"
-                "• 🏖️ Оформление отпусков для игроков\n"
-                "• 📋 Публикация правил отпусков\n"
-                "• 🔍 Проверка таблицы\n"
-                "• 🔔 Автоматические напоминания за 15 минут до мероприятий\n\n"
-                "Напишите `!faq` для краткой справки."
+                "**📅 Мероприятия** — создание, публикация, список\n"
+                "**💬 Сообщения** — отправка и удаление\n"
+                "**🏖️ Отпуска** — оформление, правила, список\n"
+                "**🔧 Утилиты** — проверка таблицы, справка"
             ),
             color=discord.Color.blue()
         )
@@ -1558,11 +1554,6 @@ async def on_message(message):
 
     if message.author == client.user:
         return
-    
-    if message.channel.id == ADMIN_CHANNEL_ID and message.author.id in ADMIN_USER_IDS:
-        if message.content.strip().lower() == '!faq':
-            await send_faq(message)
-            return
     
     if message.author.id not in ADMIN_USER_IDS:
         return
