@@ -119,16 +119,6 @@ SPREADSHEET_URL = 'https://docs.google.com/spreadsheets/d/1QGc-SRkWnFCaSx56_46UJ
 
 MSK = pytz.timezone('Europe/Moscow')
 
-VACATION_EXCEPTIONS = {
-    '[En-Y]Mr.GreyGoose': (datetime(2026, 8, 4), datetime(2026, 8, 10)),
-    '[En-Y]Bercekle': (datetime(2026, 7, 26), datetime(2026, 8, 26)),
-    '[En-Y]Slay': (datetime(2026, 7, 27), datetime(2026, 8, 27)),
-    '[En-Y]Killa': (datetime(2026, 7, 23), datetime(2026, 8, 23)),
-    '[En-Y]v1c': (datetime(2026, 7, 23), datetime(2026, 8, 23)),
-    '[En-Y]Russo': (datetime(2026, 7, 30), datetime(2026, 8, 10)),
-    '[En-Y]GDim': (datetime(2026, 8, 4), datetime(2026, 9, 4)),
-}
-
 NICKNAME_COLUMN = 'Discord клана (с клантегом)'
 SHEET_NAME = 'Основная таблица'
 
@@ -339,21 +329,6 @@ async def load_clan_members_from_sheet():
         print(f"❌ Ошибка загрузки списка клана: {e}")
         return CLAN_MEMBERS_CACHE
 
-
-def is_on_vacation(nickname: str, current_date: datetime) -> bool:
-    clean_nickname = nickname.strip().lower()
-    current_date_only = current_date.date()
-
-    for vac_name, (start_date, end_date) in VACATION_EXCEPTIONS.items():
-        if clean_nickname == vac_name.strip().lower():
-            if start_date.date() <= current_date_only <= end_date.date():
-                print(f"✅ {nickname} в отпуске (до {end_date.strftime('%d.%m.%Y')}), пропускаем.")
-                return True
-            else:
-                return False
-    return False
-
-
 async def find_discord_user(nickname: str, thread):
     try:
         guild = thread.guild
@@ -475,7 +450,7 @@ async def check_spreadsheet():
         return
 
     async with check_lock:
-        print(f"🔍 Начинаем проверку таблицы в {datetime.now(MSK).strftime('%H:%M:%S')}")
+        print(f"🔍ㅤНачинаем проверку таблицы в {datetime.now(MSK).strftime('%H:%M:%S')}")
 
         try:
             if not gc:
@@ -512,7 +487,9 @@ async def check_spreadsheet():
                 if not nickname:
                     continue
 
-                if is_on_vacation(nickname, current_time):
+                # Проверяем только утверждённые отпуска из JSON
+                if is_on_vacation_dynamic(nickname, current_time):
+                    print(f"✅ㅤ{nickname} в отпуске, пропускаем проверку.")
                     continue
 
                 issues = []
@@ -541,7 +518,7 @@ async def check_spreadsheet():
                 intro = build_intro_message(current_time)
 
                 if len(intro) > EXPECTED_INTRO_MAX_LEN:
-                    print(f"⚠️ ВНИМАНИЕ: intro подозрительно длинный ({len(intro)} символов, "
+                    print(f"⚠️ㅤВНИМАНИЕ: intro подозрительно длинный ({len(intro)} символов, "
                           f"ожидалось не более {EXPECTED_INTRO_MAX_LEN}). "
                           f"Похоже на дублирование текста в коде! Отправка intro отменена.")
                 else:
@@ -559,15 +536,15 @@ async def check_spreadsheet():
                     )
                     await send_chunked(thread, not_found_msg, "список ненайденных")
 
-                print(f"✅ Проверка завершена. Отправлено уведомлений: {len(user_issues)}")
+                print(f"✅ㅤПроверка завершена. Отправлено уведомлений: {len(user_issues)}")
             else:
-                print("✅ Проблем не обнаружено")
+                print("✅ㅤПроблем не обнаружено")
 
         except Exception as e:
             print(f"Ошибка при проверке: {e}")
             try:
                 thread = await client.fetch_channel(THREAD_ID)
-                await thread.send(f"❌ Ошибка при проверке таблицы: {e}")
+                await thread.send(f"❌ㅤОшибка при проверке таблицы: {e}")
             except Exception:
                 pass
 
@@ -595,10 +572,7 @@ def save_json(filename, data):
 
 
 def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
-    """Проверяет только УТВЕРЖДЁННЫЕ отпуска (статус 'active')"""
-    if is_on_vacation(nickname, current_date):
-        return True
-    
+    """Проверяет только УТВЕРЖДЁННЫЕ отпуска из JSON (статус 'active')"""
     vacations = load_json(VACATIONS_FILE, {})
     clean_nickname = nickname.strip().lower()
     current_date_only = current_date.date()
@@ -1596,28 +1570,32 @@ async def create_event(title: str, description: str, start_time: datetime, end_t
         channel = await client.fetch_channel(EVENTS_CHANNEL_ID)
         guild = channel.guild
         
+        embed = await build_event_embed(event_id)
+        view = EventView(event_id)
+        
+        # Отправляем пост мероприятия
+        message = await channel.send(embed=embed, view=view)
+        events[event_id]['message_id'] = message.id
+        
+        # Создаём ветку на посту мероприятия
+        thread = await message.create_thread(name=f"💬ㅤ{title}")
+        events[event_id]['thread_id'] = thread.id
+        
         # Ищем роль "Боец ArmA"
-        role_mention = ""
         role = discord.utils.get(guild.roles, name="Боец ArmA")
         if role:
-            role_mention = f"{role.mention}\n\n"
-            print(f"✅ㅤНайдена роль 'Боец ArmA' (ID: {role.id})")
+            role_mention = role.mention
+            await thread.send(
+                f"{role_mention}\n\n" +
+                es("📢 Бойцы, запланировано мероприятие! Ждем ваших отметок!")
+            )
+            print(f"✅ㅤУпоминание роли 'Боец ArmA' отправлено в ветку '{title}'")
         else:
             print("⚠️ㅤРоль 'Боец ArmA' не найдена на сервере")
         
-        embed = await build_event_embed(event_id)
-        
-        # Добавляем упоминание роли в начало описания
-        if role_mention:
-            embed.description = role_mention + embed.description
-        
-        view = EventView(event_id)
-        
-        message = await channel.send(embed=embed, view=view)
-        events[event_id]['message_id'] = message.id
         save_json(EVENTS_FILE, events)
-        
         print(f"✅ㅤМероприятие '{title}' опубликовано")
+        
     except Exception as e:
         print(f"❌ㅤОшибка публикации мероприятия: {e}")
 
