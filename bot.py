@@ -141,7 +141,7 @@ EXPECTED_INTRO_MAX_LEN = 700
 
 EVENTS_CHANNEL_ID = 1311705378140196926
 VACATION_CHANNEL_ID = 1284905224099598407
-ADMIN_CHANNEL_ID = 1470352063824265279
+ADMIN_CHANNEL_ID = 1536632416511332362
 VOICE_CHANNEL_ID = 1284893513921728582
 VOICE_CHANNEL_URL = "https://discord.com/channels/734494109032513699/1284893513921728582"
 
@@ -1509,7 +1509,7 @@ async def build_event_embed(event_id: str) -> discord.Embed:
         )
     if unmarked:
         embed.add_field(
-            name=es(f"❓ Не определились ({len(unmarked)})"),
+            name=es(f"❓ Не отметились ({len(unmarked)})"),
             value=">>> " + "\n".join(unmarked),
             inline=False
         )
@@ -1698,7 +1698,7 @@ async def check_event_reminders():
                             reminder_text = (
                                 es(f"📋 **Внимание: {event['title']}**\n\n") +
                                 f"{mentions_text}\n\n" +
-                                es("⏳ До мероприятия осталось **2 суток**, а вы ещё не определились с участием!\n\n") +
+                                es("⏳ До мероприятия осталось **2 суток**, а вы ещё не отметились!\n\n") +
                                 es("👉 Пожалуйста, отметьтесь в основном посте мероприятия — нажмите ") +
                                 es("✅ **Приду** или ") + es("❌ **Не приду**.\n\n") +
                                 es("💬 Это помогает командованию планировать состав на игру. ") +
