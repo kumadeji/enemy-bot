@@ -1979,6 +1979,24 @@ async def on_ready():
     
     try:
         admin_channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
+        
+        # === УДАЛЯЕМ СТАРЫЕ СООБЩЕНИЯ БОТА В АДМИНСКОМ КАНАЛЕ ===
+        try:
+            deleted = await admin_channel.purge(
+                limit=None,
+                check=lambda m: m.author == client.user,
+                reason="Очистка старых сообщений панели управления"
+            )
+            if deleted:
+                print(f"🧹 Удалено {len(deleted)} старых сообщений бота в админском канале")
+        except discord.Forbidden:
+            print("⚠️ У бота нет прав на удаление сообщений в админском канале. Проверьте права роли бота (Manage Messages).")
+        except discord.HTTPException as e:
+            print(f"⚠️ Не удалось удалить старые сообщения: {e}")
+        except Exception as e:
+            print(f"⚠️ Неожиданная ошибка при очистке: {e}")
+        
+        # === ОТПРАВЛЯЕМ НОВОЕ СООБЩЕНИЕ С ПАНЕЛЬЮ ===
         embed = discord.Embed(
             title=es("🛠️ Панель управления комбата и заместителей"),
             description=(
