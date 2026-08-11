@@ -1209,24 +1209,24 @@ async def handle_vacation_request(interaction: discord.Interaction, nickname: st
             if role_zam:
                 mentions.append(role_zam.mention)
             
+            # Ссылка на канал с отпусками (по аналогии с voice_mention)
+            vacation_mention = f"<#{VACATION_CHANNEL_ID}>"
+            
             if mentions:
                 mentions_text = " ".join(mentions)
                 await thread.send(
                     f"{mentions_text}\n\n" +
                     es(f"📋 Появился новый запрос на отпуск от **{nickname}** на утверждение!\n\n") +
-                    es(f"📅 Период: **{start_str} - {end_str}** ({duration} дней)\n") +
-                    es(f"📝 Причина: {reason}\n\n") +
-                    es("👉 Пожалуйста, перейдите в основное сообщение выше и нажмите ") +
+                    es(f"👉 Пожалуйста, перейдите в канал {vacation_mention} и нажмите ") +
                     es("✅ **Утвердить** или ") + es("❌ **Отклонить**.")
                 )
                 print(f"✅ Уведомление об отпуске {nickname} отправлено в ветку (ролей: {len(mentions)})")
             else:
-                # Если роли не найдены, всё равно отправим уведомление без пинга
+                # Если роли не найдены, отправим уведомление без пинга
                 await thread.send(
                     es(f"📋 Появился новый запрос на отпуск от **{nickname}** на утверждение!\n\n") +
-                    es(f"📅 Период: **{start_str} - {end_str}** ({duration} дней)\n") +
-                    es(f"📝 Причина: {reason}\n\n") +
-                    es("⚠️ Роли 'Комбат ArmA' и 'Зам. комбата ArmA' не найдены на сервере.")
+                    es(f"👉 Пожалуйста, перейдите в канал {vacation_mention} и нажмите ") +
+                    es("✅ **Утвердить** или ") + es("❌ **Отклонить**.")
                 )
                 print(f"⚠️ Роли комбата не найдены, уведомление отправлено без пинга")
             
@@ -1789,7 +1789,7 @@ async def post_weekly_events():
     
     await create_event(
         "СУББОТА - RTvT AS VDV",
-        f"Бойцы, на субботу запланировано мероприятие на сервере AS VDV. Ждём вас на мероприятии. Заходите в голосовой канал {voice_mention} за 15 минут до начала.",
+        f"Бойцы, на субботу запланировано мероприятие на сервере AS VDV. Ждём вас! Заходите в голосовой канал {voice_mention} за 15 минут до начала.",
         saturday_start,
         saturday_end
     )
@@ -1798,7 +1798,7 @@ async def post_weekly_events():
     
     await create_event(
         "ВОСКРЕСЕНЬЕ - TvT TT",
-        f"Бойцы, на воскресенье запланировано мероприятие на сервере TT. Ждём вас на мероприятии. Заходите в голосовой канал {voice_mention} за 15 минут до начала.",
+        f"Бойцы, на воскресенье запланировано мероприятие на сервере TT. Ждём вас! Заходите в голосовой канал {voice_mention} за 15 минут до начала.",
         sunday_start,
         sunday_end
     )
