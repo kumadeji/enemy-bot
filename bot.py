@@ -163,7 +163,7 @@ VACATION_RULES = es("""
 * Рапорт можно продлить, создав новый со следующего дня после окончания предыдущего
 * После оформления отпуск должен быть **утверждён комбатом или заместителем**
 * Во время отпуска тебе **не нужно отмечаться в расписании на игры**
-* Игрок в отпуске **лишается возможности участия в играх** до закрытия отпуска
+* Боец в отпуске **лишается возможности участия в играх** до закрытия отпуска
 
 **✅ Уважительные причины:**
 * Командировки и мероприятия по работе
@@ -667,9 +667,9 @@ class VacationModal(discord.ui.Modal, title=es("🏖️ Оформление о�
         )
 
 
-class AdminVacationModal(discord.ui.Modal, title=es("🏖️ Отпуск для игрока (комбат)")):
+class AdminVacationModal(discord.ui.Modal, title=es("🏖️ Отпуск для бойца (комбат)")):
     player_name = discord.ui.TextInput(
-        label="Ник игрока (как в Discord)",
+        label="Позывной бойца с клантегом (как в Discord)",
         placeholder="[En-Y]Killa",
         required=True,
         max_length=35
@@ -909,7 +909,7 @@ class AdminMainMenuView(discord.ui.View):
         modal = DeleteMessageModal()
         await interaction.response.send_modal(modal)
     
-    @discord.ui.button(label=es("🏖️ Отпуск для игрока"), style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player", row=2)
+    @discord.ui.button(label=es("🏖️ Отпуск для бойца"), style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player", row=2)
     async def vacation_for_player_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1013,7 +1013,7 @@ class VacationMessageView(discord.ui.View):
             await interaction.response.send_message(es("❌ Отпуск не найден! Возможно, данные были удалены."), ephemeral=True)
             return
         if interaction.user.display_name != nickname and interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Только сам игрок или командование может закрыть отпуск!"), ephemeral=True)
+            await interaction.response.send_message(es("⛔ Только сам боец или командование может закрыть отпуск!"), ephemeral=True)
             return
         await close_vacation(interaction, nickname, early=True, by_admin=False)
     
@@ -1128,7 +1128,7 @@ async def handle_vacation_request(interaction: discord.Interaction, nickname: st
             await interaction.response.send_message(es("❌ Отпуск не может быть дольше 31 дня!"), ephemeral=True)
             return
         
-        # Проверка даты только для обычных игроков, НЕ для админов
+        # Проверка даты только для обычных бойцов, НЕ для комбата/заместителей
         if not by_admin:
             if start_date.date() < datetime.now(MSK).date():
                 await interaction.response.send_message(es("❌ Дата начала должна быть в будущем!"), ephemeral=True)
@@ -1136,7 +1136,7 @@ async def handle_vacation_request(interaction: discord.Interaction, nickname: st
         
         member = await find_member_by_nickname(nickname)
         if not member:
-            await interaction.response.send_message(f"❌ Игрок {nickname} не найден на сервере!", ephemeral=True)
+            await interaction.response.send_message(f"❌ Боец {nickname} не найден на сервере!", ephemeral=True)
             return
         
         vacations = load_json(VACATIONS_FILE, {})
@@ -1157,7 +1157,7 @@ async def handle_vacation_request(interaction: discord.Interaction, nickname: st
             'message_id': None,
             'channel_id': None,
             'thread_id': None,
-            'created_by': interaction.user.display_name if by_admin else 'Сам игрок',
+            'created_by': interaction.user.display_name if by_admin else 'Сам боец',
             'by_admin': by_admin
         }
         save_json(VACATIONS_FILE, vacations)
@@ -1180,7 +1180,7 @@ async def handle_vacation_request(interaction: discord.Interaction, nickname: st
         
         # Правильное поле в зависимости от того, кто оформил
         if by_admin:
-            embed.add_field(name=es("👤 Оформил"), value=f"Комбат/зам: {interaction.user.display_name}", inline=False)
+            embed.add_field(name=es("👤 Оформил"), value=f"Комбат/заместитель: {interaction.user.display_name}", inline=False)
         else:
             embed.add_field(name=es("👤 Запросил"), value=interaction.user.display_name, inline=False)
         
@@ -1245,7 +1245,7 @@ async def handle_vacation_request(interaction: discord.Interaction, nickname: st
             ephemeral=True
         )
         
-        print(f"🏖️ {nickname}: отпуск с {start_str} по {end_str}. Причина: {reason}. Админ: {by_admin}")
+        print(f"🏖️ {nickname}: отпуск с {start_str} по {end_str}. Причина: {reason}. Комбат/заместитель: {by_admin}")
         
     except ValueError:
         await interaction.response.send_message(
@@ -1350,7 +1350,7 @@ async def reject_vacation(interaction: discord.Interaction, nickname: str):
                     embed.set_field_at(i, name=es("ℹ️ Статус"), value=es("❌ Отклонён командованием"), inline=False)
                     break
             embed.add_field(name=es("❌ Отклонил"), value=interaction.user.display_name, inline=False)
-            embed.set_footer(text="Отпуск аннулирован. Игрок должен отмечаться на мероприятия.")
+            embed.set_footer(text="Отпуск аннулирован. Боец должен отмечаться на мероприятия.")
             
             await message.edit(embed=embed, view=None)
     except Exception as e:
@@ -1400,12 +1400,12 @@ async def close_vacation(interaction: discord.Interaction, nickname: str, early:
     except Exception as e:
         print(f"Ошибка обновления сообщения: {e}")
     
-    who_closed = "комбат/заместитель" if by_admin else "игрок"
+    who_closed = "комбат/заместитель" if by_admin else "боец"
     await interaction.response.send_message(
         f"✅ Отпуск {nickname} закрыт ({who_closed}). Роль 'Отпуск' снята.",
         ephemeral=True
     )
-    print(f"✅ Отпуск {nickname} закрыт. Ранний: {early}, Админ: {by_admin}")
+    print(f"✅ Отпуск {nickname} закрыт. Ранний: {early}, Комбат/заместитель: {by_admin}")
 
 
 async def show_vacation_list(interaction: discord.Interaction):
@@ -1427,9 +1427,9 @@ async def show_vacation_list(interaction: discord.Interaction):
             end = datetime.fromisoformat(data['end']).strftime('%d.%m.%Y')
             text += f"**{nickname}**: {start} - {end}\n"
             text += f"Причина: {data.get('reason', 'Не указана')}\n"
-            created_by = data.get('created_by', 'Сам игрок')
+            created_by = data.get('created_by', 'Сам боец')
             if data.get('by_admin', False):
-                text += f"Оформил комбат/зам: {created_by}\n\n"
+                text += f"Оформил комбат/заместитель: {created_by}\n\n"
             else:
                 text += f"Запросил: {created_by}\n\n"
     
@@ -1890,7 +1890,7 @@ async def check_event_reminders():
                         )
                         
                         await thread.send(reminder_text)
-                        print(f"✅ Напоминание за 15 минут для '{event['title']}' ({len(accepted)} игроков)")
+                        print(f"✅ Напоминание за 15 минут для '{event['title']}' ({len(accepted)} бойцов)")
                     
                     event['reminder_15min_sent'] = True
                     changed = True
