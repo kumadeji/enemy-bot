@@ -869,6 +869,8 @@ class AdminMainMenuView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
     
+    # ═══════════ РЯД 1: МЕРОПРИЯТИЯ ═══════════
+    
     @discord.ui.button(label=es("📅 Создать мероприятие"), style=discord.ButtonStyle.primary, custom_id="admin_create_event", row=0)
     async def create_event_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
@@ -877,14 +879,16 @@ class AdminMainMenuView(discord.ui.View):
         modal = EventCreateModal()
         await interaction.response.send_modal(modal)
     
-    @discord.ui.button(label=es("📅 Мероприятия недели"), style=discord.ButtonStyle.primary, custom_id="admin_force_weekly", row=0)
-    async def force_weekly_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-            return
-        await interaction.response.defer(ephemeral=True)
-        await post_weekly_events()
-        await interaction.followup.send(es("✅ Мероприятия на эту неделю опубликованы!"), ephemeral=True)
+    # === КНОПКА СКРЫТА (закомментирована) ===
+    # @discord.ui.button(label=es("📅 Мероприятия недели"), style=discord.ButtonStyle.primary, custom_id="admin_force_weekly", row=0)
+    # async def force_weekly_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    #     if interaction.user.id not in ADMIN_USER_IDS:
+    #         await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+    #         return
+    #     await interaction.response.defer(ephemeral=True)
+    #     await post_weekly_events()
+    #     await interaction.followup.send(es("✅ Мероприятия на эту неделю опубликованы!"), ephemeral=True)
+    # === КОНЕЦ СКРЫТОЙ КНОПКИ ===
     
     @discord.ui.button(label=es("📋 Список мероприятий"), style=discord.ButtonStyle.secondary, custom_id="admin_event_list", row=0)
     async def event_list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -892,6 +896,8 @@ class AdminMainMenuView(discord.ui.View):
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await show_event_list(interaction)
+    
+    # ═══════════ РЯД 2: СООБЩЕНИЯ ═══════════
     
     @discord.ui.button(label=es("📝 Отправить сообщение"), style=discord.ButtonStyle.success, custom_id="admin_send_message", row=1)
     async def send_message_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -909,6 +915,8 @@ class AdminMainMenuView(discord.ui.View):
         modal = DeleteMessageModal()
         await interaction.response.send_modal(modal)
     
+    # ═══════════ РЯД 3: ОТПУСКА ═══════════
+    
     @discord.ui.button(label=es("🏖️ Отпуск для бойца"), style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player", row=2)
     async def vacation_for_player_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id not in ADMIN_USER_IDS:
@@ -917,12 +925,14 @@ class AdminMainMenuView(discord.ui.View):
         modal = AdminVacationModal()
         await interaction.response.send_modal(modal)
     
-    @discord.ui.button(label=es("📋 Правила отпусков"), style=discord.ButtonStyle.secondary, custom_id="admin_vacation_rules", row=2)
-    async def vacation_rules_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-            return
-        await publish_vacation_info(interaction)
+    # === КНОПКА СКРЫТА (закомментирована) ===
+    # @discord.ui.button(label=es("📋 Правила отпусков"), style=discord.ButtonStyle.secondary, custom_id="admin_vacation_rules", row=2)
+    # async def vacation_rules_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    #     if interaction.user.id not in ADMIN_USER_IDS:
+    #         await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+    #         return
+    #     await publish_vacation_info(interaction)
+    # === КОНЕЦ СКРЫТОЙ КНОПКИ ===
     
     @discord.ui.button(label=es("🏖️ Список отпусков"), style=discord.ButtonStyle.secondary, custom_id="admin_vacation_list", row=2)
     async def vacation_list_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -930,6 +940,8 @@ class AdminMainMenuView(discord.ui.View):
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await show_vacation_list(interaction)
+    
+    # ═══════════ РЯД 4: УТИЛИТЫ ═══════════
     
     @discord.ui.button(label=es("🔍 Проверить таблицу"), style=discord.ButtonStyle.success, custom_id="admin_check_table", row=3)
     async def check_table_button(self, interaction: discord.Interaction, button: discord.ui.Button):
