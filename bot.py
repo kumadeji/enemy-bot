@@ -212,18 +212,16 @@ def pluralize_days(num: int) -> str:
 def format_vacation_period(start_iso: str, end_iso: str) -> str:
     """Форматирует период отпуска в виде меток времени Discord.
     
-    Первая строка всегда: <t:START:d> - <t:END:d> (N день/дня/дней)
-    Вторая строка (relative) появляется только когда отпуск актуален:
-    - До начала отпуска: <t:START:R>
-    - Во время отпуска: <t:END:R>
+    Первая строка: Даты: <t:START:d> - <t:END:d> (N день/дня/дней)
+    Вторая строка (только когда актуален):
+    - До начала: "Начнется:" + <t:START:R>
+    - Во время: "Закончится:" + <t:END:R>
     - После окончания: исчезает
-    
-    Используется для embed-сообщений и обновления шаблонов."""
+    """
     start = datetime.fromisoformat(start_iso)
     end = datetime.fromisoformat(end_iso)
     current_time = datetime.now(MSK)
     
-    # Локализуем, если naive datetime (без tzinfo)
     if start.tzinfo is None:
         start = MSK.localize(start)
     if end.tzinfo is None:
@@ -232,22 +230,19 @@ def format_vacation_period(start_iso: str, end_iso: str) -> str:
     start_ts = int(start.timestamp())
     end_ts = int(end.timestamp())
     
-    # Длительность в днях (разница дат)
     duration = (end.date() - start.date()).days
     days_word = pluralize_days(duration)
     
-    # Первая строка: даты + длительность в скобках
-    result = f"<t:{start_ts}:d> - <t:{end_ts}:d> ({duration} {days_word})"
+    # Первая строка с префиксом "Даты:"
+    result = f"Даты: <t:{start_ts}:d> - <t:{end_ts}:d> ({duration} {days_word})"
     
-    # Вторая строка: relative time (исчезает после окончания)
+    # Вторая строка с префиксом в зависимости от текущего статуса
     if current_time < start:
-        result += f"\n<t:{start_ts}:R>"
+        result += f"\nНачнется: <t:{start_ts}:R>"
     elif current_time <= end:
-        result += f"\n<t:{end_ts}:R>"
-    # Если отпуск уже закончился — ничего не добавляем
+        result += f"\nЗакончится: <t:{end_ts}:R>"
     
     return result
-
 
 CLAN_MEMBERS_CACHE = []
 CLAN_MEMBERS_CACHE_TIME = None
@@ -1677,47 +1672,19 @@ async def cancel_event(interaction, event_id):
     await interaction.response.send_message(es("✅ Мероприятие отменено!"), ephemeral=True)
 
 
-async def build_event_embed(event_id: str) -> discord.Embed:
-    events = load_json(EVENTS_FILE, {})
-    event = events[event_id]
-    current_date = datetime.now(MSK)
-    active_members = await get_active_members(current_date)
-    accepted = list(event.get('accepted', {}).keys())
-    declined = list(event.get('declined', {}).keys())
-    unmarked = [m for m in active_members if m not in accepted and m not in declined]
-    embed = discord.Embed(title=event['title'], description=event['description'], color=event.get('color', 15844367))
-    
     # === ВРЕМЯ ===
     start_ts = int(event['start_time'])
     end_ts = int(event['end_time'])
     event_end = datetime.fromtimestamp(end_ts, MSK)
     
-    # Первая строка (полная дата + время) остаётся всегда
-    time_value = f"<t:{start_ts}:F> - <t:{end_ts}:t>"
-    # Вторая строка (relative "через 3 дня") исчезает после завершения мероприятия
+    # Первая строка с префиксом "Дата:" (остаётся всегда)
+    time_value = f"Дата: <t:{start_ts}:F> - <t:{end_ts}:t>"
+    
+    # Вторая строка с префиксом "Начнется:" (исчезает после завершения)
     if current_date <= event_end:
-        time_value += f"\n<t:{start_ts}:R>"
+        time_value += f"\nНачнется: <t:{start_ts}:R>"
     
     embed.add_field(name=es("⏰ Время"), value=time_value, inline=False)
-    
-    if accepted:
-        embed.add_field(name=es(f"✅ Придут ({len(accepted)})"), value=">>> " + "\n".join(accepted), inline=True)
-    if declined:
-        embed.add_field(name=es(f"❌ Не придут ({len(declined)})"), value=">>> " + "\n".join(declined), inline=True)
-    if unmarked:
-        embed.add_field(name=es(f"❓ Не отметились ({len(unmarked)})"), value=">>> " + "\n".join(unmarked), inline=False)
-    image_key = event.get('image_key', 'none')
-    if image_key != 'none' and image_key in EVENT_IMAGES:
-        filename = EVENT_IMAGES[image_key]['file']
-        embed.set_image(url=f'attachment://{filename}')
-    num_games = event.get('num_games', 0)
-    if num_games and num_games > 0:
-        games_word = pluralize_games(num_games)
-        embed.add_field(name="", value=f"*🎮 На мероприятии запланировано {num_games} {games_word}*", inline=False)
-    else:
-        embed.add_field(name="", value="*🎮 На этом мероприятии игры не запланированы*", inline=False)
-    return embed
-
 
 async def get_or_create_thread(event, event_id, title):
     if event.get('thread_id'):
