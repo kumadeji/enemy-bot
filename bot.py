@@ -88,7 +88,7 @@ def es(text):
         '📋 ': '📋ㅤ', '📖 ': '📖ㅤ', '📞 ': '📞ㅤ', '✏️ ': '✏️ㅤ',
         '💥 ': '💥ㅤ', '⭐ ': '⭐ㅤ', '🧪 ': '🧪ㅤ', '📭 ': '📭ㅤ',
         '📢 ': '📢ㅤ', '⏳ ': '⏳ㅤ', '🎮 ': '🎮ㅤ', '👥 ': '👥ㅤ',
-        '🕹️ ': '🕹️ㅤ', '🏆 ': '🏆ㅤ', '🎖️ ': '🎖️ㅤ', '🔵 ': '🔵ㅤ',
+        '🕹️ ': '🕹️ㅤ', '🏆 ': '🏆ㅤ', '🪖 ': '🪖ㅤ', '🔵 ': '🔵ㅤ',
         '🍻 ': '🍻ㅤ', '🚪 ': '🚪ㅤ', '➡️ ': '➡️ㅤ', '⏭️ ': '⏭️ㅤ',
         '🖼️ ': '🖼️ㅤ', '🚫 ': '🚫ㅤ',
     }
@@ -191,6 +191,62 @@ def pluralize_games(num: int) -> str:
         return "игры"
     else:
         return "игр"
+
+
+def pluralize_days(num: int) -> str:
+    """Правильное склонение слова 'день' для русского языка."""
+    if num <= 0:
+        return "дней"
+    last_digit = num % 10
+    last_two_digits = num % 100
+    if 11 <= last_two_digits <= 14:
+        return "дней"
+    if last_digit == 1:
+        return "день"
+    elif last_digit in [2, 3, 4]:
+        return "дня"
+    else:
+        return "дней"
+
+
+def format_vacation_period(start_iso: str, end_iso: str) -> str:
+    """Форматирует период отпуска в виде меток времени Discord.
+    
+    Первая строка всегда: <t:START:d> - <t:END:d> (N день/дня/дней)
+    Вторая строка (relative) появляется только когда отпуск актуален:
+    - До начала отпуска: <t:START:R>
+    - Во время отпуска: <t:END:R>
+    - После окончания: исчезает
+    
+    Используется для embed-сообщений и обновления шаблонов."""
+    start = datetime.fromisoformat(start_iso)
+    end = datetime.fromisoformat(end_iso)
+    current_time = datetime.now(MSK)
+    
+    # Локализуем, если naive datetime (без tzinfo)
+    if start.tzinfo is None:
+        start = MSK.localize(start)
+    if end.tzinfo is None:
+        end = MSK.localize(end)
+    
+    start_ts = int(start.timestamp())
+    end_ts = int(end.timestamp())
+    
+    # Длительность в днях (разница дат)
+    duration = (end.date() - start.date()).days
+    days_word = pluralize_days(duration)
+    
+    # Первая строка: даты + длительность в скобках
+    result = f"<t:{start_ts}:d> - <t:{end_ts}:d> ({duration} {days_word})"
+    
+    # Вторая строка: relative time (исчезает после окончания)
+    if current_time < start:
+        result += f"\n<t:{start_ts}:R>"
+    elif current_time <= end:
+        result += f"\n<t:{end_ts}:R>"
+    # Если отпуск уже закончился — ничего не добавляем
+    
+    return result
 
 
 CLAN_MEMBERS_CACHE = []
@@ -914,7 +970,6 @@ class EventView(discord.ui.View):
         await interaction.response.send_message(es("🖼️ Выберите картинку (или оставьте текущую):"), view=EventEditSelectView(event_id), ephemeral=True)
     @discord.ui.button(label=es("📝 Заполнить явку"), style=discord.ButtonStyle.success, custom_id="event_attendance", row=1)
     async def attendance_button(self, interaction, button):
-        # Доступно только комбату и заместителям (ADMIN_USER_IDS)
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
@@ -942,10 +997,10 @@ class AttendanceWizard:
         self.event_id = event_id
         self.num_games = num_games
         self.event_title = event_title
-        self.data = {}  # players per step: {step_idx: [players]} or {"overall": [...]}
-        self.commanders = {}  # commander per step: {step_idx: "nickname"} or {"overall": "nickname"}
-        self.current_step = 0  # текущий шаг (игровой)
-        self.phase = 'players'  # 'players' или 'commander'
+        self.data = {}
+        self.commanders = {}
+        self.current_step = 0
+        self.phase = 'players'
 
 
 class CommanderSelectView(discord.ui.View):
@@ -955,15 +1010,12 @@ class CommanderSelectView(discord.ui.View):
         self.wizard = wizard
         self.select = None
         
-        # Формируем опции
         options = [discord.SelectOption(label="— Без командира —", value="none", emoji="🚫")]
         for nick in clan_members[:MAX_SELECT_OPTIONS - 1]:
             options.append(discord.SelectOption(label=nick, value=nick))
         
-        # Если бойцов больше, чем MAX_SELECT_OPTIONS, показываем только первые и добавляем TextInput
-        # Для простоты ограничимся MAX_SELECT_OPTIONS-1 (с учётом "Без командира")
         self.select = discord.ui.Select(
-            placeholder="🎖️ Выберите командира отделения...",
+            placeholder="🪖 Выберите командира отделения...",
             options=options,
             min_values=1,
             max_values=1,
@@ -972,7 +1024,6 @@ class CommanderSelectView(discord.ui.View):
         self.select.callback = self.select_callback
         self.add_item(self.select)
         
-        # Кнопка "Пропустить" — командир не указан
         skip_btn = discord.ui.Button(label=es("⏭️ Пропустить (без командира)"), style=discord.ButtonStyle.secondary, custom_id="commander_skip", row=2)
         skip_btn.callback = self.skip_callback
         self.add_item(skip_btn)
@@ -1076,7 +1127,6 @@ class AttendanceStepView(discord.ui.View):
             self.wizard.data["overall"] = []
         else:
             self.wizard.data[self.step] = []
-        # Переходим к выбору командира
         self.stop()
         await interaction.response.defer()
         await show_commander_step(interaction, self.wizard)
@@ -1120,9 +1170,9 @@ async def show_commander_step(interaction, wizard):
     view = CommanderSelectView(wizard, clan_members)
     
     if wizard.num_games == 0:
-        title_text = es(f"🎖️ **{wizard.event_title}**\n\n") + es("Выберите командира отделения на этом мероприятии:")
+        title_text = es(f"🪖 **{wizard.event_title}**\n\n") + es("Выберите командира отделения на этом мероприятии:")
     else:
-        title_text = es(f"🎖️ **{wizard.event_title}**\n\n") + es(f"**Командир отделения на Игре {wizard.current_step + 1}** из {wizard.num_games}\nВыберите ОДНОГО командира:")
+        title_text = es(f"🪖 **{wizard.event_title}**\n\n") + es(f"**Командир отделения на игре {wizard.current_step + 1}** из {wizard.num_games}\nВыберите одного командира:")
     
     await interaction.followup.send(title_text, view=view, ephemeral=True)
 
@@ -1132,18 +1182,15 @@ async def proceed_to_next_step(interaction, wizard):
     clan_members = await load_clan_members_from_sheet()
     
     if wizard.num_games == 0:
-        # Одна игра, уже выбраны бойцы и командир
         await finalize_attendance(interaction, wizard)
         return
     
-    # Переход к следующей игре
     wizard.current_step += 1
     
     if wizard.current_step >= wizard.num_games:
         await finalize_attendance(interaction, wizard)
         return
     
-    # Показываем выбор бойцов на следующую игру
     view = AttendanceStepView(wizard, wizard.current_step, clan_members)
     title_text = es(f"👥 **{wizard.event_title}**\n\n") + es(f"**Игра {wizard.current_step + 1}** из {wizard.num_games}\nВыберите явившихся:")
     await interaction.followup.send(title_text, view=view, ephemeral=True)
@@ -1158,7 +1205,6 @@ async def finalize_attendance(interaction, wizard):
     
     attendance = load_json(ATTENDANCE_FILE, {})
     
-    # Удаляем старое сообщение явки
     if wizard.event_id in attendance:
         old_record = attendance[wizard.event_id]
         if old_record.get('attendance_message_id') and old_record.get('thread_id'):
@@ -1200,7 +1246,6 @@ async def finalize_attendance(interaction, wizard):
     
     record['thread_id'] = thread.id
     
-    # Формируем отчёт
     report_text = es(f"🏆 **Отчёт о явке: {wizard.event_title}**\n\n")
     report_text += es(f"📋 Составил: **{interaction.user.display_name}**\n\n")
     
@@ -1215,7 +1260,7 @@ async def finalize_attendance(interaction, wizard):
             report_text += es("*Никто не явился*")
         
         report_text += "\n\n"
-        report_text += es("🎖️ **Командир отделения:**\n")
+        report_text += es("🪖 **Командир отделения:**\n")
         if commander:
             report_text += commander
         else:
@@ -1234,7 +1279,7 @@ async def finalize_attendance(interaction, wizard):
                 report_text += es("*Никто не явился*")
             
             report_text += "\n\n"
-            report_text += es(f"🎖️ Командир отделения:\n")
+            report_text += es(f"🪖 Командир отделения:\n")
             if commander:
                 report_text += commander
             else:
@@ -1304,7 +1349,12 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
         channel = await client.fetch_channel(VACATION_CHANNEL_ID)
         embed_description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** запросил(а) отпуск"
         embed = discord.Embed(title=es("🏖️ Отпуск требует утверждения"), description=embed_description, color=discord.Color.orange())
-        embed.add_field(name=es("📅 Период"), value=f"{start_str} - {end_str} ({duration} дней)", inline=True)
+        # Формируем период через format_vacation_period (с метками времени и correct склонением дней)
+        embed.add_field(
+            name=es("📅 Период"),
+            value=format_vacation_period(start_date.isoformat(), end_date.isoformat()),
+            inline=False
+        )
         embed.add_field(name=es("📝 Причина"), value=reason, inline=False)
         if by_admin:
             embed.add_field(name=es("👤 Оформил"), value=f"Комбат или заместитель: {interaction.user.display_name}", inline=False)
@@ -1363,10 +1413,13 @@ async def approve_vacation(interaction, nickname):
             embed.color = discord.Color.green()
             embed.title = es("🏖️ Отпуск утверждён")
             embed.description = f"Отпуск для **{nickname}**" if vacation.get('by_admin') else f"**{nickname}** взял(а) отпуск"
+            # Обновляем поле периода (может измениться relative-строка после утверждения)
             for i, field in enumerate(embed.fields):
-                if field.name == es("ℹ️ Статус"):
-                    embed.set_field_at(i, name=es("ℹ️ Статус"), value=es("✅ Утверждён и активен"), inline=False)
+                if field.name == es("📅 Период"):
+                    embed.set_field_at(i, name=es("📅 Период"), value=format_vacation_period(vacation['start'], vacation['end']), inline=False)
                     break
+                elif field.name == es("ℹ️ Статус"):
+                    embed.set_field_at(i, name=es("ℹ️ Статус"), value=es("✅ Утверждён и активен"), inline=False)
             embed.add_field(name=es("✅ Утвердил"), value=interaction.user.display_name, inline=False)
             embed.set_footer(text="Во время отпуска вам не нужно отмечаться в расписании мероприятий")
             await message.edit(embed=embed, view=VacationMessageView())
@@ -1434,8 +1487,10 @@ async def close_vacation(interaction, nickname, early=False, by_admin=False):
                 if field.name == es("ℹ️ Статус"):
                     embed.set_field_at(i, name=es("ℹ️ Статус"), value=status_text, inline=False)
                     break
+                # Обновляем период — relative-строка исчезает, когда отпуск закрыт
+                elif field.name == es("📅 Период"):
+                    embed.set_field_at(i, name=es("📅 Период"), value=format_vacation_period(vacation['start'], vacation['end']), inline=False)
             embed.color = discord.Color.red() if early else discord.Color.greyple()
-            # Кнопки пропадают после закрытия
             await message.edit(embed=embed, view=None)
     except Exception:
         pass
@@ -1469,7 +1524,8 @@ async def show_vacation_list(interaction):
 
 async def check_expired_vacations():
     """Автоматически закрывает отпуска, срок которых истёк.
-    Сообщение в канале остаётся, меняется только статус и убираются кнопки."""
+    Сообщение в канале остаётся, меняется только статус, обновляется поле периода
+    (исчезает relative-строка) и убираются кнопки."""
     vacations = load_json(VACATIONS_FILE, {})
     current_date = datetime.now(MSK).date()
     changed = False
@@ -1486,7 +1542,6 @@ async def check_expired_vacations():
                 member = await find_member_by_nickname(nickname)
                 if member:
                     await update_vacation_role(member, False)
-                # Обновляем сообщение: статус + убираем кнопки
                 if data.get('message_id') and data.get('channel_id'):
                     try:
                         channel = await client.fetch_channel(data['channel_id'])
@@ -1496,9 +1551,11 @@ async def check_expired_vacations():
                             for i, field in enumerate(embed.fields):
                                 if field.name == es("ℹ️ Статус"):
                                     embed.set_field_at(i, name=es("ℹ️ Статус"), value=es("✅ Завершен по истечению срока"), inline=False)
-                                    break
+                                # Обновляем период — relative-строка исчезает
+                                elif field.name == es("📅 Период"):
+                                    embed.set_field_at(i, name=es("📅 Период"), value=format_vacation_period(data['start'], data['end']), inline=False)
                             embed.color = discord.Color.greyple()
-                            await message.edit(embed=embed, view=None)  # view=None — кнопки убираются
+                            await message.edit(embed=embed, view=None)
                     except Exception:
                         pass
                 print(f"✅ Отпуск {nickname} автоматически закрыт (истёк срок)")
@@ -1629,9 +1686,20 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     declined = list(event.get('declined', {}).keys())
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
     embed = discord.Embed(title=event['title'], description=event['description'], color=event.get('color', 15844367))
+    
+    # === ВРЕМЯ ===
     start_ts = int(event['start_time'])
     end_ts = int(event['end_time'])
-    embed.add_field(name=es("⏰ Время"), value=f"<t:{start_ts}:F> - <t:{end_ts}:t>\n<t:{start_ts}:R>", inline=False)
+    event_end = datetime.fromtimestamp(end_ts, MSK)
+    
+    # Первая строка (полная дата + время) остаётся всегда
+    time_value = f"<t:{start_ts}:F> - <t:{end_ts}:t>"
+    # Вторая строка (relative "через 3 дня") исчезает после завершения мероприятия
+    if current_date <= event_end:
+        time_value += f"\n<t:{start_ts}:R>"
+    
+    embed.add_field(name=es("⏰ Время"), value=time_value, inline=False)
+    
     if accepted:
         embed.add_field(name=es(f"✅ Придут ({len(accepted)})"), value=">>> " + "\n".join(accepted), inline=True)
     if declined:
@@ -1878,41 +1946,69 @@ async def update_all_templates():
             
             embed = message.embeds[0]
             status = data.get('status', 'pending')
+            by_admin = data.get('by_admin', False)
+            created_by = data.get('created_by', 'Сам боец' if not by_admin else 'Неизвестно')
             
-            # Восстанавливаем описание в зависимости от статуса и by_admin
+            # === ОБНОВЛЯЕМ ПОЛЕ "📅 Период" с метками времени Discord ===
+            for i, field in enumerate(embed.fields):
+                if field.name == es("📅 Период"):
+                    new_period = format_vacation_period(data['start'], data['end'])
+                    embed.set_field_at(i, name=es("📅 Период"), value=new_period, inline=False)
+                    break
+            
+            # === ОБНОВЛЯЕМ ПОЛЕ "Оформил/Запросил" в зависимости от by_admin ===
+            if by_admin:
+                requester_field_name = es("👤 Оформил")
+                requester_field_value = f"Комбат или заместитель: {created_by}"
+            else:
+                requester_field_name = es("👤 Запросил")
+                requester_field_value = created_by
+            
+            field_found = False
+            for i, field in enumerate(embed.fields):
+                if field.name in [es("👤 Оформил"), es("👤 Запросил")]:
+                    embed.set_field_at(i, name=requester_field_name, value=requester_field_value, inline=False)
+                    field_found = True
+                    break
+            
+            if not field_found:
+                embed.add_field(name=requester_field_name, value=requester_field_value, inline=False)
+            
+            # === ОБНОВЛЯЕМ TITLE, DESCRIPTION, COLOR В ЗАВИСИМОСТИ ОТ СТАТУСА ===
             if status == 'pending':
                 embed.title = es("🏖️ Отпуск требует утверждения")
-                embed.description = f"Отпуск для **{nickname}**" if data.get('by_admin') else f"**{nickname}** запросил(а) отпуск"
+                embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** запросил(а) отпуск"
                 embed.color = discord.Color.orange()
-                # Обновляем статус
                 for i, field in enumerate(embed.fields):
                     if field.name == es("ℹ️ Статус"):
                         embed.set_field_at(i, name=es("ℹ️ Статус"), value=es("⏳ Ожидает утверждения комбатом"), inline=False)
                         break
                 await message.edit(embed=embed, view=VacationApprovalView())
+                
             elif status == 'active':
                 embed.title = es("🏖️ Отпуск утверждён")
-                embed.description = f"Отпуск для **{nickname}**" if data.get('by_admin') else f"**{nickname}** взял(а) отпуск"
+                embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** взял(а) отпуск"
                 embed.color = discord.Color.green()
                 for i, field in enumerate(embed.fields):
                     if field.name == es("ℹ️ Статус"):
                         embed.set_field_at(i, name=es("ℹ️ Статус"), value=es("✅ Утверждён и активен"), inline=False)
                         break
                 await message.edit(embed=embed, view=VacationMessageView())
+                
             elif status in ['rejected', 'ended_early', 'ended_scheduled']:
                 if status == 'rejected':
                     embed.title = es("❌ Отпуск отклонён")
-                    embed.description = f"Отпуск для **{nickname}** отклонён" if data.get('by_admin') else f"Запрос на отпуск **{nickname}** отклонён"
+                    embed.description = f"Отпуск для **{nickname}** отклонён" if by_admin else f"Запрос на отпуск **{nickname}** отклонён"
                     embed.color = discord.Color.red()
                     status_text = es("❌ Отклонён командованием")
                 elif status == 'ended_early':
                     embed.title = es("🏖️ Отпуск утверждён")
-                    embed.description = f"Отпуск для **{nickname}**" if data.get('by_admin') else f"**{nickname}** взял(а) отпуск"
+                    embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** взял(а) отпуск"
                     embed.color = discord.Color.red()
                     status_text = es("❌ Завершен досрочно")
                 else:  # ended_scheduled
                     embed.title = es("🏖️ Отпуск утверждён")
-                    embed.description = f"Отпуск для **{nickname}**" if data.get('by_admin') else f"**{nickname}** взял(а) отпуск"
+                    embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** взял(а) отпуск"
                     embed.color = discord.Color.greyple()
                     status_text = es("✅ Завершен по истечению срока")
                 
@@ -1929,6 +2025,7 @@ async def update_all_templates():
         except Exception as e:
             print(f"❌ Ошибка обновления отпуска '{nickname}': {e}")
             vac_errors += 1
+
     
     # === 3. ОБНОВЛЕНИЕ ПРАВИЛ ОТПУСКОВ ===
     try:
@@ -1938,7 +2035,6 @@ async def update_all_templates():
             if message.author.id != client.user.id:
                 continue
             if message.embeds and message.embeds[0].title == es("🏖️ Оформление отпусков"):
-                # Нашли сообщение с правилами - обновим его
                 embed = discord.Embed(title=es("🏖️ Оформление отпусков"), description=VACATION_RULES, color=discord.Color.green())
                 embed.set_footer(text="Нажмите кнопку ниже, чтобы оформить отпуск")
                 await message.edit(embed=embed, view=VacationRequestView())
@@ -1946,7 +2042,6 @@ async def update_all_templates():
                 vac_updated += 1
                 break
         if not rules_updated:
-            # Правил нет — публикуем
             embed = discord.Embed(title=es("🏖️ Оформление отпусков"), description=VACATION_RULES, color=discord.Color.green())
             embed.set_footer(text="Нажмите кнопку ниже, чтобы оформить отпуск")
             await channel.send(embed=embed, view=VacationRequestView())
@@ -2026,13 +2121,11 @@ async def setup_voice_room_triggers(guild):
     """Создаёт триггер-каналы для временных голосовых комнат, если их ещё нет."""
     global TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC
     
-    # === 🔵 Канал для военных (с правами как у VOICE_CHANNEL_ID) ===
     try:
         category = guild.get_channel(VOICE_ROOM_CATEGORY_ARMY)
         if not category:
             print(f"⚠️ Категория {VOICE_ROOM_CATEGORY_ARMY} не найдена")
         else:
-            # Ищем существующий триггер-канал по имени
             existing = None
             for ch in category.voice_channels:
                 if ch.name == "🔵 Создать голосовую комнату":
@@ -2043,7 +2136,6 @@ async def setup_voice_room_triggers(guild):
                 TRIGGER_CHANNEL_ARMY = existing.id
                 print(f"✅ Найден существующий 🔵 триггер-канал: {existing.id}")
             else:
-                # Копируем права с референсного канала
                 ref_channel = guild.get_channel(VOICE_CHANNEL_ID)
                 overwrites = ref_channel.overwrites if ref_channel else {}
                 
@@ -2058,7 +2150,6 @@ async def setup_voice_room_triggers(guild):
     except Exception as e:
         print(f"❌ Ошибка создания 🔵 триггер-канала: {e}")
     
-    # === 🍻 Публичный канал (открытый для всех) ===
     try:
         category = guild.get_channel(VOICE_ROOM_CATEGORY_PUBLIC)
         if not category:
@@ -2074,7 +2165,6 @@ async def setup_voice_room_triggers(guild):
                 TRIGGER_CHANNEL_PUBLIC = existing.id
                 print(f"✅ Найден существующий 🍻 триггер-канал: {existing.id}")
             else:
-                # Полностью открытые права
                 overwrites = {
                     guild.default_role: discord.PermissionOverwrite(
                         view_channel=True,
@@ -2104,7 +2194,6 @@ async def create_temp_voice_room(member, trigger_channel):
     guild = member.guild
     category = trigger_channel.category
     
-    # Определяем тип триггера для прав
     is_public = (trigger_channel.id == TRIGGER_CHANNEL_PUBLIC)
     
     if is_public:
@@ -2121,7 +2210,6 @@ async def create_temp_voice_room(member, trigger_channel):
             )
         }
     else:
-        # Копируем права с референсного канала + даём владельцу права управления
         ref_channel = guild.get_channel(VOICE_CHANNEL_ID)
         overwrites = dict(ref_channel.overwrites) if ref_channel else {}
         overwrites[member] = discord.PermissionOverwrite(
@@ -2132,9 +2220,7 @@ async def create_temp_voice_room(member, trigger_channel):
         )
     
     try:
-        # Очищаем никнейм от недопустимых символов для имени канала
         clean_name = member.display_name
-        # Discord допускает до 100 символов
         room_name = f"🚪 Комната {clean_name}"
         if len(room_name) > 100:
             room_name = room_name[:100]
@@ -2152,7 +2238,6 @@ async def create_temp_voice_room(member, trigger_channel):
             'is_public': is_public
         }
         
-        # Перемещаем пользователя во временный канал
         await member.move_to(temp_channel, reason="Создание временной голосовой комнаты")
         
         print(f"✅ Создана временная комната '{room_name}' для {member.display_name} (ID: {temp_channel.id})")
@@ -2172,7 +2257,6 @@ async def cleanup_empty_temp_room(channel_id):
     try:
         channel = client.get_channel(channel_id)
         if channel is None:
-            # Канал уже не существует
             del VOICE_ROOMS[channel_id]
             return
         
@@ -2194,19 +2278,14 @@ async def on_voice_state_update(member, before, after):
     """Обработчик для временных голосовых комнат."""
     global TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC, VOICE_ROOMS
     
-    # Игнорируем ботов
     if member.bot:
         return
     
-    # === СЛУЧАЙ 1: Пользователь подключился к триггер-каналу ===
     if after.channel and after.channel.id in [TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC]:
-        # Перемещаем во временную комнату
         await create_temp_voice_room(member, after.channel)
         return
     
-    # === СЛУЧАЙ 2: Пользователь вышел из временной комнаты ===
     if before.channel and before.channel.id in VOICE_ROOMS:
-        # Небольшая задержка, чтобы не удалять канал преждевременно
         await asyncio.sleep(2)
         await cleanup_empty_temp_room(before.channel.id)
 
@@ -2217,7 +2296,6 @@ async def on_ready():
     
     await load_clan_members_from_sheet()
     
-    # === НАСТРОЙКА ВРЕМЕННЫХ ГОЛОСОВЫХ КОМНАТ ===
     for guild in client.guilds:
         await setup_voice_room_triggers(guild)
     
