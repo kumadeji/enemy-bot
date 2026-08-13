@@ -1697,9 +1697,9 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     num_games = event.get('num_games', 0)
     if num_games and num_games > 0:
         games_word = pluralize_games(num_games)
-        embed.add_field(name="", value=f"*🎮 На мероприятии запланировано {num_games} {games_word}*", inline=False)
+        embed.add_field(name="", value=f"*На мероприятии запланировано {num_games} {games_word}*", inline=False)
     else:
-        embed.add_field(name="", value="*🎮 На этом мероприятии игры не запланированы*", inline=False)
+        embed.add_field(name="", value="*На этом мероприятии игры не запланированы*", inline=False)
     return embed
 
 
