@@ -150,7 +150,7 @@ VACATIONS_FILE = 'vacations.json'
 ATTENDANCE_FILE = 'attendance_data.json'
 
 MAX_GAMES = 10
-MAX_SELECT_OPTIONS = 25  # ограничение Discord для одного Select
+MAX_SELECT_OPTIONS = 25
 
 # Путь к папке с картинками
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -186,10 +186,10 @@ def get_image_info(image_key: str):
         return filename, path
     return None, None
 
-# Кэш списка участников клана (загружается из таблицы)
+# Кэш списка участников клана
 CLAN_MEMBERS_CACHE = []
 CLAN_MEMBERS_CACHE_TIME = None
-CLAN_MEMBERS_CACHE_TTL = 3600  # 1 час
+CLAN_MEMBERS_CACHE_TTL = 3600
 
 VACATION_RULES = es("""
 
@@ -608,7 +608,6 @@ def save_json(filename, data):
 
 
 def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
-    """Проверяет только УТВЕРЖДЁННЫЕ отпуска из JSON (статус 'active')"""
     vacations = load_json(VACATIONS_FILE, {})
     clean_nickname = nickname.strip().lower()
     current_date_only = current_date.date()
@@ -628,7 +627,6 @@ def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
 
 
 async def get_active_members(current_date: datetime) -> list:
-    """Возвращает список активных участников клана (из таблицы, исключая отпускников)"""
     members = await load_clan_members_from_sheet()
     return [m for m in members if not is_on_vacation_dynamic(m, current_date)]
 
@@ -796,6 +794,31 @@ class DeleteMessageModal(discord.ui.Modal, title=es("🗑️ Удаление с
             await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
 
 
+class ExtractMessageModal(discord.ui.Modal, title=es("🔍 Извлечь код сообщения")):
+    channel_id = discord.ui.TextInput(
+        label="ID канала или ветки",
+        placeholder="123456789012345678",
+        required=True,
+        max_length=20
+    )
+    message_id = discord.ui.TextInput(
+        label="ID сообщения",
+        placeholder="123456789012345678",
+        required=True,
+        max_length=20
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            channel_id = int(self.channel_id.value)
+            message_id = int(self.message_id.value)
+            await extract_message_structure(interaction, channel_id, message_id)
+        except ValueError:
+            await interaction.response.send_message(es("❌ Неверный ID!"), ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+
+
 class EventCreateModal(discord.ui.Modal):
     def __init__(self, image_key='none'):
         super().__init__(title=es("📅 Создание мероприятия"))
@@ -847,7 +870,6 @@ class EventCreateModal(discord.ui.Modal):
             start = MSK.localize(start)
             end = MSK.localize(end)
             
-            # Валидация num_games
             try:
                 games = int(self.num_games.value.strip() or "0")
                 if games < 0 or games > MAX_GAMES:
@@ -933,7 +955,6 @@ class EventEditModal(discord.ui.Modal):
             start = MSK.localize(start)
             end = MSK.localize(end)
             
-            # Валидация num_games
             try:
                 games = int(self.num_games.value.strip() or "0")
                 if games < 0 or games > MAX_GAMES:
@@ -1147,6 +1168,19 @@ class AdminMainMenuView(discord.ui.View):
             ephemeral=True
         )
     # === КОНЕЦ ВРЕМЕННОЙ КНОПКИ ===
+    
+    # === ВРЕМЕННАЯ КНОПКА: извлечение структуры сообщения ===
+    # Используйте для анализа сообщений с нужным форматированием.
+    
+    @discord.ui.button(label=es("🔍 Извлечь код сообщения"), style=discord.ButtonStyle.secondary, custom_id="admin_extract_message", row=3)
+    async def extract_message_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+            return
+        modal = ExtractMessageModal()
+        await interaction.response.send_modal(modal)
+    # === КОНЕЦ ВРЕМЕННОЙ КНОПКИ ===
+
 
 class VacationRequestView(discord.ui.View):
     def __init__(self):
@@ -1318,7 +1352,7 @@ class AttendanceWizard:
         self.event_id = event_id
         self.num_games = num_games
         self.event_title = event_title
-        self.data = {}  # {0: [players], 1: [players], ...} или {"overall": [players]}
+        self.data = {}
         self.current_step = 0
     
     def get_step_label(self, step: int) -> str:
@@ -1335,8 +1369,6 @@ class AttendanceStepView(discord.ui.View):
         self.step = step
         self.selected_players = []
         
-        # Разбиваем список бойцов на части по MAX_SELECT_OPTIONS
-        # Если бойцов > MAX_SELECT_OPTIONS, добавляем несколько Select'ов
         total_members = len(clan_members)
         parts = []
         for i in range(0, total_members, MAX_SELECT_OPTIONS):
@@ -1357,9 +1389,7 @@ class AttendanceStepView(discord.ui.View):
             self.add_item(select)
             self.selects.append(select)
         
-        # Кнопки действий
         if step == 0 and wizard.num_games == 0:
-            # Только один шаг - общий список
             finish_btn = discord.ui.Button(
                 label=es("✅ Отправить отчёт"),
                 style=discord.ButtonStyle.success,
@@ -1369,7 +1399,6 @@ class AttendanceStepView(discord.ui.View):
             finish_btn.callback = self.finish_callback
             self.add_item(finish_btn)
         elif wizard.num_games > 1 and step < wizard.num_games - 1:
-            # Есть следующие игры
             skip_btn = discord.ui.Button(
                 label=es("⏭️ Пропустить эту игру"),
                 style=discord.ButtonStyle.secondary,
@@ -1388,7 +1417,6 @@ class AttendanceStepView(discord.ui.View):
             next_btn.callback = self.next_callback
             self.add_item(next_btn)
         else:
-            # Последняя игра
             skip_btn = discord.ui.Button(
                 label=es("⏭️ Пропустить эту игру"),
                 style=discord.ButtonStyle.secondary,
@@ -1412,13 +1440,11 @@ class AttendanceStepView(discord.ui.View):
             if interaction.user.id not in ADMIN_USER_IDS:
                 await interaction.response.send_message(es("⛔ Только комбат/заместитель!"), ephemeral=True)
                 return
-            # Обновляем выбранные игроки для этой части
             self.selected_players.extend([v for v in select.values if v not in self.selected_players])
             await interaction.response.defer()
         return callback
     
     def _collect_all_selected(self):
-        """Собирает всех выбранных игроков из всех Select'ов"""
         all_selected = []
         for select in self.selects:
             for value in select.values:
@@ -1431,7 +1457,6 @@ class AttendanceStepView(discord.ui.View):
             await interaction.response.send_message(es("⛔ Только комбат/заместитель!"), ephemeral=True)
             return
         
-        # Сохраняем пустой список для этой игры
         if self.wizard.num_games == 0:
             self.wizard.data["overall"] = []
         else:
@@ -1478,7 +1503,6 @@ class AttendanceStepView(discord.ui.View):
 
 
 async def start_attendance_wizard(interaction: discord.Interaction, event_id: str):
-    """Запускает мастер учёта явки"""
     events = load_json(EVENTS_FILE, {})
     event = events.get(event_id)
     if not event:
@@ -1493,7 +1517,6 @@ async def start_attendance_wizard(interaction: discord.Interaction, event_id: st
         await interaction.response.send_message(es("❌ Список клана пуст!"), ephemeral=True)
         return
     
-    # Определяем первый шаг
     view = AttendanceStepView(wizard, 0, clan_members)
     
     if num_games == 0:
@@ -1505,11 +1528,9 @@ async def start_attendance_wizard(interaction: discord.Interaction, event_id: st
 
 
 async def proceed_to_next_step(interaction: discord.Interaction, wizard: AttendanceWizard):
-    """Переход к следующему шагу мастера"""
     clan_members = await load_clan_members_from_sheet()
     
     if wizard.num_games == 0:
-        # Один шаг - сразу завершаем
         await finalize_attendance(interaction, wizard)
         return
     
@@ -1526,14 +1547,12 @@ async def proceed_to_next_step(interaction: discord.Interaction, wizard: Attenda
 
 
 async def finalize_attendance(interaction: discord.Interaction, wizard: AttendanceWizard):
-    """Завершает мастер и публикует отчёт"""
     events = load_json(EVENTS_FILE, {})
     event = events.get(wizard.event_id)
     if not event:
         await interaction.followup.send(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
     
-    # Сохраняем в attendance_data.json
     attendance = load_json(ATTENDANCE_FILE, {})
     
     event_start = datetime.fromtimestamp(event['start_time'], MSK)
@@ -1555,7 +1574,6 @@ async def finalize_attendance(interaction: discord.Interaction, wizard: Attendan
     attendance[wizard.event_id] = record
     save_json(ATTENDANCE_FILE, attendance)
     
-    # Публикуем отчёт в ветку мероприятия
     thread = await get_or_create_thread(event, wizard.event_id, wizard.event_title)
     if not thread:
         await interaction.followup.send(es("❌ Не удалось получить ветку мероприятия!"), ephemeral=True)
@@ -1983,7 +2001,7 @@ async def handle_event_response(interaction: discord.Interaction, event_id: str,
     nickname = interaction.user.display_name
     current_date = datetime.now(MSK)
     
-    # === ПРОВЕРКА: мероприятие ещё не завершилось? ===
+    # ПРОВЕРКА: мероприятие ещё не завершилось?
     event_end = datetime.fromtimestamp(event['end_time'], MSK)
     if current_date > event_end:
         await interaction.response.send_message(
@@ -2015,7 +2033,6 @@ async def handle_event_response(interaction: discord.Interaction, event_id: str,
         message = await channel.fetch_message(event['message_id'])
         embed = await build_event_embed(event_id)
         
-        # Обновляем embed с картинкой
         filename, path = get_image_info(event.get('image_key', 'none'))
         if filename and path:
             file = discord.File(path, filename=filename)
@@ -2052,7 +2069,6 @@ async def refresh_event_message(interaction: discord.Interaction, event_id: str)
 
 
 async def open_edit_modal(interaction: discord.Interaction, event_id: str, image_key: str = None):
-    """Открывает модальное окно для редактирования мероприятия"""
     events = load_json(EVENTS_FILE, {})
     if event_id not in events:
         await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
@@ -2081,7 +2097,6 @@ async def open_edit_modal(interaction: discord.Interaction, event_id: str, image
 
 async def update_event(event_id: str, title: str, description: str, start_time: datetime, 
                        end_time: datetime, image_key: str = None, num_games: int = None):
-    """Обновляет существующее мероприятие"""
     events = load_json(EVENTS_FILE, {})
     if event_id not in events:
         return
@@ -2181,17 +2196,16 @@ async def build_event_embed(event_id: str) -> discord.Embed:
             inline=False
         )
     
-    # === КАРТИНКА ===
+    # КАРТИНКА
     image_key = event.get('image_key', 'none')
     if image_key != 'none' and image_key in EVENT_IMAGES:
         filename = EVENT_IMAGES[image_key]['file']
         embed.set_image(url=f'attachment://{filename}')
     
-    # === КОЛИЧЕСТВО ИГР ===
+    # КОЛИЧЕСТВО ИГР
     num_games = event.get('num_games', 0)
     if num_games and num_games > 0:
-        games_word = "игр" if num_games >= 5 or num_games == 0 else ("игра" if num_games == 1 else "игры")
-        if num_games in [1]:
+        if num_games == 1:
             games_word = "игра"
         elif num_games in [2, 3, 4]:
             games_word = "игры"
@@ -2207,7 +2221,6 @@ async def build_event_embed(event_id: str) -> discord.Embed:
 
 
 async def get_or_create_thread(event: dict, event_id: str, title: str):
-    """Получает существующую ветку или создаёт новую на посте мероприятия"""
     if event.get('thread_id'):
         try:
             thread = await client.fetch_channel(event['thread_id'])
@@ -2318,76 +2331,6 @@ async def show_event_list(interaction: discord.Interaction):
     
     await interaction.response.send_message(text, ephemeral=True)
 
-async def update_all_event_messages():
-    """ВРЕМЕННАЯ ФУНКЦИЯ: Обновляет все существующие сообщения мероприятий,
-    приводя их к новым требованиям (картинки, игры, новые кнопки).
-    После использования эту кнопку можно закомментировать."""
-    events = load_json(EVENTS_FILE, {})
-    updated_count = 0
-    error_count = 0
-    
-    for event_id, event in events.items():
-        title = event.get('title', '').lower()
-        original_image = event.get('image_key', 'none')
-        original_games = event.get('num_games', 0)
-        
-        # 1. Определяем картинку по названию (если не установлена)
-        image_key = original_image
-        if image_key == 'none' or image_key not in EVENT_IMAGES:
-            if 'as vdv' in title or ('rtvt' in title and 'tt' not in title):
-                image_key = 'asvdv'
-            elif (' tt' in title or title.endswith('tt') or 'triad' in title) and 'tvt' in title:
-                image_key = 'tt'
-            elif 'echo' in title:
-                image_key = 'echo'
-            elif 'межклан' in title:
-                image_key = 'mezhklan'
-            elif 'внутриклан' in title:
-                image_key = 'vnutriklan'
-            elif 'вылазка' in title:
-                image_key = 'vylazka'
-            elif 'мангуст' in title:
-                image_key = 'mangust'
-        
-        # 2. Определяем количество игр по умолчанию (если не установлено)
-        num_games = original_games if original_games and original_games > 0 else 0
-        if num_games == 0:
-            if image_key == 'asvdv':
-                num_games = 2
-            elif image_key == 'tt':
-                num_games = 3
-        
-        # Обновляем данные в JSON
-        event['image_key'] = image_key
-        event['num_games'] = num_games
-        
-        # 3. Обновляем сообщение в Discord
-        try:
-            channel = await client.fetch_channel(event['channel_id'])
-            message = await channel.fetch_message(event['message_id'])
-            
-            embed = await build_event_embed(event_id)
-            
-            # Подготавливаем файл картинки
-            filename, path = get_image_info(image_key)
-            if filename and path:
-                file = discord.File(path, filename=filename)
-                await message.edit(embed=embed, attachments=[file], view=EventView())
-            else:
-                await message.edit(embed=embed, attachments=[], view=EventView())
-            
-            updated_count += 1
-            print(f"✅ Обновлено '{event.get('title', '?')}' → картинка: {image_key}, игр: {num_games}")
-        except discord.NotFound:
-            print(f"⚠️ Сообщение мероприятия '{event.get('title', '?')}' не найдено (удалено)")
-            error_count += 1
-        except Exception as e:
-            print(f"❌ Ошибка обновления '{event.get('title', '?')}': {e}")
-            error_count += 1
-    
-    save_json(EVENTS_FILE, events)
-    print(f"🔄 Итог: обновлено {updated_count}, ошибок {error_count}")
-    return updated_count, error_count
 
 async def post_weekly_events():
     print(es("📅 Публикация мероприятий на эту неделю..."))
@@ -2408,7 +2351,6 @@ async def post_weekly_events():
     
     voice_mention = f"<#{VOICE_CHANNEL_ID}>"
     
-    # Суббота - AS VDV (2 игры)
     await create_event(
         "СУББОТА - RTvT на AS VDV",
         f"Бойцы, на субботу запланировано мероприятие на сервере AS VDV. Ждём вас! Заходите в голосовой канал {voice_mention} за 15 минут до начала.",
@@ -2420,7 +2362,6 @@ async def post_weekly_events():
     
     await asyncio.sleep(2)
     
-    # Воскресенье - TT (3 игры)
     await create_event(
         "ВОСКРЕСЕНЬЕ - TvT TT",
         f"Бойцы, на воскресенье запланировано мероприятие на сервере TT. Ждём вас! Заходите в голосовой канал {voice_mention} за 15 минут до начала.",
@@ -2432,7 +2373,6 @@ async def post_weekly_events():
 
 
 async def check_event_reminders():
-    """Проверяет все мероприятия и отправляет напоминания."""
     events = load_json(EVENTS_FILE, {})
     current_time = datetime.now(MSK)
     changed = False
@@ -2522,6 +2462,159 @@ async def check_event_reminders():
     
     if changed:
         save_json(EVENTS_FILE, events)
+
+
+# ============== ВРЕМЕННЫЕ ФУНКЦИИ ==============
+
+async def update_all_event_messages():
+    """ВРЕМЕННАЯ ФУНКЦИЯ: Обновляет все существующие сообщения мероприятий,
+    приводя их к новым требованиям (картинки, игры, новые кнопки).
+    После использования эту кнопку можно закомментировать."""
+    events = load_json(EVENTS_FILE, {})
+    updated_count = 0
+    error_count = 0
+    
+    for event_id, event in events.items():
+        title = event.get('title', '').lower()
+        original_image = event.get('image_key', 'none')
+        original_games = event.get('num_games', 0)
+        
+        # Определяем картинку по названию (если не установлена)
+        image_key = original_image
+        if image_key == 'none' or image_key not in EVENT_IMAGES:
+            if 'as vdv' in title or ('rtvt' in title and 'tt' not in title):
+                image_key = 'asvdv'
+            elif (' tt' in title or title.endswith('tt') or 'triad' in title) and 'tvt' in title:
+                image_key = 'tt'
+            elif 'echo' in title:
+                image_key = 'echo'
+            elif 'межклан' in title:
+                image_key = 'mezhklan'
+            elif 'внутриклан' in title:
+                image_key = 'vnutriklan'
+            elif 'вылазка' in title:
+                image_key = 'vylazka'
+            elif 'мангуст' in title:
+                image_key = 'mangust'
+        
+        # Определяем количество игр по умолчанию (если не установлено)
+        num_games = original_games if original_games and original_games > 0 else 0
+        if num_games == 0:
+            if image_key == 'asvdv':
+                num_games = 2
+            elif image_key == 'tt':
+                num_games = 3
+        
+        # Обновляем данные в JSON
+        event['image_key'] = image_key
+        event['num_games'] = num_games
+        
+        # Обновляем сообщение в Discord
+        try:
+            channel = await client.fetch_channel(event['channel_id'])
+            message = await channel.fetch_message(event['message_id'])
+            
+            embed = await build_event_embed(event_id)
+            
+            filename, path = get_image_info(image_key)
+            if filename and path:
+                file = discord.File(path, filename=filename)
+                await message.edit(embed=embed, attachments=[file], view=EventView())
+            else:
+                await message.edit(embed=embed, attachments=[], view=EventView())
+            
+            updated_count += 1
+            print(f"✅ Обновлено '{event.get('title', '?')}' → картинка: {image_key}, игр: {num_games}")
+        except discord.NotFound:
+            print(f"⚠️ Сообщение мероприятия '{event.get('title', '?')}' не найдено (удалено)")
+            error_count += 1
+        except Exception as e:
+            print(f"❌ Ошибка обновления '{event.get('title', '?')}': {e}")
+            error_count += 1
+    
+    save_json(EVENTS_FILE, events)
+    print(f"🔄 Итог: обновлено {updated_count}, ошибок {error_count}")
+    return updated_count, error_count
+
+
+async def extract_message_structure(interaction: discord.Interaction, channel_id: int, message_id: int):
+    """ВРЕМЕННАЯ ФУНКЦИЯ: Извлекает полную структуру сообщения для анализа"""
+    try:
+        channel = await client.fetch_channel(channel_id)
+        message = await channel.fetch_message(message_id)
+        
+        result = []
+        result.append(f"=== СООБЩЕНИЕ ID: {message.id} ===")
+        result.append(f"Автор: {message.author}")
+        result.append(f"Content: {message.content}")
+        result.append(f"")
+        
+        if message.embeds:
+            result.append(f"=== EMBEDS ({len(message.embeds)}) ===")
+            for i, embed in enumerate(message.embeds):
+                result.append(f"--- Embed {i+1} ---")
+                result.append(f"Title: {embed.title}")
+                result.append(f"Description: {embed.description}")
+                result.append(f"Color: {embed.color}")
+                result.append(f"")
+                
+                if embed.image:
+                    result.append(f"IMAGE: url={embed.image.url}")
+                if embed.thumbnail:
+                    result.append(f"THUMBNAIL: url={embed.thumbnail.url}")
+                
+                result.append(f"Fields ({len(embed.fields)}):")
+                for j, field in enumerate(embed.fields):
+                    result.append(f"  Field {j+1}: name='{field.name}', value='{field.value}', inline={field.inline}")
+                
+                if embed.footer:
+                    result.append(f"Footer: {embed.footer.text}")
+                
+                result.append(f"")
+                result.append(f"RAW DICT:")
+                result.append(json.dumps(embed.to_dict(), indent=2, ensure_ascii=False))
+        else:
+            result.append("Нет embeds")
+        
+        result.append(f"")
+        result.append(f"=== ATTACHMENTS ({len(message.attachments)}) ===")
+        for att in message.attachments:
+            result.append(f"Attachment: filename={att.filename}, url={att.url}, content_type={att.content_type}")
+        
+        result.append(f"")
+        result.append(f"=== COMPONENTS ({len(message.components)}) ===")
+        for i, row in enumerate(message.components):
+            result.append(f"Row {i+1}:")
+            for comp in row.children:
+                result.append(f"  {comp.type}: label={getattr(comp, 'label', None)}, custom_id={getattr(comp, 'custom_id', None)}")
+        
+        output = "\n".join(result)
+        print(output)
+        
+        # Отправляем результат (до 1900 символов из-за лимита Discord)
+        if len(output) <= 1900:
+            await interaction.response.send_message(
+                f"```\n{output}\n```",
+                ephemeral=True
+            )
+        else:
+            # Разбиваем на части
+            parts = [output[i:i+1900] for i in range(0, len(output), 1900)]
+            await interaction.response.send_message(
+                f"```\n{parts[0]}\n```",
+                ephemeral=True
+            )
+            for part in parts[1:]:
+                await interaction.followup.send(
+                    f"```\n{part}\n```",
+                    ephemeral=True
+                )
+        
+        return output
+    except Exception as e:
+        print(f"Ошибка извлечения: {e}")
+        await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+        return None
 
 
 # ============== СОБЫТИЯ DISCORD ==============
