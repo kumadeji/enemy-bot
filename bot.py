@@ -136,7 +136,6 @@ ADMIN_CHANNEL_ID = 1536632416511332362
 VOICE_CHANNEL_ID = 1284893513921728582
 VOICE_CHANNEL_URL = "https://discord.com/channels/734494109032513699/1284893513921728582"
 
-# Категории для временных голосовых комнат
 VOICE_ROOM_CATEGORY_ARMY = 1284893244878098464
 VOICE_ROOM_CATEGORY_PUBLIC = 1116657923360301157
 
@@ -194,7 +193,6 @@ def pluralize_games(num: int) -> str:
 
 
 def pluralize_days(num: int) -> str:
-    """Правильное склонение слова 'день' для русского языка."""
     if num <= 0:
         return "дней"
     last_digit = num % 10
@@ -244,13 +242,12 @@ def format_vacation_period(start_iso: str, end_iso: str) -> str:
     
     return result
 
+
 CLAN_MEMBERS_CACHE = []
 CLAN_MEMBERS_CACHE_TIME = None
 CLAN_MEMBERS_CACHE_TTL = 3600
 
-# Кэш временных голосовых комнат: {channel_id: {'owner_id': int, 'created_at': datetime}}
 VOICE_ROOMS = {}
-# ID триггер-каналов
 TRIGGER_CHANNEL_ARMY = None
 TRIGGER_CHANNEL_PUBLIC = None
 
@@ -282,7 +279,7 @@ VACATION_RULES = es("""
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
-intents.voice_states = True  # Для временных голосовых комнат
+intents.voice_states = True
 
 client = discord.Client(intents=intents)
 scheduler = AsyncIOScheduler(timezone=MSK)
@@ -963,7 +960,7 @@ class EventView(discord.ui.View):
             await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
             return
         await interaction.response.send_message(es("🖼️ Выберите картинку (или оставьте текущую):"), view=EventEditSelectView(event_id), ephemeral=True)
-    @discord.ui.button(label=es("📝 Заполнить явку"), style=discord.ButtonStyle.success, custom_id="event_attendance", row=1)
+    @discord.ui.button(label=es("📝 Указать явку бойцов"), style=discord.ButtonStyle.success, custom_id="event_attendance", row=1)
     async def attendance_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1160,7 +1157,6 @@ async def start_attendance_wizard(interaction, event_id):
 
 
 async def show_commander_step(interaction, wizard):
-    """Показывает шаг выбора командира отделения для текущей игры"""
     clan_members = await load_clan_members_from_sheet()
     view = CommanderSelectView(wizard, clan_members)
     
@@ -1173,7 +1169,6 @@ async def show_commander_step(interaction, wizard):
 
 
 async def proceed_to_next_step(interaction, wizard):
-    """Переход к следующему шагу: после выбора командира — следующая игра или финал"""
     clan_members = await load_clan_members_from_sheet()
     
     if wizard.num_games == 0:
@@ -1344,7 +1339,6 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
         channel = await client.fetch_channel(VACATION_CHANNEL_ID)
         embed_description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** запросил(а) отпуск"
         embed = discord.Embed(title=es("🏖️ Отпуск требует утверждения"), description=embed_description, color=discord.Color.orange())
-        # Формируем период через format_vacation_period (с метками времени и correct склонением дней)
         embed.add_field(
             name=es("📅 Период"),
             value=format_vacation_period(start_date.isoformat(), end_date.isoformat()),
@@ -1408,7 +1402,6 @@ async def approve_vacation(interaction, nickname):
             embed.color = discord.Color.green()
             embed.title = es("🏖️ Отпуск утверждён")
             embed.description = f"Отпуск для **{nickname}**" if vacation.get('by_admin') else f"**{nickname}** взял(а) отпуск"
-            # Обновляем поле периода (может измениться relative-строка после утверждения)
             for i, field in enumerate(embed.fields):
                 if field.name == es("📅 Период"):
                     embed.set_field_at(i, name=es("📅 Период"), value=format_vacation_period(vacation['start'], vacation['end']), inline=False)
@@ -1482,7 +1475,6 @@ async def close_vacation(interaction, nickname, early=False, by_admin=False):
                 if field.name == es("ℹ️ Статус"):
                     embed.set_field_at(i, name=es("ℹ️ Статус"), value=status_text, inline=False)
                     break
-                # Обновляем период — relative-строка исчезает, когда отпуск закрыт
                 elif field.name == es("📅 Период"):
                     embed.set_field_at(i, name=es("📅 Период"), value=format_vacation_period(vacation['start'], vacation['end']), inline=False)
             embed.color = discord.Color.red() if early else discord.Color.greyple()
@@ -1518,9 +1510,6 @@ async def show_vacation_list(interaction):
 
 
 async def check_expired_vacations():
-    """Автоматически закрывает отпуска, срок которых истёк.
-    Сообщение в канале остаётся, меняется только статус, обновляется поле периода
-    (исчезает relative-строка) и убираются кнопки."""
     vacations = load_json(VACATIONS_FILE, {})
     current_date = datetime.now(MSK).date()
     changed = False
@@ -1546,7 +1535,6 @@ async def check_expired_vacations():
                             for i, field in enumerate(embed.fields):
                                 if field.name == es("ℹ️ Статус"):
                                     embed.set_field_at(i, name=es("ℹ️ Статус"), value=es("✅ Завершен по истечению срока"), inline=False)
-                                # Обновляем период — relative-строка исчезает
                                 elif field.name == es("📅 Период"):
                                     embed.set_field_at(i, name=es("📅 Период"), value=format_vacation_period(data['start'], data['end']), inline=False)
                             embed.color = discord.Color.greyple()
@@ -1672,6 +1660,16 @@ async def cancel_event(interaction, event_id):
     await interaction.response.send_message(es("✅ Мероприятие отменено!"), ephemeral=True)
 
 
+async def build_event_embed(event_id: str) -> discord.Embed:
+    events = load_json(EVENTS_FILE, {})
+    event = events[event_id]
+    current_date = datetime.now(MSK)
+    active_members = await get_active_members(current_date)
+    accepted = list(event.get('accepted', {}).keys())
+    declined = list(event.get('declined', {}).keys())
+    unmarked = [m for m in active_members if m not in accepted and m not in declined]
+    embed = discord.Embed(title=event['title'], description=event['description'], color=event.get('color', 15844367))
+    
     # === ВРЕМЯ ===
     start_ts = int(event['start_time'])
     end_ts = int(event['end_time'])
@@ -1685,6 +1683,25 @@ async def cancel_event(interaction, event_id):
         time_value += f"\nНачнется: <t:{start_ts}:R>"
     
     embed.add_field(name=es("⏰ Время"), value=time_value, inline=False)
+    
+    if accepted:
+        embed.add_field(name=es(f"✅ Придут ({len(accepted)})"), value=">>> " + "\n".join(accepted), inline=True)
+    if declined:
+        embed.add_field(name=es(f"❌ Не придут ({len(declined)})"), value=">>> " + "\n".join(declined), inline=True)
+    if unmarked:
+        embed.add_field(name=es(f"❓ Не отметились ({len(unmarked)})"), value=">>> " + "\n".join(unmarked), inline=False)
+    image_key = event.get('image_key', 'none')
+    if image_key != 'none' and image_key in EVENT_IMAGES:
+        filename = EVENT_IMAGES[image_key]['file']
+        embed.set_image(url=f'attachment://{filename}')
+    num_games = event.get('num_games', 0)
+    if num_games and num_games > 0:
+        games_word = pluralize_games(num_games)
+        embed.add_field(name="", value=f"*🎮 На мероприятии запланировано {num_games} {games_word}*", inline=False)
+    else:
+        embed.add_field(name="", value="*🎮 На этом мероприятии игры не запланированы*", inline=False)
+    return embed
+
 
 async def get_or_create_thread(event, event_id, title):
     if event.get('thread_id'):
@@ -1891,6 +1908,7 @@ async def update_all_templates():
             else:
                 await message.edit(embed=embed, attachments=[], view=EventView())
             ev_updated += 1
+            await asyncio.sleep(1.5)  # Защита от rate limit
         except discord.NotFound:
             ev_errors += 1
         except Exception as e:
@@ -1987,6 +2005,7 @@ async def update_all_templates():
                 await message.edit(embed=embed, view=None)
             
             vac_updated += 1
+            await asyncio.sleep(1.5)  # Защита от rate limit
         except discord.NotFound:
             vac_errors += 1
         except Exception as e:
@@ -2085,7 +2104,6 @@ async def extract_message_structure(interaction, channel_id, message_id):
 # ============== ВРЕМЕННЫЕ ГОЛОСОВЫЕ КОМНАТЫ ==============
 
 async def setup_voice_room_triggers(guild):
-    """Создаёт триггер-каналы для временных голосовых комнат, если их ещё нет."""
     global TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC
     
     try:
@@ -2155,7 +2173,6 @@ async def setup_voice_room_triggers(guild):
 
 
 async def create_temp_voice_room(member, trigger_channel):
-    """Создаёт временную голосовую комнату для пользователя."""
     global VOICE_ROOMS
     
     guild = member.guild
@@ -2215,7 +2232,6 @@ async def create_temp_voice_room(member, trigger_channel):
 
 
 async def cleanup_empty_temp_room(channel_id):
-    """Удаляет временную голосовую комнату, если она пуста."""
     global VOICE_ROOMS
     
     if channel_id not in VOICE_ROOMS:
@@ -2242,7 +2258,6 @@ async def cleanup_empty_temp_room(channel_id):
 
 @client.event
 async def on_voice_state_update(member, before, after):
-    """Обработчик для временных голосовых комнат."""
     global TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC, VOICE_ROOMS
     
     if member.bot:
