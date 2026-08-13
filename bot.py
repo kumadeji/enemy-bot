@@ -1119,7 +1119,34 @@ class AdminMainMenuView(discord.ui.View):
             return
         await interaction.response.send_message(es("🔍 Запускаю проверку таблицы..."), ephemeral=True)
         await check_spreadsheet()
-
+    
+    # === ВРЕМЕННАЯ КНОПКА: обновление старых сообщений мероприятий ===
+    # Приводит все существующие сообщения мероприятий к новым требованиям:
+    # - добавляет картинки (автоопределение по названию)
+    # - добавляет количество игр (AS VDV = 2, TT = 3)
+    # - обновляет кнопки (убирает "Обновить список", добавляет "Учесть явившихся")
+    # После использования закомментируйте или удалите эту кнопку.
+    
+    @discord.ui.button(label=es("🔄 Обновить все мероприятия"), style=discord.ButtonStyle.primary, custom_id="admin_refresh_all_events", row=3)
+    async def refresh_all_events_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+            return
+        
+        await interaction.response.send_message(
+            es("🔄 Начинаю обновление всех сообщений мероприятий...\n"
+               "Это может занять несколько секунд."),
+            ephemeral=True
+        )
+        
+        updated_count, error_count = await update_all_event_messages()
+        
+        await interaction.followup.send(
+            es(f"✅ Обновлено мероприятий: **{updated_count}**\n"
+               f"⚠️ Ошибок: **{error_count}**"),
+            ephemeral=True
+        )
+    # === КОНЕЦ ВРЕМЕННОЙ КНОПКИ ===
 
 class VacationRequestView(discord.ui.View):
     def __init__(self):
@@ -2291,6 +2318,76 @@ async def show_event_list(interaction: discord.Interaction):
     
     await interaction.response.send_message(text, ephemeral=True)
 
+async def update_all_event_messages():
+    """ВРЕМЕННАЯ ФУНКЦИЯ: Обновляет все существующие сообщения мероприятий,
+    приводя их к новым требованиям (картинки, игры, новые кнопки).
+    После использования эту кнопку можно закомментировать."""
+    events = load_json(EVENTS_FILE, {})
+    updated_count = 0
+    error_count = 0
+    
+    for event_id, event in events.items():
+        title = event.get('title', '').lower()
+        original_image = event.get('image_key', 'none')
+        original_games = event.get('num_games', 0)
+        
+        # 1. Определяем картинку по названию (если не установлена)
+        image_key = original_image
+        if image_key == 'none' or image_key not in EVENT_IMAGES:
+            if 'as vdv' in title or ('rtvt' in title and 'tt' not in title):
+                image_key = 'asvdv'
+            elif (' tt' in title or title.endswith('tt') or 'triad' in title) and 'tvt' in title:
+                image_key = 'tt'
+            elif 'echo' in title:
+                image_key = 'echo'
+            elif 'межклан' in title:
+                image_key = 'mezhklan'
+            elif 'внутриклан' in title:
+                image_key = 'vnutriklan'
+            elif 'вылазка' in title:
+                image_key = 'vylazka'
+            elif 'мангуст' in title:
+                image_key = 'mangust'
+        
+        # 2. Определяем количество игр по умолчанию (если не установлено)
+        num_games = original_games if original_games and original_games > 0 else 0
+        if num_games == 0:
+            if image_key == 'asvdv':
+                num_games = 2
+            elif image_key == 'tt':
+                num_games = 3
+        
+        # Обновляем данные в JSON
+        event['image_key'] = image_key
+        event['num_games'] = num_games
+        
+        # 3. Обновляем сообщение в Discord
+        try:
+            channel = await client.fetch_channel(event['channel_id'])
+            message = await channel.fetch_message(event['message_id'])
+            
+            embed = await build_event_embed(event_id)
+            
+            # Подготавливаем файл картинки
+            filename, path = get_image_info(image_key)
+            if filename and path:
+                file = discord.File(path, filename=filename)
+                await message.edit(embed=embed, attachments=[file], view=EventView())
+            else:
+                await message.edit(embed=embed, attachments=[], view=EventView())
+            
+            updated_count += 1
+            print(f"✅ Обновлено '{event.get('title', '?')}' → картинка: {image_key}, игр: {num_games}")
+        except discord.NotFound:
+            print(f"⚠️ Сообщение мероприятия '{event.get('title', '?')}' не найдено (удалено)")
+            error_count += 1
+        except Exception as e:
+            print(f"❌ Ошибка обновления '{event.get('title', '?')}': {e}")
+            error_count += 1
+    
+    save_json(EVENTS_FILE, events)
+    print(f"🔄 Итог: обновлено {updated_count}, ошибок {error_count}")
+    return updated_count, error_count
 
 async def post_weekly_events():
     print(es("📅 Публикация мероприятий на эту неделю..."))
