@@ -181,6 +181,34 @@ def get_image_info(image_key: str):
     if os.path.exists(path):
         return filename, path
     return None, None
+    
+def pluralize_games(num: int) -> str:
+    """Возвращает правильное склонение слова 'игра' для русского языка.
+    
+    Примеры:
+    - 1 игра
+    - 2 игры, 3 игры, 4 игры
+    - 5 игр, 11 игр, 12 игр, 13 игр, 14 игр, 20 игр
+    - 21 игра
+    - 22 игры, 23 игры, 24 игры
+    - 25 игр, 30 игр
+    """
+    if num <= 0:
+        return "игр"
+    
+    last_digit = num % 10
+    last_two_digits = num % 100
+    
+    # Особые случаи: 11-14 всегда "игр"
+    if 11 <= last_two_digits <= 14:
+        return "игр"
+    
+    if last_digit == 1:
+        return "игра"
+    elif last_digit in [2, 3, 4]:
+        return "игры"
+    else:
+        return "игр"
 
 
 CLAN_MEMBERS_CACHE = []
@@ -637,7 +665,7 @@ class EventCreateModal(discord.ui.Modal):
         self.event_description = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, required=True, max_length=1000)
         self.start_time = discord.ui.TextInput(label="Начало (ДД.ММ.ГГГГ ЧЧ:ММ)", required=True, max_length=16)
         self.end_time = discord.ui.TextInput(label="Окончание (ДД.ММ.ГГГГ ЧЧ:ММ)", required=True, max_length=16)
-        self.num_games = discord.ui.TextInput(label="Количество игр (0 = без игр)", required=False, max_length=2, default="0")
+        self.num_games = discord.ui.TextInput(label="Количество игр (0, 1, 2 или больше)", required=False, max_length=2, default="0")
         self.add_item(self.event_title)
         self.add_item(self.event_description)
         self.add_item(self.start_time)
@@ -667,7 +695,7 @@ class EventEditModal(discord.ui.Modal):
         self.event_description = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, default=current_description, required=True, max_length=1000)
         self.start_time = discord.ui.TextInput(label="Начало (ДД.ММ.ГГГГ ЧЧ:ММ)", default=current_start, required=True, max_length=16)
         self.end_time = discord.ui.TextInput(label="Окончание (ДД.ММ.ГГГГ ЧЧ:ММ)", default=current_end, required=True, max_length=16)
-        self.num_games = discord.ui.TextInput(label="Количество игр (0 = без игр)", default=str(num_games), required=False, max_length=2)
+        self.num_games = discord.ui.TextInput(label="Количество игр (0, 1, 2 или больше)", default=str(num_games), required=False, max_length=2)
         self.add_item(self.event_title)
         self.add_item(self.event_description)
         self.add_item(self.start_time)
@@ -886,7 +914,7 @@ class VacationMessageView(discord.ui.View):
                 return nickname
         return None
     
-    @discord.ui.button(label=es("✅ Завершить отпуск досрочно"), style=discord.ButtonStyle.success, custom_id="vacation_end_early")
+    @discord.ui.button(label=es("✅ Завершить мой отпуск досрочно"), style=discord.ButtonStyle.success, custom_id="vacation_end_early")
     async def end_early_button(self, interaction, button):
         nickname = self.get_nickname_by_message(interaction)
         if not nickname:
@@ -897,7 +925,7 @@ class VacationMessageView(discord.ui.View):
             return
         await close_vacation(interaction, nickname, early=True, by_admin=False)
     
-    @discord.ui.button(label=es("🔴 Закрыть отпуск (комбат)"), style=discord.ButtonStyle.danger, custom_id="vacation_admin_close")
+    @discord.ui.button(label=es("🔴 Закрыть отпуск для бойца"), style=discord.ButtonStyle.danger, custom_id="vacation_admin_close")
     async def admin_close_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -947,7 +975,7 @@ class EventView(discord.ui.View):
             return
         await interaction.response.send_message(es("🖼️ Выберите картинку (или оставьте текущую):"), view=EventEditSelectView(event_id), ephemeral=True)
     
-    @discord.ui.button(label=es("📝 Заполнить явку"), style=discord.ButtonStyle.success, custom_id="event_attendance", row=1)
+    @discord.ui.button(label=es("📝 Учесть явку"), style=discord.ButtonStyle.success, custom_id="event_attendance", row=1)
     async def attendance_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1616,8 +1644,8 @@ async def cancel_event(interaction, event_id):
     
     await interaction.response.send_message(es("✅ Мероприятие отменено!"), ephemeral=True)
 
-
-async def build_event_embed(event_id):
+async def build_event_embed(event_id: str) -> discord.Embed:
+    """Создаёт embed-сообщение для мероприятия с актуальным шаблоном."""
     events = load_json(EVENTS_FILE, {})
     event = events[event_id]
     
@@ -1634,35 +1662,59 @@ async def build_event_embed(event_id):
         color=event.get('color', 15844367)
     )
     
+    # === ВРЕМЯ ===
     start_ts = int(event['start_time'])
     end_ts = int(event['end_time'])
-    embed.add_field(name=es("⏰ Время"), value=f"<t:{start_ts}:F> - <t:{end_ts}:t>\n<t:{start_ts}:R>", inline=False)
+    embed.add_field(
+        name=es("⏰ Время"),
+        value=f"<t:{start_ts}:F> - <t:{end_ts}:t>\n<t:{start_ts}:R>",
+        inline=False
+    )
     
+    # === СПИСКИ УЧАСТНИКОВ ===
     if accepted:
-        embed.add_field(name=es(f"✅ Придут ({len(accepted)})"), value=">>> " + "\n".join(accepted), inline=True)
+        embed.add_field(
+            name=es(f"✅ Придут ({len(accepted)})"),
+            value=">>> " + "\n".join(accepted),
+            inline=True
+        )
     if declined:
-        embed.add_field(name=es(f"❌ Не придут ({len(declined)})"), value=">>> " + "\n".join(declined), inline=True)
+        embed.add_field(
+            name=es(f"❌ Не придут ({len(declined)})"),
+            value=">>> " + "\n".join(declined),
+            inline=True
+        )
     if unmarked:
-        embed.add_field(name=es(f"❓ Не отметились ({len(unmarked)})"), value=">>> " + "\n".join(unmarked), inline=False)
+        embed.add_field(
+            name=es(f"❓ Не отметились ({len(unmarked)})"),
+            value=">>> " + "\n".join(unmarked),
+            inline=False
+        )
     
+    # === КАРТИНКА ===
     image_key = event.get('image_key', 'none')
     if image_key != 'none' and image_key in EVENT_IMAGES:
         filename = EVENT_IMAGES[image_key]['file']
         embed.set_image(url=f'attachment://{filename}')
     
-    # ИСПРАВЛЕНИЕ 4: Новая формулировка
+    # === КОЛИЧЕСТВО ИГР с правильным склонением ===
     num_games = event.get('num_games', 0)
     if num_games and num_games > 0:
-        if num_games == 1:
-            games_word = "игра"
-        elif num_games in [2, 3, 4]:
-            games_word = "игры"
-        else:
-            games_word = "игр"
-        embed.add_field(name="", value=f"*На мероприятии запланировано {num_games} {games_word}*", inline=False)
+        games_word = pluralize_games(num_games)
+        embed.add_field(
+            name="",
+            value=f"*На мероприятии запланировано {num_games} {games_word}*",
+            inline=False
+        )
+    else:
+        # Если игр нет — показываем, что игры не запланированы
+        embed.add_field(
+            name="",
+            value="*На этом мероприятии игры не запланированы*",
+            inline=False
+        )
     
     return embed
-
 
 async def get_or_create_thread(event, event_id, title):
     if event.get('thread_id'):
