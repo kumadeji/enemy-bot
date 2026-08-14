@@ -12,6 +12,10 @@ from collections import deque
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# Глобальный executor для синхронных операций (gspread использует requests)
+EXECUTOR = ThreadPoolExecutor(max_workers=5)
 
 # ============== ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА ==============
 
@@ -231,10 +235,8 @@ def format_vacation_period(start_iso: str, end_iso: str) -> str:
     duration = (end.date() - start.date()).days
     days_word = pluralize_days(duration)
     
-    # Первая строка с префиксом "Даты:"
     result = f"Даты: <t:{start_ts}:d> - <t:{end_ts}:d> ({duration} {days_word})"
     
-    # Вторая строка с префиксом в зависимости от текущего статуса
     if current_time < start:
         result += f"\nНачнется: <t:{start_ts}:R>"
     elif current_time <= end:
@@ -250,6 +252,8 @@ CLAN_MEMBERS_CACHE_TTL = 3600
 VOICE_ROOMS = {}
 TRIGGER_CHANNEL_ARMY = None
 TRIGGER_CHANNEL_PUBLIC = None
+# Блокировки по member.id для защиты от двойного создания временных комнат
+VOICE_ROOM_CREATION_LOCKS = {}
 
 VACATION_RULES = es("""
 
@@ -345,7 +349,8 @@ def get_color_category(bg):
     return None
 
 
-def get_sheet_data_with_colors(sheet, range_name):
+def get_sheet_data_with_colors_sync(sheet, range_name):
+    """Синхронная версия для выполнения в executor (gspread использует requests)."""
     try:
         base_url = 'https://sheets.googleapis.com/v4/spreadsheets'
         full_url = f'{base_url}/{sheet.spreadsheet.id}'
@@ -373,6 +378,12 @@ def get_sheet_data_with_colors(sheet, range_name):
         return []
 
 
+async def get_sheet_data_with_colors(sheet, range_name):
+    """Асинхронная обёртка — выполняет синхронный запрос в отдельном потоке."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(EXECUTOR, get_sheet_data_with_colors_sync, sheet, range_name)
+
+
 async def load_clan_members_from_sheet():
     global CLAN_MEMBERS_CACHE, CLAN_MEMBERS_CACHE_TIME
     current_time = datetime.now().timestamp()
@@ -382,9 +393,11 @@ async def load_clan_members_from_sheet():
         print("⚠️ Google Sheets не инициализирован, использую кэш")
         return CLAN_MEMBERS_CACHE
     try:
-        spreadsheet = gc.open_by_url(SPREADSHEET_URL)
+        # Выполняем синхронный gc.open_by_url в отдельном потоке, чтобы не блокировать event loop
+        loop = asyncio.get_event_loop()
+        spreadsheet = await loop.run_in_executor(EXECUTOR, gc.open_by_url, SPREADSHEET_URL)
         sheet = spreadsheet.worksheet(SHEET_NAME)
-        data_with_colors = get_sheet_data_with_colors(sheet, 'A1:J28')
+        data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J28')
         if not data_with_colors or len(data_with_colors) < 2:
             return CLAN_MEMBERS_CACHE
         headers = [cell['value'] for cell in data_with_colors[0]]
@@ -508,9 +521,11 @@ async def check_spreadsheet():
         try:
             if not gc:
                 return
-            spreadsheet = gc.open_by_url(SPREADSHEET_URL)
+            # Выполняем синхронный gc.open_by_url в отдельном потоке
+            loop = asyncio.get_event_loop()
+            spreadsheet = await loop.run_in_executor(EXECUTOR, gc.open_by_url, SPREADSHEET_URL)
             sheet = spreadsheet.worksheet(SHEET_NAME)
-            data_with_colors = get_sheet_data_with_colors(sheet, 'A1:J28')
+            data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J28')
             if not data_with_colors or len(data_with_colors) < 2:
                 return
             headers = [cell['value'] for cell in data_with_colors[0]]
@@ -1908,7 +1923,7 @@ async def update_all_templates():
             else:
                 await message.edit(embed=embed, attachments=[], view=EventView())
             ev_updated += 1
-            await asyncio.sleep(1.5)  # Защита от rate limit
+            await asyncio.sleep(2.5)  # Защита от rate limit
         except discord.NotFound:
             ev_errors += 1
         except Exception as e:
@@ -2005,7 +2020,7 @@ async def update_all_templates():
                 await message.edit(embed=embed, view=None)
             
             vac_updated += 1
-            await asyncio.sleep(1.5)  # Защита от rate limit
+            await asyncio.sleep(2.5)  # Защита от rate limit
         except discord.NotFound:
             vac_errors += 1
         except Exception as e:
@@ -2258,15 +2273,29 @@ async def cleanup_empty_temp_room(channel_id):
 
 @client.event
 async def on_voice_state_update(member, before, after):
-    global TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC, VOICE_ROOMS
+    """Обработчик для временных голосовых комнат с защитой от двойного создания."""
+    global TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC, VOICE_ROOMS, VOICE_ROOM_CREATION_LOCKS
     
     if member.bot:
         return
     
+    # === СЛУЧАЙ 1: Пользователь подключился к триггер-каналу ===
     if after.channel and after.channel.id in [TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC]:
-        await create_temp_voice_room(member, after.channel)
+        # Получаем или создаём lock для этого пользователя (защита от race condition)
+        if member.id not in VOICE_ROOM_CREATION_LOCKS:
+            VOICE_ROOM_CREATION_LOCKS[member.id] = asyncio.Lock()
+        
+        async with VOICE_ROOM_CREATION_LOCKS[member.id]:
+            # Проверяем, не создана ли уже комната для этого пользователя
+            for room_id, room_data in VOICE_ROOMS.items():
+                if room_data['owner_id'] == member.id:
+                    return
+            
+            # Создаём временную комнату
+            await create_temp_voice_room(member, after.channel)
         return
     
+    # === СЛУЧАЙ 2: Пользователь вышел из временной комнаты ===
     if before.channel and before.channel.id in VOICE_ROOMS:
         await asyncio.sleep(2)
         await cleanup_empty_temp_room(before.channel.id)
@@ -2352,6 +2381,7 @@ if __name__ == '__main__':
     try:
         client.run(os.environ['DISCORD_TOKEN'])
     finally:
+        EXECUTOR.shutdown(wait=False)
         if os.path.exists(LOCK_FILE):
             try:
                 with open(LOCK_FILE, 'r') as f:
