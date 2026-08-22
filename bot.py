@@ -350,38 +350,50 @@ def get_color_category(bg):
 
 
 def get_sheet_data_with_colors_sync(sheet, range_name):
-    """Синхронная версия для выполнения в executor (gspread использует requests)."""
-    try:
-        base_url = 'https://sheets.googleapis.com/v4/spreadsheets'
-        full_url = f'{base_url}/{sheet.spreadsheet.id}'
-        range_str = f"'{sheet.title}'!{range_name}"
-        params = {
-            'ranges': range_str,
-            'includeGridData': 'true',
-            'fields': 'sheets.data.rowData.values(effectiveFormat/backgroundColor,userEnteredValue)'
-        }
-        res = sheet.client.request('get', full_url, params=params)
-        data = res.json()
-        rows_data = data['sheets'][0]['data'][0].get('rowData', [])
-        result = []
-        for row in rows_data:
-            row_result = []
-            for cell in row.get('values', []):
-                val_obj = cell.get('userEnteredValue', {})
-                val = str(val_obj.get('stringValue', val_obj.get('numberValue', val_obj.get('boolValue', ''))))
-                bg = cell.get('effectiveFormat', {}).get('backgroundColor', None)
-                row_result.append({'value': val, 'bg': bg})
-            result.append(row_result)
-        return result
-    except Exception as e:
-        print(f"❌ Ошибка при получении данных с цветами из API: {e}")
-        return []
+    """Синхронная версия для выполнения в executor. Выбрасывает исключения при ошибках."""
+    base_url = 'https://sheets.googleapis.com/v4/spreadsheets'
+    full_url = f'{base_url}/{sheet.spreadsheet.id}'
+    range_str = f"'{sheet.title}'!{range_name}"
+    params = {
+        'ranges': range_str,
+        'includeGridData': 'true',
+        'fields': 'sheets.data.rowData.values(effectiveFormat/backgroundColor,userEnteredValue)'
+    }
+    res = sheet.client.request('get', full_url, params=params)
+    data = res.json()
+    rows_data = data['sheets'][0]['data'][0].get('rowData', [])
+    result = []
+    for row in rows_data:
+        row_result = []
+        for cell in row.get('values', []):
+            val_obj = cell.get('userEnteredValue', {})
+            val = str(val_obj.get('stringValue', val_obj.get('numberValue', val_obj.get('boolValue', ''))))
+            bg = cell.get('effectiveFormat', {}).get('backgroundColor', None)
+            row_result.append({'value': val, 'bg': bg})
+        result.append(row_result)
+    return result
 
 
 async def get_sheet_data_with_colors(sheet, range_name):
-    """Асинхронная обёртка — выполняет синхронный запрос в отдельном потоке."""
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(EXECUTOR, get_sheet_data_with_colors_sync, sheet, range_name)
+    """Асинхронная обёртка с retry для Google API."""
+    max_retries = 3
+    last_error = None
+    for attempt in range(max_retries):
+        try:
+            return await asyncio.get_event_loop().run_in_executor(
+                EXECUTOR, get_sheet_data_with_colors_sync, sheet, range_name
+            )
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            if ('503' in error_str or '500' in error_str or '429' in error_str) and attempt < max_retries - 1:
+                wait_time = 2 * (attempt + 1)
+                print(f"⚠️ Google API ошибка (попытка {attempt + 1}/{max_retries}), повтор через {wait_time} сек...")
+                await asyncio.sleep(wait_time)
+                continue
+            break
+    print(f"❌ Ошибка при получении данных с цветами из API: {last_error}")
+    return []
 
 
 async def load_clan_members_from_sheet():
@@ -392,33 +404,41 @@ async def load_clan_members_from_sheet():
     if not gc:
         print("⚠️ Google Sheets не инициализирован, использую кэш")
         return CLAN_MEMBERS_CACHE
-    try:
-        # Выполняем синхронный gc.open_by_url в отдельном потоке, чтобы не блокировать event loop
-        loop = asyncio.get_event_loop()
-        spreadsheet = await loop.run_in_executor(EXECUTOR, gc.open_by_url, SPREADSHEET_URL)
-        sheet = spreadsheet.worksheet(SHEET_NAME)
-        data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J28')
-        if not data_with_colors or len(data_with_colors) < 2:
+    
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            loop = asyncio.get_event_loop()
+            spreadsheet = await loop.run_in_executor(EXECUTOR, gc.open_by_url, SPREADSHEET_URL)
+            sheet = spreadsheet.worksheet(SHEET_NAME)
+            data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J28')
+            if not data_with_colors or len(data_with_colors) < 2:
+                return CLAN_MEMBERS_CACHE
+            headers = [cell['value'] for cell in data_with_colors[0]]
+            rows = data_with_colors[1:]
+            if NICKNAME_COLUMN not in headers:
+                return CLAN_MEMBERS_CACHE
+            nick_idx = headers.index(NICKNAME_COLUMN)
+            members = []
+            for row in rows:
+                if nick_idx < len(row):
+                    raw_nickname = row[nick_idx]['value'].strip()
+                    nickname = extract_nickname(raw_nickname)
+                    if nickname:
+                        members.append(nickname)
+            CLAN_MEMBERS_CACHE = members
+            CLAN_MEMBERS_CACHE_TIME = current_time
+            print(f"✅ Загружено {len(members)} участников клана из таблицы")
+            return members
+        except Exception as e:
+            error_str = str(e)
+            if ('503' in error_str or '500' in error_str or '429' in error_str) and attempt < max_retries - 1:
+                wait_time = 2 * (attempt + 1)
+                print(f"⚠️ Google API ошибка (попытка {attempt + 1}/{max_retries}), повтор через {wait_time} сек...")
+                await asyncio.sleep(wait_time)
+                continue
+            print(f"❌ Ошибка загрузки списка клана: {e}")
             return CLAN_MEMBERS_CACHE
-        headers = [cell['value'] for cell in data_with_colors[0]]
-        rows = data_with_colors[1:]
-        if NICKNAME_COLUMN not in headers:
-            return CLAN_MEMBERS_CACHE
-        nick_idx = headers.index(NICKNAME_COLUMN)
-        members = []
-        for row in rows:
-            if nick_idx < len(row):
-                raw_nickname = row[nick_idx]['value'].strip()
-                nickname = extract_nickname(raw_nickname)
-                if nickname:
-                    members.append(nickname)
-        CLAN_MEMBERS_CACHE = members
-        CLAN_MEMBERS_CACHE_TIME = current_time
-        print(f"✅ Загружено {len(members)} участников клана из таблицы")
-        return members
-    except Exception as e:
-        print(f"❌ Ошибка загрузки списка клана: {e}")
-        return CLAN_MEMBERS_CACHE
 
 
 async def find_discord_user(nickname: str, thread):
@@ -714,17 +734,19 @@ class EventCreateModal(discord.ui.Modal):
         self.add_item(self.end_time)
         self.add_item(self.num_games)
     async def on_submit(self, interaction):
+        # СРАЗУ отвечаем Discord, что начали обработку (иначе будет Unknown interaction)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             start = MSK.localize(datetime.strptime(self.start_time.value, "%d.%m.%Y %H:%M"))
             end = MSK.localize(datetime.strptime(self.end_time.value, "%d.%m.%Y %H:%M"))
             games = int(self.num_games.value.strip() or "0")
             if games < 0 or games > MAX_GAMES:
-                await interaction.response.send_message(es(f"❌ Количество игр: 0-{MAX_GAMES}!"), ephemeral=True)
+                await interaction.followup.send(es(f"❌ Количество игр: 0-{MAX_GAMES}!"), ephemeral=True)
                 return
             await create_event(self.event_title.value, self.event_description.value, start, end, image_key=self.image_key, num_games=games)
-            await interaction.response.send_message(es("✅ Мероприятие создано!"), ephemeral=True)
+            await interaction.followup.send(es("✅ Мероприятие создано!"), ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
 
 
 class EventEditModal(discord.ui.Modal):
@@ -743,17 +765,19 @@ class EventEditModal(discord.ui.Modal):
         self.add_item(self.end_time)
         self.add_item(self.num_games)
     async def on_submit(self, interaction):
+        # СРАЗУ отвечаем Discord, что начали обработку
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             start = MSK.localize(datetime.strptime(self.start_time.value, "%d.%m.%Y %H:%M"))
             end = MSK.localize(datetime.strptime(self.end_time.value, "%d.%m.%Y %H:%M"))
             games = int(self.num_games.value.strip() or "0")
             if games < 0 or games > MAX_GAMES:
-                await interaction.response.send_message(es(f"❌ Количество игр: 0-{MAX_GAMES}!"), ephemeral=True)
+                await interaction.followup.send(es(f"❌ Количество игр: 0-{MAX_GAMES}!"), ephemeral=True)
                 return
             await update_event(self.event_id, self.event_title.value, self.event_description.value, start, end, image_key=self.image_key, num_games=games)
-            await interaction.response.send_message(es("✅ Мероприятие обновлено!"), ephemeral=True)
+            await interaction.followup.send(es("✅ Мероприятие обновлено!"), ephemeral=True)
         except Exception as e:
-            await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
 
 
 class EventImageSelectView(discord.ui.View):
@@ -1923,7 +1947,7 @@ async def update_all_templates():
             else:
                 await message.edit(embed=embed, attachments=[], view=EventView())
             ev_updated += 1
-            await asyncio.sleep(2.5)  # Защита от rate limit
+            await asyncio.sleep(4)  # Защита от rate limit
         except discord.NotFound:
             ev_errors += 1
         except Exception as e:
@@ -2020,7 +2044,7 @@ async def update_all_templates():
                 await message.edit(embed=embed, view=None)
             
             vac_updated += 1
-            await asyncio.sleep(2.5)  # Защита от rate limit
+            await asyncio.sleep(4)  # Защита от rate limit
         except discord.NotFound:
             vac_errors += 1
         except Exception as e:
