@@ -411,7 +411,7 @@ async def load_clan_members_from_sheet():
             loop = asyncio.get_event_loop()
             spreadsheet = await loop.run_in_executor(EXECUTOR, gc.open_by_url, SPREADSHEET_URL)
             sheet = spreadsheet.worksheet(SHEET_NAME)
-            data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J28')
+            data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J35')
             if not data_with_colors or len(data_with_colors) < 2:
                 return CLAN_MEMBERS_CACHE
             headers = [cell['value'] for cell in data_with_colors[0]]
@@ -545,7 +545,7 @@ async def check_spreadsheet():
             loop = asyncio.get_event_loop()
             spreadsheet = await loop.run_in_executor(EXECUTOR, gc.open_by_url, SPREADSHEET_URL)
             sheet = spreadsheet.worksheet(SHEET_NAME)
-            data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J28')
+            data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J35')
             if not data_with_colors or len(data_with_colors) < 2:
                 return
             headers = [cell['value'] for cell in data_with_colors[0]]
