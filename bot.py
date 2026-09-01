@@ -164,7 +164,7 @@ WEEKDAY_INDEX = {'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'su
 DEFAULT_WEEKLY_EVENTS = {
     "weekly_asvdv_rtvt": {
         "name": "Суббота. Плановые RTvT на AS VDV",
-        "description": "Бойцы, в субботу пройдут плановые ротационные игры Realistic TvT на сервере AS VDV. Игры длинные - каждая по 60-90 минут. Ждём вас!\n\nОтметки обязательны.",
+        "description": "Бойцы, в субботу пройдут плановые ротационные матчи Realistic TvT на сервере AS VDV. Матчи длинные - каждая по 60-90 минут. Ждём вас!",
         "day_of_week": "sat",
         "start_time": "16:30",
         "end_time": "19:30",
@@ -174,7 +174,7 @@ DEFAULT_WEEKLY_EVENTS = {
     },
     "weekly_tt_tvt": {
         "name": "Воскресенье. Плановые TvT на Triad Tactics",
-        "description": "Бойцы, в воскресенье пройдут плановые ротационные игры TvT на сервере Triad Tactics. Игры длинные - каждая по 60-90 минут. Ждём вас!\n\nОтметки обязательны.",
+        "description": "Бойцы, в воскресенье пройдут плановые ротационные матчи TvT на сервере Triad Tactics. Матчи длинные - каждая по 60-90 минут. Ждём вас!",
         "day_of_week": "sun",
         "start_time": "17:45",
         "end_time": "22:15",
@@ -208,9 +208,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGES_DIR = os.path.join(BASE_DIR, 'images')
 
 EVENT_IMAGES = {
-    'echo': {'file': 'echo-rounded.png', 'title': 'Игра на ECHO'},
-    'asvdv': {'file': 'asvdv-rounded.png', 'title': 'Игра на AS VDV'},
-    'tt': {'file': 'tt-rounded.png', 'title': 'Игра на Triad Tactics'},
+    'echo': {'file': 'echo-rounded.png', 'title': 'Матчи на ECHO'},
+    'asvdv': {'file': 'asvdv-rounded.png', 'title': 'Матчи на AS VDV'},
+    'tt': {'file': 'tt-rounded.png', 'title': 'Матчи на Triad Tactics'},
     'mezhklan': {'file': 'mezhklan-rounded.png', 'title': 'Межклановое мероприятие'},
     'vnutriklan': {'file': 'vnutriklan-rounded.png', 'title': 'Внутриклановое мероприятие'},
     'vylazka': {'file': 'vylazka-rounded.png', 'title': 'Клановая вылазка'},
@@ -237,17 +237,17 @@ def get_image_info(image_key: str):
 
 def pluralize_games(num: int) -> str:
     if num <= 0:
-        return "игр"
+        return "матчей"
     last_digit = num % 10
     last_two_digits = num % 100
     if 11 <= last_two_digits <= 14:
-        return "игр"
+        return "матчей"
     if last_digit == 1:
-        return "игра"
+        return "матч"
     elif last_digit in [2, 3, 4]:
-        return "игры"
+        return "матча"
     else:
-        return "игр"
+        return "матчей"
 
 
 def pluralize_days(num: int) -> str:
@@ -317,8 +317,8 @@ VACATION_RULES = es("""
 * Отпуск оформляется на срок от **7 дней до 1 месяца**
 * Рапорт можно продлить, создав новый со следующего дня после окончания предыдущего
 * После оформления отпуск должен быть **утверждён комбатом или заместителем**
-* Во время отпуска тебе **не нужно отмечаться в расписании на игры**
-* Боец в отпуске **лишается возможности участия в играх** до закрытия отпуска
+* Во время отпуска тебе **не нужно отмечаться в расписании на матчи**
+* Боец в отпуске **лишается возможности участия в матчах** до закрытия отпуска
 
 **✅ Уважительные причины:**
 * Командировки и мероприятия по работе
@@ -329,7 +329,7 @@ VACATION_RULES = es("""
 **❌ Неуважительные причины:**
 * Усталость от игры
 
-Боец, указывай честную и конкретную причину! Это помогает командованию планировать состав на игры. Отпуск может быть аннулирован, если вы будете находится в отпуске, но постоянно играть в игры во время проводимых мероприятий в клане.
+Боец, указывай честную и конкретную причину! Это помогает командованию планировать состав на матчи. Отпуск может быть аннулирован, если вы будете находится в отпуске, но постоянно играть в игры во время проводимых мероприятий в клане.
 """)
 
 # ============== ИНИЦИАЛИЗАЦИЯ ==============
@@ -792,7 +792,7 @@ class EventCreateModal(discord.ui.Modal):
         self.start_time = discord.ui.TextInput(label="Начало (ДД.ММ.ГГГГ ЧЧ:ММ)", required=True, max_length=16)
         self.end_time = discord.ui.TextInput(label="Окончание (ДД.ММ.ГГГГ ЧЧ:ММ)", required=True, max_length=16)
         self.num_games = discord.ui.TextInput(
-            label="Игры;Обязательны ли отметки",
+            label="Матчи;Обязательны ли отметки",
             placeholder="Примеры: 2;Да или 0;Нет",
             required=False, max_length=10, default="0;Нет"
         )
@@ -815,7 +815,7 @@ class EventCreateModal(discord.ui.Modal):
             games = int(games_str.strip() or "0")
             mandatory = mandatory_str.strip().lower() not in ('нет', 'no', 'false', '0')
             if games < 0 or games > MAX_GAMES:
-                await interaction.followup.send(es(f"❌ Количество игр: 0-{MAX_GAMES}!"), ephemeral=True)
+                await interaction.followup.send(es(f"❌ Количество матчей: 0-{MAX_GAMES}!"), ephemeral=True)
                 return
             await create_event(self.event_title.value, self.event_description.value, start, end,
                                 image_key=self.image_key, num_games=games, mandatory=mandatory)
@@ -833,7 +833,7 @@ class EventEditModal(discord.ui.Modal):
         self.start_time = discord.ui.TextInput(label="Начало (ДД.ММ.ГГГГ ЧЧ:ММ)", default=current_start, required=True, max_length=16)
         self.end_time = discord.ui.TextInput(label="Окончание (ДД.ММ.ГГГГ ЧЧ:ММ)", default=current_end, required=True, max_length=16)
         self.num_games = discord.ui.TextInput(
-            label="Игры;Обязательны ли отметки",
+            label="Матчи;Обязательны ли отметки",
             placeholder="Примеры: 2;Да или 0;Нет",
             default=f"{num_games};{'Да' if mandatory else 'Нет'}",
             required=False, max_length=10
@@ -857,7 +857,7 @@ class EventEditModal(discord.ui.Modal):
             games = int(games_str.strip() or "0")
             mandatory = mandatory_str.strip().lower() not in ('нет', 'no', 'false', '0')
             if games < 0 or games > MAX_GAMES:
-                await interaction.followup.send(es(f"❌ Количество игр: 0-{MAX_GAMES}!"), ephemeral=True)
+                await interaction.followup.send(es(f"❌ Количество матчей: 0-{MAX_GAMES}!"), ephemeral=True)
                 return
             await update_event(self.event_id, self.event_title.value, self.event_description.value, start, end,
                                 image_key=self.image_key, num_games=games, mandatory=mandatory)
@@ -957,7 +957,7 @@ class WeeklyEventModal(discord.ui.Modal):
         self.start_time_input = discord.ui.TextInput(label="Начало (ЧЧ:ММ)", default=defaults.get('start_time', '16:30'), required=True, max_length=5)
         self.end_time_input = discord.ui.TextInput(label="Окончание (ЧЧ:ММ)", default=defaults.get('end_time', '19:30'), required=True, max_length=5)
         self.num_games_input = discord.ui.TextInput(
-            label="Игры;Обязательны ли отметки",
+            label="Матчи;Обязательны ли отметки",
             placeholder="Примеры: 2;Да или 0;Нет",
             default=f"{defaults.get('num_games', 0)};{'Да' if defaults.get('mandatory', True) else 'Нет'}",
             required=False, max_length=10
@@ -1025,7 +1025,7 @@ class WeeklyEventsManageSelectView(discord.ui.View):
             f"**{entry['name']}**\n\n{entry['description']}\n\n"
             f"День: {WEEKDAY_NAMES.get(entry['day_of_week'], entry['day_of_week'])}\n"
             f"Время: {entry['start_time']} - {entry['end_time']}\n"
-            f"Игр: {entry.get('num_games', 0)}\n"
+            f"Матчей: {entry.get('num_games', 0)}\n"
             f"Обязательны ли отметки: {'Да' if entry.get('mandatory', True) else 'Нет'}"
         )
         await interaction.response.send_message(text, view=WeeklyEventManageActionsView(weekly_id), ephemeral=True)
@@ -1526,7 +1526,7 @@ class AttendanceWizard:
 
 class CommandersSelectView(discord.ui.View):
     """Выбор командира отделения и (отдельно) командира стороны —
-    ТОЛЬКО из числа бойцов, отмеченных явившимися на этом шаге/игре (п.16)."""
+    ТОЛЬКО из числа бойцов, отмеченных явившимися на этом шаге/матче (п.16)."""
     def __init__(self, wizard, present_players):
         super().__init__(timeout=300)
         self.wizard = wizard
@@ -1614,14 +1614,14 @@ class AttendanceStepView(discord.ui.View):
             finish_btn.callback = self.to_commander_callback
             self.add_item(finish_btn)
         elif wizard.num_games > 1 and step < wizard.num_games - 1:
-            skip_btn = discord.ui.Button(label=es("⏭️ Пропустить эту игру"), style=discord.ButtonStyle.secondary, custom_id=f"attendance_skip_{step}", row=4)
+            skip_btn = discord.ui.Button(label=es("⏭️ Пропустить этот матч"), style=discord.ButtonStyle.secondary, custom_id=f"attendance_skip_{step}", row=4)
             skip_btn.callback = self.skip_callback
             self.add_item(skip_btn)
             next_btn = discord.ui.Button(label=es(f"➡️ Далее (командир отделения)"), style=discord.ButtonStyle.primary, custom_id=f"attendance_next_{step}", row=4)
             next_btn.callback = self.to_commander_callback
             self.add_item(next_btn)
         else:
-            skip_btn = discord.ui.Button(label=es("⏭️ Пропустить эту игру"), style=discord.ButtonStyle.secondary, custom_id=f"attendance_skip_{step}", row=4)
+            skip_btn = discord.ui.Button(label=es("⏭️ Пропустить этот матч"), style=discord.ButtonStyle.secondary, custom_id=f"attendance_skip_{step}", row=4)
             skip_btn.callback = self.skip_callback
             self.add_item(skip_btn)
             next_btn = discord.ui.Button(label=es(f"➡️ Далее (командир отделения)"), style=discord.ButtonStyle.primary, custom_id=f"attendance_next_{step}", row=4)
@@ -1684,7 +1684,7 @@ async def start_attendance_wizard(interaction, event_id):
     if num_games == 0:
         title_text = es(f"👥 **{event.get('title', '')}**\n\n") + es("Выберите бойцов, явившихся на мероприятие:")
     else:
-        title_text = es(f"👥 **{event.get('title', '')}**\n\n") + es(f"**Игра 1** из {num_games}\nВыберите явившихся:")
+        title_text = es(f"👥 **{event.get('title', '')}**\n\n") + es(f"**Матч 1** из {num_games}\nВыберите явившихся:")
     await interaction.response.send_message(title_text, view=view, ephemeral=True)
 
 
@@ -1696,7 +1696,7 @@ async def show_commander_step(interaction, wizard):
     if wizard.num_games == 0:
         title_text = es(f"🪖 **{wizard.event_title}**\n\n") + es("Выберите командира отделения и командира стороны (из числа явившихся):")
     else:
-        title_text = es(f"🪖 **{wizard.event_title}**\n\n") + es(f"**Командиры на игре {wizard.current_step + 1}** из {wizard.num_games}\nВыберите из числа явившихся на эту игру:")
+        title_text = es(f"🪖 **{wizard.event_title}**\n\n") + es(f"**Командиры на матче {wizard.current_step + 1}** из {wizard.num_games}\nВыберите из числа явившихся на этот матч:")
 
     await interaction.followup.send(title_text, view=view, ephemeral=True)
 
@@ -1714,7 +1714,7 @@ async def proceed_to_next_step(interaction, wizard):
         return
     
     view = AttendanceStepView(wizard, wizard.current_step, clan_members)
-    title_text = es(f"👥 **{wizard.event_title}**\n\n") + es(f"**Игра {wizard.current_step + 1}** из {wizard.num_games}\nВыберите явившихся:")
+    title_text = es(f"👥 **{wizard.event_title}**\n\n") + es(f"**Матч {wizard.current_step + 1}** из {wizard.num_games}\nВыберите явившихся:")
     await interaction.followup.send(title_text, view=view, ephemeral=True)
 
 
@@ -1792,7 +1792,7 @@ async def finalize_attendance(interaction, wizard):
             commander = wizard.commanders.get(i)
             side_commander = wizard.side_commanders.get(i)
             
-            report_text += es(f"🎮 **Игра {i+1}**\n\n")
+            report_text += es(f"🎮 **Матч {i+1}**\n\n")
             report_text += es(f"👥 Явились ({len(players)}):\n")
             report_text += "\n".join(players) if players else es("*Никто не явился*")
             
@@ -2134,7 +2134,7 @@ async def handle_event_response(interaction, event_id, response_type):
         await interaction.response.send_message(es("⛔ Мероприятие уже завершено. Отметки больше не принимаются!"), ephemeral=True)
         return
 
-    # === Запрет на участие, если игрока нет в таблице клана (п.9) ===
+    # === Запрет на участие, если бойца нет в таблице клана (п.9) ===
     clan_members = await load_clan_members_from_sheet()
     if nickname not in clan_members:
         await interaction.response.send_message(
@@ -2296,13 +2296,13 @@ async def build_event_embed(event_id: str) -> discord.Embed:
 
     embed = discord.Embed(title=title_prefix + event['title'], description=event['description'], color=embed_color)
 
-    # === ЧИСЛО ИГР (строка сверху, п.7) ===
+    # === ЧИСЛО МАТЧЕЙ (строка сверху, п.7) ===
     num_games = event.get('num_games', 0)
     if num_games and num_games > 0:
         games_word = pluralize_games(num_games)
-        embed.add_field(name=es("🎮 Игры"), value=f"Запланировано: {num_games} {games_word}", inline=False)
+        embed.add_field(name=es("🎮 Плановые матчи"), value=f"Запланировано: {num_games} {games_word}", inline=False)
     else:
-        embed.add_field(name=es("🎮 Игры"), value="Игры на мероприятии не запланированы", inline=False)
+        embed.add_field(name=es("🎮 Матчи"), value="Матчи на мероприятии не запланированы", inline=False)
 
     # === ОБЯЗАТЕЛЬНОСТЬ ОТМЕТОК (п.11) ===
     if event.get('mandatory', True):
@@ -2402,7 +2402,7 @@ async def show_event_list(interaction):
         text += f"Дата: {start.strftime('%d.%m.%Y %H:%M')}\n"
         num_games = event.get('num_games', 0)
         if num_games and num_games > 0:
-            text += es(f"🎮 Игр: {num_games}\n")
+            text += es(f"🎮 Матчей: {num_games}\n")
         text += es(f"✅ Придут: {len(event.get('accepted', {}))}\n")
         text += es(f"❌ Не придут: {len(event.get('declined', {}))}\n\n")
     await interaction.response.send_message(text, ephemeral=True)
