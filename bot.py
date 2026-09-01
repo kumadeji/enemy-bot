@@ -499,7 +499,6 @@ def build_intro_lines(current_time: datetime) -> list:
         es("🔴 **Красные** проблемы — критические, требуют немедленного исправления."),
         es("🟡 **Желтые** проблемы — менее важные, но тоже требуют своевременного исправления."),
         es(f"📅 Проверка от {current_time.strftime('%d.%m.%Y %H:%M')} МСК"), " ",
-        "─" * 50,
     ]
 
 
@@ -526,7 +525,6 @@ def build_user_message(discord_user, issues: list) -> str:
         for issue in yellow_issues:
             parts.append(issue_line(issue))
         parts.append("")
-    parts.append("─" * 50)
     return "\n".join(parts).strip("\n")
 
 
@@ -607,7 +605,7 @@ async def check_spreadsheet():
                     user_msg = build_user_message(discord_user, issues)
                     await send_chunked(thread, user_msg, discord_user.display_name)
                 if users_not_found:
-                    not_found_msg = ("─" * 50 + "\n\n" + es("⚠️ **Не удалось найти в Discord:**\n") + ", ".join(users_not_found))
+                    not_found_msg = ("\n\n" + es("⚠️ **Не удалось найти в Discord:**\n") + ", ".join(users_not_found))
                     await send_chunked(thread, not_found_msg, "список ненайденных")
         except Exception as e:
             print(f"Ошибка при проверке: {e}")
