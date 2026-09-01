@@ -7,12 +7,16 @@ import gspread
 import re
 import json
 import uuid
+import copy
+import threading
 from datetime import datetime, timedelta
 from collections import deque
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import firebase_admin
+from firebase_admin import credentials as firebase_credentials, firestore
 
 # Глобальный executor для синхронных операций (gspread использует requests)
 EXECUTOR = ThreadPoolExecutor(max_workers=5)
@@ -152,6 +156,31 @@ VACATIONS_FILE = 'vacations.json'
 ATTENDANCE_FILE = 'attendance_data.json'
 WEEKLY_EVENTS_FILE = 'weekly_events.json'
 LAST_SCHEDULED_CHECK_FILE = 'last_scheduled_check.json'
+VOICE_ROOMS_FILE = 'voice_rooms.json'
+
+# ============== FIREBASE ==============
+
+FIREBASE_CREDENTIALS_FILE = 'credentials_firebase.json'
+FIREBASE_PROJECT_ID = 'enemy-firebase'
+FIREBASE_ROSTER_COLLECTION = 'rosterPublic'
+
+# Клантег, которым дополняется "голый" позывной (callsign) из Firebase,
+# чтобы получить строку, сравнимую с discord display_name (напр. "[En-Y]Killa").
+# Если у вас в клане используется другой тег — поменяйте здесь.
+CLAN_TAG = "[En-Y]"
+
+# Все "JSON-файлы" бота на самом деле хранятся как документы в Firestore,
+# в коллекции botData. Ключ словаря — старое имя файла (для обратной совместимости
+# со всем остальным кодом бота, который вызывает load_json('events_data.json', ...)
+# и не подозревает о Firebase), значение — имя документа в Firestore.
+FIREBASE_DATA_MAP = {
+    EVENTS_FILE: 'events',
+    VACATIONS_FILE: 'vacations',
+    ATTENDANCE_FILE: 'attendance',
+    WEEKLY_EVENTS_FILE: 'weeklyEvents',
+    VOICE_ROOMS_FILE: 'voiceRooms',
+    LAST_SCHEDULED_CHECK_FILE: 'lastScheduledCheck',
+}
 
 # ============== ЕЖЕНЕДЕЛЬНЫЕ МЕРОПРИЯТИЯ: СПРАВОЧНИКИ ==============
 
@@ -186,7 +215,8 @@ DEFAULT_WEEKLY_EVENTS = {
 
 
 def ensure_weekly_events_file():
-    if not os.path.exists(WEEKLY_EVENTS_FILE):
+    existing = load_json(WEEKLY_EVENTS_FILE, {})
+    if not existing:
         save_json(WEEKLY_EVENTS_FILE, DEFAULT_WEEKLY_EVENTS)
 
 
@@ -369,6 +399,17 @@ except Exception as e:
     print(f"Ошибка при инициализации Google Sheets: {e}")
     gc = None
 
+try:
+    if not firebase_admin._apps:
+        _fb_cred = firebase_credentials.Certificate(FIREBASE_CREDENTIALS_FILE)
+        firebase_admin.initialize_app(_fb_cred, {'projectId': FIREBASE_PROJECT_ID})
+    fs_db = firestore.client()
+    print("✅ Firebase Admin SDK инициализирован")
+except Exception as e:
+    print(f"❌ Ошибка при инициализации Firebase: {e}")
+    fs_db = None
+
+
 # ============== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==============
 
 def extract_nickname(raw_text):
@@ -494,6 +535,40 @@ async def load_clan_members_from_sheet():
             print(f"❌ Ошибка загрузки списка клана: {e}")
             return CLAN_MEMBERS_CACHE
 
+def _firebase_load_roster_sync():
+    """Синхронное чтение всех callsign'ов из rosterPublic (выполняется в EXECUTOR)."""
+    docs = fs_db.collection(FIREBASE_ROSTER_COLLECTION).stream()
+    members = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        callsign = (data.get('callsign') or '').strip()
+        if callsign:
+            members.append(f"{CLAN_TAG}{callsign}")
+    return members
+
+
+async def load_clan_members_from_firebase():
+    """Список бойцов клана из Firebase (rosterPublic) — используется для явки,
+    гейта на участие в мероприятиях и списка 'активных бойцов'.
+    НЕ используется для check_spreadsheet() — та проверка ошибок регистрации
+    по-прежнему читает исходную Google-таблицу напрямую, без изменений."""
+    global CLAN_MEMBERS_CACHE, CLAN_MEMBERS_CACHE_TIME
+    current_time = datetime.now().timestamp()
+    if CLAN_MEMBERS_CACHE and CLAN_MEMBERS_CACHE_TIME and (current_time - CLAN_MEMBERS_CACHE_TIME) < CLAN_MEMBERS_CACHE_TTL:
+        return CLAN_MEMBERS_CACHE
+    if not fs_db:
+        print("⚠️ Firebase не инициализирован, использую кэш списка клана")
+        return CLAN_MEMBERS_CACHE
+    try:
+        loop = asyncio.get_event_loop()
+        members = await loop.run_in_executor(EXECUTOR, _firebase_load_roster_sync)
+        CLAN_MEMBERS_CACHE = members
+        CLAN_MEMBERS_CACHE_TIME = current_time
+        print(f"✅ Загружено {len(members)} участников клана из Firebase")
+        return members
+    except Exception as e:
+        print(f"❌ Ошибка загрузки списка клана из Firebase: {e}")
+        return CLAN_MEMBERS_CACHE
 
 async def find_discord_user(nickname: str, thread):
     try:
@@ -660,9 +735,75 @@ async def scheduled_check_spreadsheet():
 
 # ============== РАБОТА С ДАННЫМИ ==============
 
+_FIRESTORE_CACHE = {}
+_FIRESTORE_CACHE_LOCK = threading.Lock()
+
+
+def _firestore_doc_ref(doc_name):
+    return fs_db.collection('botData').document(doc_name)
+
+
+def _firestore_read_sync(doc_name):
+    """Синхронное чтение (выполняется в EXECUTOR, не блокирует event loop)."""
+    doc_ref = _firestore_doc_ref(doc_name)
+    snap = doc_ref.get()
+    if snap.exists:
+        return (snap.to_dict() or {}).get('data', {})
+    return {}
+
+
+def _firestore_write_sync(doc_name, data):
+    """Синхронная запись (выполняется в EXECUTOR, не блокирует event loop)."""
+    if not fs_db:
+        print(f"⚠️ Firebase не инициализирован — запись '{doc_name}' пропущена")
+        return
+    try:
+        doc_ref = _firestore_doc_ref(doc_name)
+        doc_ref.set({'data': data, 'updatedAt': firestore.SERVER_TIMESTAMP})
+    except Exception as e:
+        print(f"❌ Ошибка записи в Firebase ({doc_name}): {e}")
+
+
+async def load_all_firebase_data():
+    """Загружает все данные бота из Firebase в память при старте.
+    Если в Firebase ещё пусто, а рядом лежит старый локальный JSON-файл —
+    один раз переносит его содержимое в облако (чтобы не потерять историю
+    при переходе со старой версии бота)."""
+    if not fs_db:
+        print("⚠️ Firebase не инициализирован — данные бота НЕ будут сохраняться в облако!")
+        return
+    loop = asyncio.get_event_loop()
+    for local_name, doc_name in FIREBASE_DATA_MAP.items():
+        try:
+            data = await loop.run_in_executor(EXECUTOR, _firestore_read_sync, doc_name)
+            if not data and os.path.exists(local_name):
+                try:
+                    with open(local_name, 'r', encoding='utf-8') as f:
+                        local_data = json.load(f)
+                    if local_data:
+                        await loop.run_in_executor(EXECUTOR, _firestore_write_sync, doc_name, local_data)
+                        data = local_data
+                        print(f"📦 Мигрированы локальные данные '{local_name}' → Firebase ({doc_name})")
+                except Exception as mig_err:
+                    print(f"⚠️ Не удалось мигрировать '{local_name}' в Firebase: {mig_err}")
+            with _FIRESTORE_CACHE_LOCK:
+                _FIRESTORE_CACHE[local_name] = data
+        except Exception as e:
+            print(f"❌ Ошибка загрузки '{doc_name}' из Firebase: {e}")
+            with _FIRESTORE_CACHE_LOCK:
+                _FIRESTORE_CACHE[local_name] = {}
+    print(f"✅ Данные бота загружены из Firebase ({len(FIREBASE_DATA_MAP)} коллекций)")
+
 def load_json(filename, default=None):
     if default is None:
         default = {}
+    if filename in FIREBASE_DATA_MAP:
+        with _FIRESTORE_CACHE_LOCK:
+            cached = _FIRESTORE_CACHE.get(filename)
+        if cached is None:
+            return default
+        return copy.deepcopy(cached)
+    # Фоллбэк на локальный файл — для всего, что ещё не переведено на Firebase
     if not os.path.exists(filename):
         return default
     try:
@@ -673,12 +814,21 @@ def load_json(filename, default=None):
 
 
 def save_json(filename, data):
+    if filename in FIREBASE_DATA_MAP:
+        with _FIRESTORE_CACHE_LOCK:
+            _FIRESTORE_CACHE[filename] = copy.deepcopy(data)
+        doc_name = FIREBASE_DATA_MAP[filename]
+        if fs_db:
+            try:
+                EXECUTOR.submit(_firestore_write_sync, doc_name, data)
+            except Exception as e:
+                print(f"❌ Не удалось запланировать запись в Firebase ({doc_name}): {e}")
+        return
     try:
         with open(filename, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
         print(f"Ошибка сохранения {filename}: {e}")
-
 
 def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
     vacations = load_json(VACATIONS_FILE, {})
@@ -699,7 +849,7 @@ def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
 
 
 async def get_active_members(current_date: datetime) -> list:
-    members = await load_clan_members_from_sheet()
+    members = await load_clan_members_from_firebase()
     return [m for m in members if not is_on_vacation_dynamic(m, current_date)]
 
 
@@ -1381,7 +1531,8 @@ class ConfirmDeleteView(discord.ui.View):
         await interaction.response.send_message(es("🚫 Удаление отменено."), ephemeral=True)
 
 
-class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление о модах")):
+class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление  для скачивания модов")):
+    server_name = discord.ui.TextInput(label="Название сервера (необязательно)", required=False, max_length=100)
     password = discord.ui.TextInput(label="Пароль на моды (необязательно)", required=False, max_length=100)
 
     def __init__(self, event_id):
@@ -1402,29 +1553,38 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление о
 
         event_start = datetime.fromtimestamp(event['start_time'], MSK)
         start_ts = int(event_start.timestamp())
+        guild = thread.guild
+        role = discord.utils.get(guild.roles, name="Боец ArmA")
 
         if event_created_late(event):
-            guild = thread.guild
-            role = discord.utils.get(guild.roles, name="Боец ArmA")
-            mention_block = role.mention if role else "@Боец ArmA"
+            # Мероприятие создано менее чем за сутки — рассылаем по роли целиком (п.13)
+            mention_block = role.mention if role else "**@Боец ArmA**"
         else:
+            # По умолчанию — только тем, кто отметился "Приду" (п.13)
             accepted = list(event.get('accepted', {}).keys())
             mentions = []
             for nickname in accepted:
                 member = await find_member_by_nickname(nickname)
                 mentions.append(member.mention if member else f"**{nickname}**")
-            mention_block = " ".join(mentions) if mentions else "@Боец ArmA"
+            if mentions:
+                mention_block = " ".join(mentions)
+            else:
+                # Никто ещё не отметился — некому слать индивидуально, пингуем роль как fallback
+                mention_block = role.mention if role else "**@Боец ArmA**"
 
         text = (
             mention_block + "\n\n" +
-            f"Бойцы, внимание! {event['title']}\n\n" +
-            f"Мероприятие начнется <t:{start_ts}:R>! Моды уже можно начать скачивать!"
+            f"Бойцы, внимание! {event['title']}\n\n"
         )
+        if self.server_name.value.strip():
+            text += f"Сервер: {self.server_name.value.strip()}\n\n"
+
+        text += f"Мероприятие начнется <t:{start_ts}:R>! Моды уже можно начать скачивать!"
         if self.password.value.strip():
             text += f" Пароль: {self.password.value.strip()}"
 
         await thread.send(text)
-        await interaction.response.send_message(es("✅ Объявление о модах отправлено!"), ephemeral=True)
+        await interaction.response.send_message(es("✅ Объявление для скачивания модов отправлено!"), ephemeral=True)
 
 
 # --- Фабрики кнопок ---
@@ -1440,32 +1600,32 @@ def make_decline_button():
     return b
 
 def make_edit_button():
-    b = discord.ui.Button(label=es("✏️ Редактировать"), style=discord.ButtonStyle.secondary, custom_id="event_edit", row=1)
+    b = discord.ui.Button(label=es("✏️ Изменить"), style=discord.ButtonStyle.secondary, custom_id="event_edit", row=1)
     b.callback = on_edit_button
     return b
 
 def make_attendance_button():
-    b = discord.ui.Button(label=es("📝 Указать явку бойцов"), style=discord.ButtonStyle.success, custom_id="event_attendance", row=1)
+    b = discord.ui.Button(label=es("📝 Явка"), style=discord.ButtonStyle.success, custom_id="event_attendance", row=1)
     b.callback = on_attendance_button
     return b
 
 def make_cancel_button():
-    b = discord.ui.Button(label=es("🚫 Отменить мероприятие"), style=discord.ButtonStyle.danger, custom_id="event_cancel", row=2)
+    b = discord.ui.Button(label=es("🚫 Отменить"), style=discord.ButtonStyle.danger, custom_id="event_cancel", row=1)
     b.callback = on_cancel_button
     return b
 
 def make_reactivate_button():
-    b = discord.ui.Button(label=es("🔄 Активировать снова"), style=discord.ButtonStyle.success, custom_id="event_reactivate", row=2)
+    b = discord.ui.Button(label=es("🔄 Активировать"), style=discord.ButtonStyle.success, custom_id="event_reactivate", row=1)
     b.callback = on_reactivate_button
     return b
 
 def make_delete_button():
-    b = discord.ui.Button(label=es("🗑️ Удалить мероприятие"), style=discord.ButtonStyle.danger, custom_id="event_delete", row=2)
+    b = discord.ui.Button(label=es("🗑️ Удалить"), style=discord.ButtonStyle.danger, custom_id="event_delete", row=1)
     b.callback = on_delete_button
     return b
 
 def make_mods_button():
-    b = discord.ui.Button(label=es("🧩 Моды"), style=discord.ButtonStyle.primary, custom_id="event_mods", row=3)
+    b = discord.ui.Button(label=es("🧩 Моды"), style=discord.ButtonStyle.primary, custom_id="event_mods", row=1)
     b.callback = on_mods_button
     return b
 
@@ -1928,7 +2088,7 @@ async def approve_vacation(interaction, nickname):
             embed = message.embeds[0]
             embed.color = discord.Color.green()
             embed.title = es("🏖️ Отпуск утверждён")
-            embed.description = f"Отпуск для **{nickname}**" if vacation.get('by_admin') else f"**{nickname}** взял(а) отпуск"
+            embed.description = f"Отпуск для **{nickname}**" if vacation.get('by_admin') else f"**{nickname}** взял отпуск"
             # ВАЖНО: без break, чтобы обновлялись ОБА поля (и Период, и Статус)
             for i, field in enumerate(embed.fields):
                 if field.name == es("📅 Период"):
@@ -2134,11 +2294,11 @@ async def handle_event_response(interaction, event_id, response_type):
         await interaction.response.send_message(es("⛔ Мероприятие уже завершено. Отметки больше не принимаются!"), ephemeral=True)
         return
 
-    # === Запрет на участие, если бойца нет в таблице клана (п.9) ===
-    clan_members = await load_clan_members_from_sheet()
+    # === Запрет на участие, если бойца нет в списке клана (Firebase) (п.9) ===
+    clan_members = await load_clan_members_from_firebase()
     if nickname not in clan_members:
         await interaction.response.send_message(
-            es("⛔ Вы не найдены в таблице клана. Обратитесь к командованию, чтобы отметиться."),
+            es("⛔ Вы не найдены в списке клана. Обратитесь к командованию, чтобы отметиться."),
             ephemeral=True
         )
         return
@@ -2655,7 +2815,7 @@ async def update_all_templates():
                 
             elif status == 'active':
                 embed.title = es("🏖️ Отпуск утверждён")
-                embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** взял(а) отпуск"
+                embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** взял отпуск"
                 embed.color = discord.Color.green()
                 for i, field in enumerate(embed.fields):
                     if field.name == es("ℹ️ Статус"):
@@ -2670,12 +2830,12 @@ async def update_all_templates():
                     status_text = "Отклонён командованием"
                 elif status == 'ended_early':
                     embed.title = es("🏖️ Отпуск утверждён")
-                    embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** взял(а) отпуск"
+                    embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** взял отпуск"
                     embed.color = discord.Color.red()
                     status_text = "Завершен досрочно"
                 else:  # ended_scheduled
                     embed.title = es("🏖️ Отпуск утверждён")
-                    embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** взял(а) отпуск"
+                    embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** взял отпуск"
                     embed.color = discord.Color.greyple()
                     status_text = "Завершен по истечению срока"
                 
@@ -2902,6 +3062,7 @@ async def create_temp_voice_room(member, trigger_channel):
             'created_at': datetime.now(MSK).isoformat(),
             'is_public': is_public
         }
+        save_voice_rooms()
         
         await member.move_to(temp_channel, reason="Создание временной голосовой комнаты")
         
@@ -2922,17 +3083,106 @@ async def cleanup_empty_temp_room(channel_id):
         channel = client.get_channel(channel_id)
         if channel is None:
             del VOICE_ROOMS[channel_id]
+            save_voice_rooms()
             return
         
         if len(channel.members) == 0:
             await channel.delete(reason="Временная комната пуста — автоудаление")
             del VOICE_ROOMS[channel_id]
+            save_voice_rooms()
             print(f"🗑️ Удалена пустая временная комната (ID: {channel_id})")
     except discord.NotFound:
         if channel_id in VOICE_ROOMS:
             del VOICE_ROOMS[channel_id]
+            save_voice_rooms()
     except Exception as e:
         print(f"⚠️ Ошибка при удалении временной комнаты: {e}")
+
+        
+TEMP_ROOM_NAME_PREFIX = "🚪 Комната "
+
+
+def save_voice_rooms():
+    """Сохраняет текущее состояние временных комнат на диск (переживает рестарт бота)."""
+    save_json(VOICE_ROOMS_FILE, {str(k): v for k, v in VOICE_ROOMS.items()})
+
+
+def load_voice_rooms():
+    """Загружает состояние временных комнат с диска в память при старте бота."""
+    global VOICE_ROOMS
+    data = load_json(VOICE_ROOMS_FILE, {})
+    VOICE_ROOMS = {int(k): v for k, v in data.items()}
+
+
+async def sync_voice_rooms_on_startup(guild):
+    """Сверяет состояние временных комнат с реальностью при старте бота.
+    Закрывает эффект 'зависшей' комнаты, которая осталась пустой, пока бот был offline
+    (например, рестарт бота произошёл в момент, когда все вышли из комнаты, и
+    событие on_voice_state_update было пропущено из-за разрыва gateway-сессии)."""
+    load_voice_rooms()
+
+    # 1. Чистим то, что бот УЖЕ знал (из старой сессии) — вдруг оно уже пустое или удалено
+    ids_to_remove = []
+    for channel_id in list(VOICE_ROOMS.keys()):
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            ids_to_remove.append(channel_id)
+            continue
+        if len(channel.members) == 0:
+            try:
+                await channel.delete(reason="Временная комната пуста — очистка при запуске бота")
+                print(f"🗑️ [Синхронизация] Удалена зависшая пустая комната (ID: {channel_id})")
+            except Exception as e:
+                print(f"⚠️ [Синхронизация] Не удалось удалить зависшую комнату {channel_id}: {e}")
+            ids_to_remove.append(channel_id)
+
+    for channel_id in ids_to_remove:
+        VOICE_ROOMS.pop(channel_id, None)
+
+    # 2. Сканируем сами категории на предмет "бесхозных" комнат,
+    #    о которых бот вообще не знает (например, если voice_rooms.json ещё не существовал)
+    for category_id in (VOICE_ROOM_CATEGORY_ARMY, VOICE_ROOM_CATEGORY_PUBLIC):
+        category = guild.get_channel(category_id)
+        if not category:
+            continue
+        for ch in category.voice_channels:
+            if ch.id in (TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC):
+                continue
+            if not ch.name.startswith(TEMP_ROOM_NAME_PREFIX):
+                continue
+            if ch.id in VOICE_ROOMS:
+                continue
+
+            if len(ch.members) == 0:
+                try:
+                    await ch.delete(reason="Обнаружена бесхозная пустая временная комната — очистка при запуске бота")
+                    print(f"🗑️ [Синхронизация] Удалена бесхозная пустая комната '{ch.name}' (ID: {ch.id})")
+                except Exception as e:
+                    print(f"⚠️ [Синхронизация] Не удалось удалить бесхозную комнату {ch.id}: {e}")
+            else:
+                owner_id = None
+                for target, overwrite in ch.overwrites.items():
+                    if isinstance(target, discord.Member) and overwrite.manage_channels:
+                        owner_id = target.id
+                        break
+                if owner_id is None and ch.members:
+                    owner_id = ch.members[0].id
+                VOICE_ROOMS[ch.id] = {
+                    'owner_id': owner_id,
+                    'created_at': datetime.now(MSK).isoformat(),
+                    'is_public': (category_id == VOICE_ROOM_CATEGORY_PUBLIC)
+                }
+                print(f"♻️ [Синхронизация] Восстановлено отслеживание непустой комнаты '{ch.name}' (ID: {ch.id})")
+
+    save_voice_rooms()
+
+
+async def sweep_empty_voice_rooms():
+    """Периодическая защитная проверка на случай пропущенных событий on_voice_state_update
+    (например, при разрыве и переподключении gateway-сессии). Работает как страховка
+    поверх обычной логики удаления при выходе из комнаты."""
+    for channel_id in list(VOICE_ROOMS.keys()):
+        await cleanup_empty_temp_room(channel_id)
 
 
 # ============== СОБЫТИЯ DISCORD ==============
@@ -2971,11 +3221,13 @@ async def on_voice_state_update(member, before, after):
 async def on_ready():
     print(f'Бот запущен как {client.user} (PID {os.getpid()})')
     
+    await load_all_firebase_data()
     ensure_weekly_events_file()
-    await load_clan_members_from_sheet()
+    await load_clan_members_from_firebase()
     
     for guild in client.guilds:
         await setup_voice_room_triggers(guild)
+        await sync_voice_rooms_on_startup(guild)
     
     if not scheduler.get_job('spreadsheet_check'):
         scheduler.add_job(
@@ -2994,7 +3246,9 @@ async def on_ready():
     if not scheduler.get_job('event_completion_check'):
         scheduler.add_job(check_event_completion, 'interval', minutes=5, id='event_completion_check', replace_existing=True)
     if not scheduler.get_job('clan_cache_refresh'):
-        scheduler.add_job(load_clan_members_from_sheet, 'interval', hours=1, id='clan_cache_refresh', replace_existing=True)
+        scheduler.add_job(load_clan_members_from_firebase, 'interval', hours=1, id='clan_cache_refresh', replace_existing=True)
+    if not scheduler.get_job('voice_rooms_sweep'):
+        scheduler.add_job(sweep_empty_voice_rooms, 'interval', minutes=10, id='voice_rooms_sweep', replace_existing=True)
     
     if not scheduler.running:
         scheduler.start()
@@ -3056,7 +3310,8 @@ if __name__ == '__main__':
     try:
         client.run(os.environ['DISCORD_TOKEN'])
     finally:
-        EXECUTOR.shutdown(wait=False)
+        # wait=True — дожидаемся завершения всех фоновых записей в Firebase перед выходом
+        EXECUTOR.shutdown(wait=True)
         if os.path.exists(LOCK_FILE):
             try:
                 with open(LOCK_FILE, 'r') as f:
