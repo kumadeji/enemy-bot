@@ -791,7 +791,7 @@ class EventCreateModal(discord.ui.Modal):
         self.event_description = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, required=True, max_length=1000)
         self.start_time = discord.ui.TextInput(label="Начало (ДД.ММ.ГГГГ ЧЧ:ММ)", required=True, max_length=16)
         self.end_time = discord.ui.TextInput(label="Окончание (ДД.ММ.ГГГГ ЧЧ:ММ)", required=True, max_length=16)
-        self.num_games = discord.ui.TextInput(label="Игр;Обязательно (напр. 0;да)", required=False, max_length=10, default="0;да")
+        self.num_games = discord.ui.TextInput(label="Количество игр;Обязательно ли отмечаться (Пример: ''2;Да или Нет'')", required=False, max_length=10, default="0;Нет")
         self.add_item(self.event_title)
         self.add_item(self.event_description)
         self.add_item(self.start_time)
@@ -807,9 +807,9 @@ class EventCreateModal(discord.ui.Modal):
             if ';' in raw:
                 games_str, mandatory_str = raw.split(';', 1)
             else:
-                games_str, mandatory_str = raw, 'да'
+                games_str, mandatory_str = raw, 'Да'
             games = int(games_str.strip() or "0")
-            mandatory = mandatory_str.strip().lower() not in ('нет', 'no', 'false', '0')
+            mandatory = mandatory_str.strip().lower() not in ('Нет', 'No', 'false', '0')
             if games < 0 or games > MAX_GAMES:
                 await interaction.followup.send(es(f"❌ Количество игр: 0-{MAX_GAMES}!"), ephemeral=True)
                 return
@@ -828,7 +828,7 @@ class EventEditModal(discord.ui.Modal):
         self.event_description = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, default=current_description, required=True, max_length=1000)
         self.start_time = discord.ui.TextInput(label="Начало (ДД.ММ.ГГГГ ЧЧ:ММ)", default=current_start, required=True, max_length=16)
         self.end_time = discord.ui.TextInput(label="Окончание (ДД.ММ.ГГГГ ЧЧ:ММ)", default=current_end, required=True, max_length=16)
-        self.num_games = discord.ui.TextInput(label="Игр;Обязательно (напр. 2;да)", default=f"{num_games};{'да' if mandatory else 'нет'}", required=False, max_length=10)
+        self.num_games = discord.ui.TextInput(label="Количество игр;Обязательно ли отмечаться (Пример: ''2;Да или Нет'')", default=f"{num_games};{'Да' if mandatory else 'Нет'}", required=False, max_length=10)
         self.add_item(self.event_title)
         self.add_item(self.event_description)
         self.add_item(self.start_time)
@@ -844,9 +844,9 @@ class EventEditModal(discord.ui.Modal):
             if ';' in raw:
                 games_str, mandatory_str = raw.split(';', 1)
             else:
-                games_str, mandatory_str = raw, 'да'
+                games_str, mandatory_str = raw, 'Да'
             games = int(games_str.strip() or "0")
-            mandatory = mandatory_str.strip().lower() not in ('нет', 'no', 'false', '0')
+            mandatory = mandatory_str.strip().lower() not in ('Нет', 'No', 'false', '0')
             if games < 0 or games > MAX_GAMES:
                 await interaction.followup.send(es(f"❌ Количество игр: 0-{MAX_GAMES}!"), ephemeral=True)
                 return
@@ -948,8 +948,8 @@ class WeeklyEventModal(discord.ui.Modal):
         self.start_time_input = discord.ui.TextInput(label="Начало (ЧЧ:ММ)", default=defaults.get('start_time', '16:30'), required=True, max_length=5)
         self.end_time_input = discord.ui.TextInput(label="Окончание (ЧЧ:ММ)", default=defaults.get('end_time', '19:30'), required=True, max_length=5)
         self.num_games_input = discord.ui.TextInput(
-            label="Игр;Обязательно (напр. 2;да)",
-            default=f"{defaults.get('num_games', 0)};{'да' if defaults.get('mandatory', True) else 'нет'}",
+            label="Количество игр;Обязательно ли отмечаться (Пример: ''2;Да или Нет'')",
+            default=f"{defaults.get('num_games', 0)};{'Да' if defaults.get('mandatory', True) else 'Нет'}",
             required=False, max_length=10
         )
         self.add_item(self.name_input)
@@ -967,9 +967,9 @@ class WeeklyEventModal(discord.ui.Modal):
             if ';' in raw:
                 games_str, mandatory_str = raw.split(';', 1)
             else:
-                games_str, mandatory_str = raw, 'да'
+                games_str, mandatory_str = raw, 'Да'
             num_games = int(games_str.strip() or "0")
-            mandatory = mandatory_str.strip().lower() not in ('нет', 'no', 'false', '0')
+            mandatory = mandatory_str.strip().lower() not in ('Нет', 'No', 'false', '0')
 
             weekly_events = load_json(WEEKLY_EVENTS_FILE, {})
             entry = {
