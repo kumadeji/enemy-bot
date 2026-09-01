@@ -145,6 +145,9 @@ EXPECTED_INTRO_MAX_LEN = 700
 EVENTS_CHANNEL_ID = 1311705378140196926
 VACATION_CHANNEL_ID = 1284905224099598407
 ADMIN_CHANNEL_ID = 1536632416511332362
+ANKETA_CHANNEL_ID = 1366767440939454504
+ROLE_KOMBAT_ARMA_ID = 1252277370711441429
+
 VOICE_CHANNEL_ID = 1284893513921728582
 VOICE_CHANNEL_URL = "https://discord.com/channels/734494109032513699/1284893513921728582"
 
@@ -569,6 +572,83 @@ async def load_clan_members_from_firebase():
     except Exception as e:
         print(f"❌ Ошибка загрузки списка клана из Firebase: {e}")
         return CLAN_MEMBERS_CACHE
+
+QUEUE_CACHE = {'current': None, 'time': 0}
+QUEUE_CACHE_TTL = 300
+
+UID_CALLSIGN_CACHE = {}
+UID_CALLSIGN_CACHE_TIME = {}
+UID_CALLSIGN_CACHE_TTL = 3600
+
+
+def _firebase_read_queue_sync():
+    doc = fs_db.collection('queue').document('state').get()
+    if not doc.exists:
+        return []
+    return (doc.to_dict() or {}).get('current', []) or []
+
+
+def _firebase_read_profile_callsign_sync(uid):
+    doc = fs_db.collection('profiles').document(uid).get()
+    if not doc.exists:
+        return None
+    return ((doc.to_dict() or {}).get('callsign') or '').strip() or None
+
+
+async def get_uid_callsign(uid: str):
+    now = datetime.now().timestamp()
+    cached_time = UID_CALLSIGN_CACHE_TIME.get(uid, 0)
+    if uid in UID_CALLSIGN_CACHE and (now - cached_time) < UID_CALLSIGN_CACHE_TTL:
+        return UID_CALLSIGN_CACHE[uid]
+    if not fs_db:
+        return UID_CALLSIGN_CACHE.get(uid)
+    try:
+        loop = asyncio.get_event_loop()
+        callsign = await loop.run_in_executor(EXECUTOR, _firebase_read_profile_callsign_sync, uid)
+        UID_CALLSIGN_CACHE[uid] = callsign
+        UID_CALLSIGN_CACHE_TIME[uid] = now
+        return callsign
+    except Exception as e:
+        print(f"⚠️ Не удалось получить callsign для uid {uid}: {e}")
+        return UID_CALLSIGN_CACHE.get(uid)
+
+
+async def get_commander_queue():
+    now = datetime.now().timestamp()
+    if QUEUE_CACHE['current'] is not None and (now - QUEUE_CACHE['time']) < QUEUE_CACHE_TTL:
+        return QUEUE_CACHE['current']
+    if not fs_db:
+        return QUEUE_CACHE['current'] or []
+    try:
+        loop = asyncio.get_event_loop()
+        current = await loop.run_in_executor(EXECUTOR, _firebase_read_queue_sync)
+        QUEUE_CACHE['current'] = current
+        QUEUE_CACHE['time'] = now
+        return current
+    except Exception as e:
+        print(f"⚠️ Не удалось получить очередь на командование: {e}")
+        return QUEUE_CACHE['current'] or []
+
+
+async def get_expected_squad_commander(event: dict, current_date: datetime):
+    """Следующий в очереди на командование отделением (Firebase queue/state),
+    пропуская тех, кто в отпуске или явно отказался от участия в мероприятии."""
+    queue = await get_commander_queue()
+    declined = event.get('declined', {})
+    for entry in queue:
+        uid = entry.get('uid')
+        if not uid:
+            continue
+        callsign = await get_uid_callsign(uid)
+        if not callsign:
+            continue
+        nickname = f"{CLAN_TAG}{callsign}"
+        if nickname in declined:
+            continue
+        if is_on_vacation_dynamic(nickname, current_date):
+            continue
+        return nickname
+    return None
 
 async def find_discord_user(nickname: str, thread):
     try:
@@ -1036,20 +1116,27 @@ class EventEditSelectView(discord.ui.View):
     def __init__(self, event_id):
         super().__init__(timeout=120)
         self.event_id = event_id
-        events = load_json(EVENTS_FILE, {})
-        current_image = events.get(event_id, {}).get('image_key', 'none')
+        self.selected_image_key = "__keep__"  # по умолчанию — картинка не меняется
+
         options = [discord.SelectOption(label="⏮️ Оставить текущую", value="__keep__", emoji="✅", default=True)]
         options.append(discord.SelectOption(label="Без картинки", value="none", emoji="🚫"))
         for key, data in EVENT_IMAGES.items():
             options.append(discord.SelectOption(label=data['title'], value=key, emoji="🖼️"))
-        self.select = discord.ui.Select(placeholder="🖼️ Выберите картинку (по умолчанию — текущая)...", options=options)
+        self.select = discord.ui.Select(placeholder="🖼️ Выберите картинку (необязательно)...", options=options, row=0)
         self.select.callback = self.select_callback
         self.add_item(self.select)
 
+        next_btn = discord.ui.Button(label=es("➡️ Далее"), style=discord.ButtonStyle.primary, row=1)
+        next_btn.callback = self.next_callback
+        self.add_item(next_btn)
+
     async def select_callback(self, interaction):
-        selected_key = self.select.values[0]
+        self.selected_image_key = self.select.values[0]
+        await interaction.response.defer()
+
+    async def next_callback(self, interaction):
         self.stop()
-        await open_edit_modal(interaction, self.event_id, image_key=selected_key)
+        await open_edit_modal(interaction, self.event_id, image_key=self.selected_image_key)
 
 class WeeklyEventSetupView(discord.ui.View):
     """Шаг 1: выбор дня недели и картинки. Шаг 2 — модалка с текстами."""
@@ -1398,7 +1485,7 @@ def event_created_late(event: dict) -> bool:
 
 def desired_thread_name(event: dict) -> str:
     status = event.get('status', 'active')
-    title = event['title']
+    title = strip_status_prefix(event['title'])
     if status == 'cancelled':
         name = f"💬 Отменено. {title}"
     elif status == 'completed':
@@ -1654,20 +1741,446 @@ def build_event_view(event: dict) -> discord.ui.View:
     return view
 
 
-def build_full_event_view_for_registration() -> discord.ui.View:
-    """Полный набор кнопок ТОЛЬКО для регистрации persistent-колбэков при старте бота.
-    Реально отправляемые сообщения используют build_event_view() с нужным подмножеством —
-    discord.py резолвит клик по custom_id независимо от того, каким View было отправлено сообщение."""
-    view = discord.ui.View(timeout=None)
-    view.add_item(make_accept_button())
-    view.add_item(make_decline_button())
-    view.add_item(make_edit_button())
-    view.add_item(make_attendance_button())
-    view.add_item(make_cancel_button())
-    view.add_item(make_reactivate_button())
-    view.add_item(make_delete_button())
-    view.add_item(make_mods_button())
-    return view
+def register_persistent_event_views():
+    """Регистрирует персистентные callback'и кнопок мероприятий раздельными View
+    по каждому статусу — гарантированно без риска превысить лимит Discord
+    (максимум 5 виджетов в строке, максимум 5 строк на одно View).
+    custom_id совпадают между разными View (например, 'event_delete' есть
+    во всех трёх) — это не проблема: discord.py просто резолвит клик
+    по custom_id независимо от того, какое View изначально его зарегистрировало,
+    а сама функция-колбэк у одинаковых custom_id всегда одна и та же."""
+    for status in ('active', 'cancelled', 'completed'):
+        client.add_view(build_event_view({'status': status}))
+
+# ============== REALTIME-СЛЕЖЕНИЕ ЗА FIREBASE (анкеты / changeLog / уведомления) ==============
+
+FIRESTORE_WATCH_HANDLES = []
+MAIN_EVENT_LOOP = None
+FIRESTORE_WATCHERS_STARTED = False
+
+
+def _watcher_state_doc_ref():
+    return fs_db.collection('botData').document('_watcherState')
+
+
+def _get_watcher_state_sync():
+    snap = _watcher_state_doc_ref().get()
+    return (snap.to_dict() or {}) if snap.exists else {}
+
+
+def _set_watcher_state_field_sync(key, epoch_ts):
+    _watcher_state_doc_ref().set({key: epoch_ts}, merge=True)
+
+
+async def get_watcher_last_ts(key):
+    if not fs_db:
+        return None
+    loop = asyncio.get_event_loop()
+    try:
+        state = await loop.run_in_executor(EXECUTOR, _get_watcher_state_sync)
+        return state.get(key)
+    except Exception as e:
+        print(f"⚠️ Не удалось прочитать состояние watcher'а '{key}': {e}")
+        return None
+
+
+async def set_watcher_last_ts(key, dt: datetime):
+    if not fs_db:
+        return
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(EXECUTOR, _set_watcher_state_field_sync, key, dt.timestamp())
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить состояние watcher'а '{key}': {e}")
+
+
+def _extract_timestamp(value):
+    """Приводит значение поля createdAt (Firestore Timestamp) к datetime с tzinfo."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else pytz.UTC.localize(value)
+    return datetime.now(pytz.UTC)
+
+
+def _query_invited_by_sync(uid):
+    docs = fs_db.collection('profiles').where('referredByUid', '==', uid).stream()
+    result = []
+    for d in docs:
+        dd = d.to_dict() or {}
+        cs = (dd.get('callsign') or '').strip()
+        if cs:
+            result.append(cs)
+    return result
+
+
+async def get_invited_by_uid(uid):
+    if not fs_db:
+        return []
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(EXECUTOR, _query_invited_by_sync, uid)
+    except Exception as e:
+        print(f"⚠️ Ошибка запроса 'кого пригласил' для {uid}: {e}")
+        return []
+
+
+# --- Форматирование сообщений ---
+
+async def build_anketa_message(uid, data):
+    callsign = data.get('callsign', '?')
+    lines = []
+    lines.append(f"Электронная почта: {data.get('email') or '—'}")
+    lines.append(f"Имя и фамилия: {data.get('fullName') or '—'}")
+    lines.append(f"Возраст: {data.get('age', '—')}")
+    lines.append(f"Discord ID: {data.get('discordId') or '—'}")
+    lines.append(f"Steam ID: {data.get('steamId') or '—'}")
+    steam_url = data.get('steamProfileUrl') or ''
+    lines.append(f"Ссылка на Steam: <{steam_url}>" if steam_url else "Ссылка на Steam: —")
+    lines.append(f"Arma ID: {data.get('armaId') or '—'}")
+    lines.append(f"Часовой пояс: {data.get('timezone') or '—'}")
+    lines.append(f"Дата рождения: {data.get('birthDate') or '—'}")
+
+    extra = data.get('extraContacts', {}) or {}
+    if extra.get('phone'):
+        lines.append(f"Телефон: {extra['phone']}")
+    if data.get('telegramUrl'):
+        lines.append(f"Ссылка на Telegram: <{data['telegramUrl']}>")
+    if data.get('vkUrl'):
+        lines.append(f"Ссылка на ВКонтакте: <{data['vkUrl']}>")
+    if extra.get('other'):
+        lines.append(f"Другой контакт: {extra['other']}")
+
+    referrer = data.get('referrerCallsign') or data.get('referredByText') or ''
+    lines.append(f"Кем приглашён: {referrer if referrer else '—'}")
+
+    invited = await get_invited_by_uid(uid)
+    lines.append(f"Кого пригласил: {', '.join(invited) if invited else '—'}")
+
+    lines.append(f"Доступность для игр: {data.get('availability') or '—'}")
+    lines.append(f"Почему хочет вступить? {data.get('whyJoin') or '—'}")
+
+    how_found = data.get('howFound') or ''
+    if how_found:
+        lines.append(f"Откуда узнал? {how_found}")
+    elif referrer:
+        lines.append("Откуда узнал? Приглашён бойцом (см. выше)")
+    else:
+        lines.append("Откуда узнал? —")
+
+    games = data.get('gamesInterested', []) or []
+    lines.append(f"Игры, в которых заинтересован: {', '.join(games) if games else '—'}")
+
+    exp_by_game = data.get('experienceByGame', {}) or {}
+    hours_by_game = data.get('hoursByGame', {}) or {}
+    for game in games:
+        hours = hours_by_game.get(game)
+        hours_str = f"{hours} ч." if hours is not None else "? ч."
+        exp_text = exp_by_game.get(game, '')
+        lines.append(f"Опыт в {game}: {hours_str} — {exp_text}" if exp_text else f"Опыт в {game}: {hours_str}")
+
+    body = "\n".join(f"> {line}" for line in lines)
+    header = f"**🔔 <@&{ROLE_KOMBAT_ARMA_ID}> Поступила новая анкета от бойца {callsign}:**"
+    return header + "\n\n" + body
+
+
+async def build_changelog_message(uid, data):
+    callsign = data.get('callsign', '?')
+    changed_by = data.get('changedBy', '')
+    changes = data.get('changes', []) or []
+    lines = []
+    for ch in changes:
+        field = ch.get('field', '?')
+        old_val = ch.get('oldValue', '')
+        new_val = ch.get('newValue', '')
+        old_display = old_val if old_val not in (None, '') else '—'
+        new_display = new_val if new_val not in (None, '') else '—'
+        lines.append(f"{field}: {old_display} → {new_display}")
+    if not lines:
+        lines.append("Изменения не содержат деталей.")
+    body = "\n".join(f"> {line}" for line in lines)
+    who = "администрацией" if changed_by == 'admin' else ("самим бойцом" if changed_by else "неизвестно кем")
+    header = f"**📝 Боец {callsign} изменил данные в своём профиле ({who}):**"
+    return header + "\n\n" + body
+
+
+async def build_notification_message(uid, data):
+    message_text = data.get('message') or '—'
+    callsign = await get_uid_callsign(uid)
+    nickname = f"{CLAN_TAG}{callsign}" if callsign else (uid or '?')
+    header = f"**🔔 Новое уведомление для бойца {nickname}:**"
+    return header + "\n\n" + f"> {message_text}"
+
+
+# --- Обработчики новых документов ---
+
+async def handle_new_profile_watch(doc_id, data):
+    try:
+        text = await build_anketa_message(doc_id, data)
+        channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
+        await send_chunked(channel, text)
+    except Exception as e:
+        print(f"❌ Ошибка публикации новой анкеты ({doc_id}): {e}")
+    finally:
+        await set_watcher_last_ts('profiles', _extract_timestamp(data.get('createdAt')))
+
+
+async def handle_new_changelog_watch(doc_id, data):
+    try:
+        text = await build_changelog_message(doc_id, data)
+        channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
+        await send_chunked(channel, text)
+    except Exception as e:
+        print(f"❌ Ошибка публикации записи changeLog ({doc_id}): {e}")
+    finally:
+        await set_watcher_last_ts('changeLog', _extract_timestamp(data.get('createdAt')))
+
+
+async def handle_new_notification_watch(doc_id, data):
+    try:
+        text = await build_notification_message(data.get('uid', ''), data)
+        channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
+        await send_chunked(channel, text)
+    except Exception as e:
+        print(f"❌ Ошибка публикации уведомления ({doc_id}): {e}")
+    finally:
+        await set_watcher_last_ts('notifications', _extract_timestamp(data.get('createdAt')))
+
+
+def _make_on_added_callback(handler_coro):
+    """Обёртка над Firestore watch-колбэком (выполняется в отдельном grpc-потоке).
+    Передаёт обработку в основной event loop бота через run_coroutine_threadsafe."""
+    def _callback(col_snapshot, changes, read_time):
+        for change in changes:
+            if change.type.name != 'ADDED':
+                continue
+            doc = change.document
+            data = doc.to_dict() or {}
+            if MAIN_EVENT_LOOP:
+                try:
+                    asyncio.run_coroutine_threadsafe(handler_coro(doc.id, data), MAIN_EVENT_LOOP)
+                except Exception as e:
+                    print(f"❌ Ошибка планирования обработки документа {doc.id}: {e}")
+    return _callback
+
+
+async def setup_firestore_watchers():
+    """Запускает realtime-слежение (push, без задержки) за новыми анкетами,
+    записями changeLog и уведомлениями. При первом включении фичи не постит
+    историю — точка отсчёта ставится на текущий момент."""
+    global FIRESTORE_WATCHERS_STARTED, MAIN_EVENT_LOOP
+    if FIRESTORE_WATCHERS_STARTED:
+        return
+    FIRESTORE_WATCHERS_STARTED = True
+
+    if not fs_db:
+        print("⚠️ Firebase не инициализирован — realtime-уведомления не будут работать")
+        return
+
+    MAIN_EVENT_LOOP = asyncio.get_running_loop()
+
+    watch_configs = [
+        ('profiles', handle_new_profile_watch),
+        ('changeLog', handle_new_changelog_watch),
+        ('notifications', handle_new_notification_watch),
+    ]
+
+    for collection_name, handler in watch_configs:
+        try:
+            last_ts_epoch = await get_watcher_last_ts(collection_name)
+            if last_ts_epoch is None:
+                threshold = datetime.now(pytz.UTC)
+                await set_watcher_last_ts(collection_name, threshold)
+            else:
+                threshold = datetime.fromtimestamp(last_ts_epoch, tz=pytz.UTC)
+
+            query = fs_db.collection(collection_name).where('createdAt', '>', threshold)
+            watch = query.on_snapshot(_make_on_added_callback(handler))
+            FIRESTORE_WATCH_HANDLES.append(watch)
+            print(f"✅ Запущено realtime-слежение за коллекцией '{collection_name}'")
+        except Exception as e:
+            print(f"❌ Не удалось запустить слежение за '{collection_name}': {e}")
+
+# ============== УЧЁТ ОТЫГРЫШЕЙ (GAMESTATS) ==============
+
+GAMESTATS_GAME_NAME = "Arma Reforger"
+
+CALLSIGN_UID_CACHE = {}
+CALLSIGN_UID_CACHE_TIME = {}
+CALLSIGN_UID_CACHE_TTL = 3600
+
+
+def _normalize_callsign_for_lookup(nickname_with_tag: str) -> str:
+    name = nickname_with_tag
+    if name.startswith(CLAN_TAG):
+        name = name[len(CLAN_TAG):]
+    return name.strip().lower()
+
+
+def _firebase_lookup_uid_by_callsign_sync(callsign_lower):
+    doc = fs_db.collection('callsigns').document(callsign_lower).get()
+    if doc.exists:
+        return (doc.to_dict() or {}).get('uid')
+    return None
+
+
+async def get_uid_by_nickname(nickname: str):
+    key = _normalize_callsign_for_lookup(nickname)
+    now = datetime.now().timestamp()
+    cached_time = CALLSIGN_UID_CACHE_TIME.get(key, 0)
+    if key in CALLSIGN_UID_CACHE and (now - cached_time) < CALLSIGN_UID_CACHE_TTL:
+        return CALLSIGN_UID_CACHE[key]
+    if not fs_db:
+        return CALLSIGN_UID_CACHE.get(key)
+    try:
+        loop = asyncio.get_event_loop()
+        uid = await loop.run_in_executor(EXECUTOR, _firebase_lookup_uid_by_callsign_sync, key)
+        CALLSIGN_UID_CACHE[key] = uid
+        CALLSIGN_UID_CACHE_TIME[key] = now
+        return uid
+    except Exception as e:
+        print(f"⚠️ Не удалось найти uid для позывного '{nickname}': {e}")
+        return CALLSIGN_UID_CACHE.get(key)
+
+
+def _apply_gamestats_increment_sync(uid, ko_delta, ks_delta, soldier_delta):
+    doc_ref = fs_db.collection('profiles').document(uid)
+    updates = {}
+    if ko_delta:
+        updates[f'gameStats.{GAMESTATS_GAME_NAME}.koCount'] = firestore.Increment(ko_delta)
+    if ks_delta:
+        updates[f'gameStats.{GAMESTATS_GAME_NAME}.ksCount'] = firestore.Increment(ks_delta)
+    if soldier_delta:
+        updates[f'gameStats.{GAMESTATS_GAME_NAME}.playedAsSoldierCount'] = firestore.Increment(soldier_delta)
+    if not updates:
+        return
+    try:
+        doc_ref.update(updates)
+    except Exception:
+        # Структуры gameStats/{game} у профиля ещё нет — создаём с нуля
+        doc_ref.set({
+            'gameStats': {
+                GAMESTATS_GAME_NAME: {
+                    'koCount': max(ko_delta, 0),
+                    'ksCount': max(ks_delta, 0),
+                    'playedAsSoldierCount': max(soldier_delta, 0),
+                }
+            }
+        }, merge=True)
+
+
+def _create_notification_sync(uid, message):
+    fs_db.collection('notifications').add({
+        'uid': uid,
+        'message': message,
+        'read': False,
+        'createdAt': firestore.SERVER_TIMESTAMP,
+    })
+
+
+async def create_gamestats_notification(uid, message):
+    if not fs_db or not message:
+        return
+    loop = asyncio.get_event_loop()
+    try:
+        await loop.run_in_executor(EXECUTOR, _create_notification_sync, uid, message)
+    except Exception as e:
+        print(f"⚠️ Не удалось создать уведомление для {uid}: {e}")
+
+
+def build_gamestats_notification_message(ko_delta, ks_delta, soldier_delta):
+    parts = []
+    if soldier_delta > 0:
+        parts.append(("бойца", soldier_delta))
+    if ko_delta > 0:
+        parts.append(("командира отделения", ko_delta))
+    if ks_delta > 0:
+        parts.append(("командира стороны", ks_delta))
+    if not parts:
+        return None
+    if len(parts) == 1:
+        label, count = parts[0]
+        return f"{GAMESTATS_GAME_NAME}: зачтён отыгрыш за {label} (+{count})."
+    joined = ", ".join(f"за {label} (+{count})" for label, count in parts)
+    return f"{GAMESTATS_GAME_NAME}: зачтены отыгрыши: {joined}."
+
+
+def _extract_game_triples_from_wizard(wizard):
+    """[(players, commander, side_commander), ...] — один элемент на игру,
+    либо один элемент при явке 'в целом' (num_games == 0)."""
+    if wizard.num_games == 0:
+        return [(wizard.data.get('overall', []), wizard.commanders.get('overall'), wizard.side_commanders.get('overall'))]
+    return [
+        (wizard.data.get(i, []), wizard.commanders.get(i), wizard.side_commanders.get(i))
+        for i in range(wizard.num_games)
+    ]
+
+
+def _extract_game_triples_from_record(record):
+    """То же самое, но из уже сохранённой в Firebase записи явки
+    (нужно для вычисления 'старых' отыгрышей при повторной подаче явки)."""
+    if not record:
+        return []
+    if 'overall_players' in record:
+        return [(record.get('overall_players', []), record.get('overall_commander'), record.get('overall_side_commander'))]
+    games = record.get('games', {}) or {}
+    triples = []
+    for key in sorted(games.keys(), key=lambda k: int(k) if k.isdigit() else 0):
+        g = games[key]
+        triples.append((g.get('players', []), g.get('commander'), g.get('side_commander')))
+    return triples
+
+
+def _tally_from_triples(triples):
+    per_player = {}
+
+    def bump(nickname, field):
+        per_player.setdefault(nickname, {'ko': 0, 'ks': 0, 'soldier': 0})[field] += 1
+
+    for players, commander, side_commander in triples:
+        for player in (players or []):
+            is_ko = (player == commander)
+            is_ks = (player == side_commander)
+            if is_ko:
+                bump(player, 'ko')
+            if is_ks:
+                bump(player, 'ks')
+            if not is_ko and not is_ks:
+                bump(player, 'soldier')
+    return per_player
+
+
+async def apply_attendance_to_gamestats(wizard, old_record=None):
+    """Считает НЕТТО-изменение отыгрышей (новая явка минус старая, если это
+    повторная подача) и инкрементит gameStats в Firebase + создаёт уведомление
+    игроку при положительном приросте (уведомление автоматически попадёт
+    в Discord-канал через realtime-watcher из п.7)."""
+    new_tally = _tally_from_triples(_extract_game_triples_from_wizard(wizard))
+    old_tally = _tally_from_triples(_extract_game_triples_from_record(old_record)) if old_record else {}
+
+    for nickname in set(new_tally) | set(old_tally):
+        new_c = new_tally.get(nickname, {'ko': 0, 'ks': 0, 'soldier': 0})
+        old_c = old_tally.get(nickname, {'ko': 0, 'ks': 0, 'soldier': 0})
+        ko_delta = new_c['ko'] - old_c['ko']
+        ks_delta = new_c['ks'] - old_c['ks']
+        soldier_delta = new_c['soldier'] - old_c['soldier']
+
+        if ko_delta == 0 and ks_delta == 0 and soldier_delta == 0:
+            continue
+
+        uid = await get_uid_by_nickname(nickname)
+        if not uid:
+            print(f"⚠️ Не удалось найти uid для '{nickname}' — отыгрыши не зачтены в Firebase")
+            continue
+
+        loop = asyncio.get_event_loop()
+        try:
+            await loop.run_in_executor(EXECUTOR, _apply_gamestats_increment_sync, uid, ko_delta, ks_delta, soldier_delta)
+        except Exception as e:
+            print(f"❌ Ошибка обновления gameStats для {nickname} ({uid}): {e}")
+            continue
+
+        message = build_gamestats_notification_message(max(ko_delta, 0), max(ks_delta, 0), max(soldier_delta, 0))
+        if message:
+            await create_gamestats_notification(uid, message)
 
 
 # ============== МАСТЕР УЧЁТА ЯВКИ (с командирами отделений) ==============
@@ -1886,9 +2399,9 @@ async def finalize_attendance(interaction, wizard):
         return
     
     attendance = load_json(ATTENDANCE_FILE, {})
-    
-    if wizard.event_id in attendance:
-        old_record = attendance[wizard.event_id]
+    old_record = attendance.get(wizard.event_id)
+
+    if old_record:
         if old_record.get('attendance_message_id') and old_record.get('thread_id'):
             try:
                 old_thread = await client.fetch_channel(old_record['thread_id'])
@@ -1970,6 +2483,8 @@ async def finalize_attendance(interaction, wizard):
     
     attendance[wizard.event_id] = record
     save_json(ATTENDANCE_FILE, attendance)
+    
+    await apply_attendance_to_gamestats(wizard, old_record=old_record)
     
     await interaction.followup.send(es("✅ Отчёт о явке опубликован в ветке мероприятия!"), ephemeral=True)
     print(f"✅ Отчёт о явке для '{wizard.event_title}' опубликован")
@@ -2152,6 +2667,7 @@ async def close_vacation(interaction, nickname, early=False, by_admin=False):
     member = await find_member_by_nickname(nickname)
     if member:
         await update_vacation_role(member, False)
+    await send_vacation_return_message(nickname)
     try:
         channel = await client.fetch_channel(vacation['channel_id'])
         message = await channel.fetch_message(vacation['message_id'])
@@ -2229,6 +2745,7 @@ async def check_expired_vacations():
                     except Exception:
                         pass
                 print(f"✅ Отпуск {nickname} автоматически закрыт (истёк срок)")
+                await send_vacation_return_message(nickname)
         except Exception:
             pass
     if changed:
@@ -2275,6 +2792,29 @@ async def check_vacation_ending_soon():
             continue
     if changed:
         save_json(VACATIONS_FILE, vacations)
+
+
+async def send_vacation_return_message(nickname):
+    """Отправляет бойцу сообщение о том, что его отпуск завершён — с возвращением в ряды."""
+    vacations = load_json(VACATIONS_FILE, {})
+    data = vacations.get(nickname, {})
+    member = await find_member_by_nickname(nickname)
+    text = es("🏖️ **Напоминание об отпуске!**\n\n") + "Ваш отпуск завершён. Рады видеть вас снова в строю!"
+    sent = False
+    if member:
+        try:
+            await member.send(text)
+            sent = True
+        except Exception:
+            pass
+    if not sent and data.get('thread_id'):
+        try:
+            thread = await client.fetch_channel(data['thread_id'])
+            mention = member.mention if member else f"**{nickname}**"
+            await thread.send(f"{mention}\n\n" + text)
+        except Exception:
+            pass
+
 
 # ============== ФУНКЦИИ МЕРОПРИЯТИЙ ==============
 
@@ -2435,6 +2975,23 @@ async def delete_event(interaction, event_id):
     save_json(EVENTS_FILE, events)
     await interaction.response.send_message(es("🗑️ Мероприятие полностью удалено!"), ephemeral=True)
 
+_STATUS_TITLE_PREFIXES = ("Завершено. ", "Отменено. ")
+
+
+def strip_status_prefix(title: str) -> str:
+    """Убирает случайно задвоившийся префикс статуса, если он уже был
+    ранее вручную вписан прямо в название мероприятия."""
+    if not title:
+        return title
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _STATUS_TITLE_PREFIXES:
+            if title.startswith(prefix):
+                title = title[len(prefix):]
+                changed = True
+    return title
+
 async def build_event_embed(event_id: str) -> discord.Embed:
     events = load_json(EVENTS_FILE, {})
     event = events[event_id]
@@ -2454,7 +3011,7 @@ async def build_event_embed(event_id: str) -> discord.Embed:
         title_prefix = 'Завершено. '
         embed_color = discord.Color.greyple().value
 
-    embed = discord.Embed(title=title_prefix + event['title'], description=event['description'], color=embed_color)
+    embed = discord.Embed(title=title_prefix + strip_status_prefix(event['title']), description=event['description'], color=embed_color)
 
     # === ЧИСЛО МАТЧЕЙ (строка сверху, п.7) ===
     num_games = event.get('num_games', 0)
@@ -2479,6 +3036,15 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     # Строка "Начнётся" убирается при отмене/завершении (п.1, п.2)
     if status == 'active' and current_date <= event_end:
         time_value += f"\nНачнется: <t:{start_ts}:R>"
+
+    # === ОЖИДАЕМЫЙ КОМАНДИР ОТДЕЛЕНИЯ (очередь Firebase) (п.4) ===
+    if status == 'active':
+        expected_commander = await get_expected_squad_commander(event, current_date)
+        embed.add_field(
+            name=es("🪖 Ожидаемый командир отделения"),
+            value=expected_commander if expected_commander else "Не определён",
+            inline=False
+        )
 
     embed.add_field(name=es("⏰ Время"), value=time_value, inline=False)
 
@@ -2558,7 +3124,7 @@ async def show_event_list(interaction):
     text = es("📋 **Активные мероприятия:**\n\n")
     for event_id, event in events.items():
         start = datetime.fromtimestamp(event['start_time'], MSK)
-        text += f"**{event['title']}**\nID: `{event_id}`\n"
+        text += f"**{strip_status_prefix(event['title'])}**\nID: `{event_id}`\n"
         text += f"Дата: {start.strftime('%d.%m.%Y %H:%M')}\n"
         num_games = event.get('num_games', 0)
         if num_games and num_games > 0:
@@ -2710,6 +3276,9 @@ async def update_all_templates():
         if 'created_at' not in event:
             # считаем, что старые мероприятия создавались заранее (не «поздно»)
             event['created_at'] = event.get('start_time', int(datetime.now(MSK).timestamp())) - 7 * 24 * 3600
+        cleaned_title = strip_status_prefix(event.get('title', ''))
+        if cleaned_title != event.get('title', ''):
+            event['title'] = cleaned_title
         title = event.get('title', '').lower()
 
         original_image = event.get('image_key', 'none')
@@ -3257,8 +3826,10 @@ async def on_ready():
     client.add_view(VacationRequestView())
     client.add_view(VacationApprovalView())
     client.add_view(VacationMessageView())
-    client.add_view(build_full_event_view_for_registration())
-    
+    register_persistent_event_views()
+
+    await setup_firestore_watchers()
+
     try:
         admin_channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
         try:
