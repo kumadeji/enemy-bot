@@ -212,14 +212,7 @@ def pluralize_days(num: int) -> str:
 
 
 def format_vacation_period(start_iso: str, end_iso: str) -> str:
-    """Форматирует период отпуска в виде меток времени Discord.
-    
-    Первая строка: Даты: <t:START:d> - <t:END:d> (N день/дня/дней)
-    Вторая строка (только когда актуален):
-    - До начала: "Начнется:" + <t:START:R>
-    - Во время: "Закончится:" + <t:END:R>
-    - После окончания: исчезает
-    """
+    """Форматирует период отпуска в виде меток времени Discord."""
     start = datetime.fromisoformat(start_iso)
     end = datetime.fromisoformat(end_iso)
     current_time = datetime.now(MSK)
@@ -254,6 +247,9 @@ TRIGGER_CHANNEL_ARMY = None
 TRIGGER_CHANNEL_PUBLIC = None
 # Блокировки по member.id для защиты от двойного создания временных комнат
 VOICE_ROOM_CREATION_LOCKS = {}
+
+# Время последней проверки таблицы (защита от двойного запуска scheduler'ом)
+LAST_SPREADSHEET_CHECK_TIME = None
 
 VACATION_RULES = es("""
 
@@ -535,13 +531,37 @@ def build_user_message(discord_user, issues: list) -> str:
 
 
 async def check_spreadsheet():
+    """Проверка таблицы с двойной защитой от дублирования:
+    1. check_lock (asyncio.Lock) — защита от параллельного запуска
+    2. LAST_SPREADSHEET_CHECK_TIME — защита от повторного запуска scheduler'ом
+    """
+    global LAST_SPREADSHEET_CHECK_TIME
+    
     if check_lock.locked():
         return
+    
+    # Предварительная проверка: если с последней проверки прошло меньше 5 минут — пропускаем
+    current_time = datetime.now(MSK)
+    if LAST_SPREADSHEET_CHECK_TIME:
+        elapsed = (current_time - LAST_SPREADSHEET_CHECK_TIME).total_seconds()
+        if elapsed < 300:  # 5 минут
+            print(f"⏭️ Пропуск проверки таблицы (прошло {elapsed:.0f} сек с последней)")
+            return
+    
     async with check_lock:
+        # Повторная проверка внутри lock (защита от race condition)
+        current_time = datetime.now(MSK)
+        if LAST_SPREADSHEET_CHECK_TIME:
+            elapsed = (current_time - LAST_SPREADSHEET_CHECK_TIME).total_seconds()
+            if elapsed < 300:
+                return
+        
+        # Запоминаем время начала проверки
+        LAST_SPREADSHEET_CHECK_TIME = current_time
+        
         try:
             if not gc:
                 return
-            # Выполняем синхронный gc.open_by_url в отдельном потоке
             loop = asyncio.get_event_loop()
             spreadsheet = await loop.run_in_executor(EXECUTOR, gc.open_by_url, SPREADSHEET_URL)
             sheet = spreadsheet.worksheet(SHEET_NAME)
@@ -550,7 +570,6 @@ async def check_spreadsheet():
                 return
             headers = [cell['value'] for cell in data_with_colors[0]]
             rows = data_with_colors[1:]
-            current_time = datetime.now(MSK)
             thread = await client.fetch_channel(THREAD_ID)
             user_issues = {}
             users_not_found = []
@@ -734,7 +753,6 @@ class EventCreateModal(discord.ui.Modal):
         self.add_item(self.end_time)
         self.add_item(self.num_games)
     async def on_submit(self, interaction):
-        # СРАЗУ отвечаем Discord, что начали обработку (иначе будет Unknown interaction)
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             start = MSK.localize(datetime.strptime(self.start_time.value, "%d.%m.%Y %H:%M"))
@@ -765,7 +783,6 @@ class EventEditModal(discord.ui.Modal):
         self.add_item(self.end_time)
         self.add_item(self.num_games)
     async def on_submit(self, interaction):
-        # СРАЗУ отвечаем Discord, что начали обработку
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             start = MSK.localize(datetime.strptime(self.start_time.value, "%d.%m.%Y %H:%M"))
@@ -868,8 +885,10 @@ class AdminMainMenuView(discord.ui.View):
         if check_lock.locked():
             await interaction.response.send_message(es("⚠️ Проверка уже выполняется!"), ephemeral=True)
             return
-        await interaction.response.send_message(es("🔍 Запускаю проверку таблицы..."), ephemeral=True)
+        # defer СРАЗУ, чтобы Discord не отклонил interaction через 3 секунды
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await check_spreadsheet()
+        await interaction.followup.send(es("✅ Проверка таблицы завершена!"), ephemeral=True)
     
     @discord.ui.button(label=es("🔍 Извлечь код сообщения"), style=discord.ButtonStyle.secondary, custom_id="admin_extract_message", row=3)
     async def extract_message_button(self, interaction, button):
@@ -883,14 +902,12 @@ class AdminMainMenuView(discord.ui.View):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
-        await interaction.response.send_message(
-            es("🔄 Начинаю обновление шаблонов всех сообщений...\n"
-               "Это может занять несколько секунд."),
-            ephemeral=True
-        )
+        # defer СРАЗУ — обновление шаблонов занимает много времени
+        await interaction.response.defer(ephemeral=True, thinking=True)
         ev_updated, ev_errors, vac_updated, vac_errors = await update_all_templates()
         await interaction.followup.send(
-            es(f"📅 Мероприятий обновлено: **{ev_updated}** (ошибок: {ev_errors})\n"
+            es(f"🔄 **Обновление завершено!**\n\n"
+               f"📅 Мероприятий обновлено: **{ev_updated}** (ошибок: {ev_errors})\n"
                f"🏖️ Отпусков обновлено: **{vac_updated}** (ошибок: {vac_errors})"),
             ephemeral=True
         )
@@ -1008,6 +1025,8 @@ class EventView(discord.ui.View):
         if not event_id:
             await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
             return
+        # defer СРАЗУ — start_attendance_wizard загружает список клана (может быть долго)
+        await interaction.response.defer(ephemeral=True, thinking=True)
         await start_attendance_wizard(interaction, event_id)
     @discord.ui.button(label=es("❌ Отменить мероприятие"), style=discord.ButtonStyle.danger, custom_id="event_cancel", row=2)
     async def cancel_button(self, interaction, button):
@@ -1176,23 +1195,36 @@ class AttendanceStepView(discord.ui.View):
 
 
 async def start_attendance_wizard(interaction, event_id):
+    """Запускает мастер учёта явки. Корректно работает и если interaction уже defer'нут,
+    и если ещё нет."""
     events = load_json(EVENTS_FILE, {})
     event = events.get(event_id)
     if not event:
-        await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        if interaction.response.is_done():
+            await interaction.followup.send(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        else:
+            await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
     num_games = event.get('num_games', 0)
     wizard = AttendanceWizard(event_id, num_games, event.get('title', ''))
     clan_members = await load_clan_members_from_sheet()
     if not clan_members:
-        await interaction.response.send_message(es("❌ Список клана пуст!"), ephemeral=True)
+        if interaction.response.is_done():
+            await interaction.followup.send(es("❌ Список клана пуст!"), ephemeral=True)
+        else:
+            await interaction.response.send_message(es("❌ Список клана пуст!"), ephemeral=True)
         return
     view = AttendanceStepView(wizard, 0, clan_members)
     if num_games == 0:
         title_text = es(f"👥 **{event.get('title', '')}**\n\n") + es("Выберите бойцов, явившихся на мероприятие:")
     else:
         title_text = es(f"👥 **{event.get('title', '')}**\n\n") + es(f"**Игра 1** из {num_games}\nВыберите явившихся:")
-    await interaction.response.send_message(title_text, view=view, ephemeral=True)
+    
+    # Отправляем через followup если interaction уже defer'нут, иначе через response
+    if interaction.response.is_done():
+        await interaction.followup.send(title_text, view=view, ephemeral=True)
+    else:
+        await interaction.response.send_message(title_text, view=view, ephemeral=True)
 
 
 async def show_commander_step(interaction, wizard):
@@ -1590,29 +1622,46 @@ async def check_expired_vacations():
 # ============== ФУНКЦИИ МЕРОПРИЯТИЙ ==============
 
 async def handle_event_response(interaction, event_id, response_type):
+    """Обработка ответа на мероприятие с защитой от Unknown interaction и Already acknowledged."""
     events = load_json(EVENTS_FILE, {})
+    
     if event_id not in events:
-        await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
+    
     event = events[event_id]
     nickname = interaction.user.display_name
     current_date = datetime.now(MSK)
     event_end = datetime.fromtimestamp(event['end_time'], MSK)
+    
     if current_date > event_end:
-        await interaction.response.send_message(es("⛔ Мероприятие уже завершено. Отметки больше не принимаются!"), ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(es("⛔ Мероприятие уже завершено. Отметки больше не принимаются!"), ephemeral=True)
         return
+    
     if is_on_vacation_dynamic(nickname, current_date):
-        await interaction.response.send_message(es("🏖️ Вы сейчас в отпуске."), ephemeral=True)
+        if not interaction.response.is_done():
+            await interaction.response.send_message(es("🏖️ Вы сейчас в отпуске."), ephemeral=True)
         return
+    
+    # defer СРАЗУ если ещё не отвечено, чтобы Discord не отклонил interaction через 3 секунды
+    if not interaction.response.is_done():
+        await interaction.response.defer(ephemeral=True)
+    
+    # Обновляем данные мероприятия
     if response_type == "accept":
         event['accepted'][nickname] = True
         event['declined'].pop(nickname, None)
-        await interaction.response.send_message(es("✅ Вы записаны на мероприятие!"), ephemeral=True)
+        response_text = es("✅ Вы записаны на мероприятие!")
     else:
         event['declined'][nickname] = True
         event['accepted'].pop(nickname, None)
-        await interaction.response.send_message(es("❌ Вы отказались от участия!"), ephemeral=True)
+        response_text = es("❌ Вы отказались от участия!")
+    
     save_json(EVENTS_FILE, events)
+    
+    # Обновляем embed сообщение
     try:
         channel = await client.fetch_channel(event['channel_id'])
         message = await channel.fetch_message(event['message_id'])
@@ -1624,6 +1673,9 @@ async def handle_event_response(interaction, event_id, response_type):
             await message.edit(embed=embed, attachments=[])
     except Exception:
         pass
+    
+    # Отправляем финальный ответ через followup (т.к. interaction уже defer'нут)
+    await interaction.followup.send(response_text, ephemeral=True)
 
 
 async def open_edit_modal(interaction, event_id, image_key=None):
@@ -1709,15 +1761,11 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
     embed = discord.Embed(title=event['title'], description=event['description'], color=event.get('color', 15844367))
     
-    # === ВРЕМЯ ===
     start_ts = int(event['start_time'])
     end_ts = int(event['end_time'])
     event_end = datetime.fromtimestamp(end_ts, MSK)
     
-    # Первая строка с префиксом "Дата:" (остаётся всегда)
     time_value = f"Дата: <t:{start_ts}:F> - <t:{end_ts}:t>"
-    
-    # Вторая строка с префиксом "Начнется:" (исчезает после завершения)
     if current_date <= event_end:
         time_value += f"\nНачнется: <t:{start_ts}:R>"
     
@@ -1973,14 +2021,12 @@ async def update_all_templates():
             by_admin = data.get('by_admin', False)
             created_by = data.get('created_by', 'Сам боец' if not by_admin else 'Неизвестно')
             
-            # === ОБНОВЛЯЕМ ПОЛЕ "📅 Период" с метками времени Discord ===
             for i, field in enumerate(embed.fields):
                 if field.name == es("📅 Период"):
                     new_period = format_vacation_period(data['start'], data['end'])
                     embed.set_field_at(i, name=es("📅 Период"), value=new_period, inline=False)
                     break
             
-            # === ОБНОВЛЯЕМ ПОЛЕ "Оформил/Запросил" в зависимости от by_admin ===
             if by_admin:
                 requester_field_name = es("👤 Оформил")
                 requester_field_value = f"Комбат или заместитель: {created_by}"
@@ -1998,7 +2044,6 @@ async def update_all_templates():
             if not field_found:
                 embed.add_field(name=requester_field_name, value=requester_field_value, inline=False)
             
-            # === ОБНОВЛЯЕМ TITLE, DESCRIPTION, COLOR В ЗАВИСИМОСТИ ОТ СТАТУСА ===
             if status == 'pending':
                 embed.title = es("🏖️ Отпуск требует утверждения")
                 embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** запросил(а) отпуск"
@@ -2030,7 +2075,7 @@ async def update_all_templates():
                     embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** взял(а) отпуск"
                     embed.color = discord.Color.red()
                     status_text = es("❌ Завершен досрочно")
-                else:  # ended_scheduled
+                else:
                     embed.title = es("🏖️ Отпуск утверждён")
                     embed.description = f"Отпуск для **{nickname}**" if by_admin else f"**{nickname}** взял(а) отпуск"
                     embed.color = discord.Color.greyple()
@@ -2044,7 +2089,7 @@ async def update_all_templates():
                 await message.edit(embed=embed, view=None)
             
             vac_updated += 1
-            await asyncio.sleep(4)  # Защита от rate limit
+            await asyncio.sleep(4)
         except discord.NotFound:
             vac_errors += 1
         except Exception as e:
@@ -2303,23 +2348,18 @@ async def on_voice_state_update(member, before, after):
     if member.bot:
         return
     
-    # === СЛУЧАЙ 1: Пользователь подключился к триггер-каналу ===
     if after.channel and after.channel.id in [TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC]:
-        # Получаем или создаём lock для этого пользователя (защита от race condition)
         if member.id not in VOICE_ROOM_CREATION_LOCKS:
             VOICE_ROOM_CREATION_LOCKS[member.id] = asyncio.Lock()
         
         async with VOICE_ROOM_CREATION_LOCKS[member.id]:
-            # Проверяем, не создана ли уже комната для этого пользователя
             for room_id, room_data in VOICE_ROOMS.items():
                 if room_data['owner_id'] == member.id:
                     return
             
-            # Создаём временную комнату
             await create_temp_voice_room(member, after.channel)
         return
     
-    # === СЛУЧАЙ 2: Пользователь вышел из временной комнаты ===
     if before.channel and before.channel.id in VOICE_ROOMS:
         await asyncio.sleep(2)
         await cleanup_empty_temp_room(before.channel.id)
