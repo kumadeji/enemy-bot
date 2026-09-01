@@ -98,7 +98,7 @@ def es(text):
         '🕹️ ': '🕹️ㅤ', '🏆 ': '🏆ㅤ', '🪖 ': '🪖ㅤ', '🔵 ': '🔵ㅤ',
         '🍻 ': '🍻ㅤ', '🚪 ': '🚪ㅤ', '➡️ ': '➡️ㅤ', '⏭️ ': '⏭️ㅤ',
         '🖼️ ': '🖼️ㅤ', '🚫 ': '🚫ㅤ', '🎖️ ': '🎖️ㅤ', '🧩 ': '🧩ㅤ',
-        '🏁 ': '🏁ㅤ', '🚀 ': '🚀ㅤ',
+        '🏁 ': '🏁ㅤ', '🚀 ': '🚀ㅤ', '🔁️ ': '🔁️ㅤ',
     }
     if not isinstance(text, str):
         return text
@@ -2176,6 +2176,8 @@ async def update_event(event_id, title, description, start_time, end_time, image
     event['description'] = description
     event['start_time'] = int(start_time.timestamp())
     event['end_time'] = int(end_time.timestamp())
+    if event.get('status') == 'completed' and event['end_time'] > int(datetime.now(MSK).timestamp()):
+        event['status'] = 'active'
     if image_key is not None:
         event['image_key'] = image_key
     if num_games is not None:
@@ -2966,7 +2968,11 @@ async def on_ready():
         await setup_voice_room_triggers(guild)
     
     if not scheduler.get_job('spreadsheet_check'):
-        scheduler.add_job(check_spreadsheet, 'cron', day='*/2', hour=18, minute=0, id='spreadsheet_check', replace_existing=True)
+        scheduler.add_job(
+            scheduled_check_spreadsheet, 'cron', day='*/2', hour=18, minute=0,
+            id='spreadsheet_check', replace_existing=True,
+            max_instances=1, coalesce=True, misfire_grace_time=1800
+        )
     if not scheduler.get_job('weekly_events'):
         scheduler.add_job(post_weekly_events, 'cron', day_of_week='mon', hour=12, minute=0, id='weekly_events', replace_existing=True)
     if not scheduler.get_job('vacation_check'):
