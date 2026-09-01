@@ -146,6 +146,7 @@ EVENTS_CHANNEL_ID = 1311705378140196926
 VACATION_CHANNEL_ID = 1284905224099598407
 ADMIN_CHANNEL_ID = 1536632416511332362
 ANKETA_CHANNEL_ID = 1366767440939454504
+CHANGELOG_NOTIFICATIONS_CHANNEL_ID = 1536632416511332362
 ROLE_KOMBAT_ARMA_ID = 1252277370711441429
 
 VOICE_CHANNEL_ID = 1284893513921728582
@@ -1925,7 +1926,7 @@ async def handle_new_profile_watch(doc_id, data):
 async def handle_new_changelog_watch(doc_id, data):
     try:
         text = await build_changelog_message(doc_id, data)
-        channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
+        channel = await client.fetch_channel(CHANGELOG_NOTIFICATIONS_CHANNEL_ID)
         await send_chunked(channel, text)
     except Exception as e:
         print(f"❌ Ошибка публикации записи changeLog ({doc_id}): {e}")
@@ -1936,13 +1937,12 @@ async def handle_new_changelog_watch(doc_id, data):
 async def handle_new_notification_watch(doc_id, data):
     try:
         text = await build_notification_message(data.get('uid', ''), data)
-        channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
+        channel = await client.fetch_channel(CHANGELOG_NOTIFICATIONS_CHANNEL_ID)
         await send_chunked(channel, text)
     except Exception as e:
         print(f"❌ Ошибка публикации уведомления ({doc_id}): {e}")
     finally:
         await set_watcher_last_ts('notifications', _extract_timestamp(data.get('createdAt')))
-
 
 def _make_on_added_callback(handler_coro):
     """Обёртка над Firestore watch-колбэком (выполняется в отдельном grpc-потоке).
