@@ -1026,7 +1026,7 @@ class WeeklyEventsManageSelectView(discord.ui.View):
             f"День: {WEEKDAY_NAMES.get(entry['day_of_week'], entry['day_of_week'])}\n"
             f"Время: {entry['start_time']} - {entry['end_time']}\n"
             f"Игр: {entry.get('num_games', 0)}\n"
-            f"Обязательность: {'Да' if entry.get('mandatory', True) else 'Нет'}"
+            f"Обязательны ли отметки: {'Да' if entry.get('mandatory', True) else 'Нет'}"
         )
         await interaction.response.send_message(text, view=WeeklyEventManageActionsView(weekly_id), ephemeral=True)
 
