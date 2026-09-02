@@ -3,6 +3,19 @@ import os
 import sys
 import signal
 import atexit
+
+# На Windows, если stdout/stderr перенаправлены в файл (а не в реальную консоль),
+# Python выбирает кодировку по системной ANSI-кодовой странице (часто cp1251),
+# которая физически не может отобразить эмодзи (✅, ❌, 🔴 и т.д.) — это вызывает
+# необработанный UnicodeEncodeError и падение процесса ещё ДО подключения к Discord.
+# Принудительно переключаем оба потока на UTF-8 в самом начале, до первого print().
+if sys.platform == 'win32':
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
+
 import gspread
 import re
 import json
@@ -17,6 +30,38 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import firebase_admin
 from firebase_admin import credentials as firebase_credentials, firestore
+from google.cloud.firestore_v1.base_query import FieldFilter
+
+
+def _disable_windows_quick_edit_mode():
+    """На Windows клик мышью в окне консоли включает режим 'выделения текста'
+    (QuickEdit Mode), который на уровне ОС ставит на паузу ЛЮБОЙ вызов
+    чтения/записи консоли (ReadConsole/WriteConsole) — а это блокирует
+    ВЕСЬ процесс целиком, включая event loop бота и все потоки executor'а,
+    пока пользователь не нажмёт Esc/Enter. Именно это вызывает многочасовые
+    'зависания' бота (heartbeat blocked -> разрыв gateway-сессии Discord).
+    Отключаем QuickEdit Mode программно, чтобы клики по консоли были безопасны."""
+    if os.name != 'nt':
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        STD_INPUT_HANDLE = -10
+        ENABLE_QUICK_EDIT_MODE = 0x0040
+        ENABLE_EXTENDED_FLAGS = 0x0080
+
+        h_stdin = kernel32.GetStdHandle(STD_INPUT_HANDLE)
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(h_stdin, ctypes.byref(mode)):
+            return
+        new_mode = (mode.value & ~ENABLE_QUICK_EDIT_MODE) | ENABLE_EXTENDED_FLAGS
+        kernel32.SetConsoleMode(h_stdin, new_mode)
+        print("🖱️ Windows QuickEdit Mode отключён (защита от зависания при клике в консоль)")
+    except Exception as e:
+        print(f"⚠️ Не удалось отключить QuickEdit Mode: {e}")
+
+
+_disable_windows_quick_edit_mode()
 
 # Глобальный executor для синхронных операций (gspread использует requests)
 EXECUTOR = ThreadPoolExecutor(max_workers=5)
@@ -1865,7 +1910,7 @@ def _extract_timestamp(value):
 
 
 def _query_invited_by_sync(uid):
-    docs = fs_db.collection('profiles').where('referredByUid', '==', uid).stream()
+    docs = fs_db.collection('profiles').where(filter=FieldFilter('referredByUid', '==', uid)).stream()
     result = []
     for d in docs:
         dd = d.to_dict() or {}
@@ -2055,7 +2100,7 @@ async def setup_firestore_watchers():
             else:
                 threshold = datetime.fromtimestamp(last_ts_epoch, tz=pytz.UTC)
 
-            query = fs_db.collection(collection_name).where('createdAt', '>', threshold)
+            query = fs_db.collection(collection_name).where(filter=FieldFilter('createdAt', '>', threshold))
             watch = query.on_snapshot(_make_on_added_callback(handler))
             FIRESTORE_WATCH_HANDLES.append(watch)
             print(f"✅ Запущено realtime-слежение за коллекцией '{collection_name}'")
