@@ -147,7 +147,69 @@ VACATION_CHANNEL_ID = 1284905224099598407
 ADMIN_CHANNEL_ID = 1536632416511332362
 ANKETA_CHANNEL_ID = 1366767440939454504
 CHANGELOG_NOTIFICATIONS_CHANNEL_ID = 1536632416511332362
-ROLE_KOMBAT_ARMA_ID = 1252277370711441429
+
+# ============== ЕДИНЫЙ РЕЕСТР РОЛЕЙ (стандартизация) ==============
+# Роли с фиксированным ID собраны здесь в одном месте — это единственный
+# источник правды. Роли без фиксированного ID (создаются ботом динамически,
+# например "Отпуск", либо их ID нам неизвестен, например "Боец ArmA")
+# по-прежнему ищутся по имени, но теперь через ОДНУ общую функцию
+# get_role_by_name() вместо трёх разных копий этого кода по всему файлу.
+
+ROLE_IDS = {
+    'kombat_arma': 1252277370711441429,
+    'zam_kombat_arma': 1470351490005729383,
+    'kombat_squad': 1230600119053848787,
+    'zam_kombat_squad': 1503144759084974150,
+    'boets_arma': 1284456321005129778,
+    'otpusk': 1536500577553481768,
+}
+
+
+def get_role_mention_by_id(guild, role_key: str):
+    """Mention роли по ключу из ROLE_IDS, либо None, если роли нет на сервере
+    (защита от 'битых' упоминаний, если ID устарел или роль удалили)."""
+    role_id = ROLE_IDS.get(role_key)
+    if not role_id or not guild:
+        return None
+    role = guild.get_role(role_id)
+    return role.mention if role else None
+
+
+def get_role_by_name(guild, name: str):
+    """Единая точка поиска ролей БЕЗ фиксированного ID (по имени)."""
+    return discord.utils.get(guild.roles, name=name)
+
+
+def get_army_role_mention(guild):
+    """Mention роли 'Боец ArmA' по готовому фиксированному ID."""
+    mention = get_role_mention_by_id(guild, 'boets_arma')
+    return mention if mention else "**@Боец ArmA**"
+
+
+def get_leadership_mentions(guild, *role_keys: str) -> str:
+    """Собирает через пробел mentions нескольких ролей из ROLE_IDS,
+    пропуская те, которых не оказалось на сервере."""
+    mentions = [m for m in (get_role_mention_by_id(guild, key) for key in role_keys) if m]
+    return " ".join(mentions)
+
+
+def get_anketa_leadership_mentions(guild, games_interested: list) -> str:
+    """Кого тегать под новой анкетой в зависимости от игр, которыми
+    интересуется кандидат:
+    Arma Reforger -> Комбат ArmA + Зам. комбата ArmA
+    Squad         -> Комбат SQUAD + Зам. комбата SQUAD
+    Обе игры      -> все четыре роли
+    Ни одна из известных -> по умолчанию руководство ArmA."""
+    games_lower = {(g or '').strip().lower() for g in (games_interested or [])}
+    keys = []
+    if 'arma reforger' in games_lower:
+        keys.extend(['kombat_arma', 'zam_kombat_arma'])
+    if 'squad' in games_lower:
+        keys.extend(['kombat_squad', 'zam_kombat_squad'])
+    if not keys:
+        keys = ['kombat_arma', 'zam_kombat_arma']
+    return get_leadership_mentions(guild, *keys)
+
 
 VOICE_CHANNEL_ID = 1284893513921728582
 VOICE_CHANNEL_URL = "https://discord.com/channels/734494109032513699/1284893513921728582"
@@ -934,13 +996,15 @@ async def get_active_members(current_date: datetime) -> list:
 
 
 async def get_vacation_role(guild):
-    role = discord.utils.get(guild.roles, name="Отпуск")
-    if not role:
-        try:
-            role = await guild.create_role(name="Отпуск", mentionable=False)
-        except Exception:
-            return None
-    return role
+    role = guild.get_role(ROLE_IDS['otpusk'])
+    if role:
+        return role
+    # Фоллбэк на случай, если роль с этим ID вдруг не найдена на сервере
+    # (например, роль была удалена) — создаём заново по старому принципу.
+    try:
+        return await guild.create_role(name="Отпуск", mentionable=False)
+    except Exception:
+        return None
 
 
 async def update_vacation_role(member, has_vacation: bool):
@@ -1306,7 +1370,7 @@ class AdminMainMenuView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
     
-    @discord.ui.button(label=es("📅 Создать разовое мероприятие"), style=discord.ButtonStyle.primary, custom_id="admin_create_event", row=0)
+    @discord.ui.button(label=es("📅 Создание единоразового мероприятия"), style=discord.ButtonStyle.primary, custom_id="admin_create_event", row=0)
     async def create_event_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1314,14 +1378,14 @@ class AdminMainMenuView(discord.ui.View):
         view = EventImageSelectView()
         await interaction.response.send_message(es("🖼️ Выберите картинку для мероприятия:"), view=view, ephemeral=True)
     
-    @discord.ui.button(label=es("📋 Список разовых мероприятий"), style=discord.ButtonStyle.secondary, custom_id="admin_event_list", row=0)
+    @discord.ui.button(label=es("📋 Список единоразовых мероприятий"), style=discord.ButtonStyle.secondary, custom_id="admin_event_list", row=0)
     async def event_list_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await show_event_list(interaction)
         
-    @discord.ui.button(label=es("🔁 Управление еженедельными мероприятиями"), style=discord.ButtonStyle.secondary, custom_id="admin_weekly_events", row=0)
+    @discord.ui.button(label=es("🔁 Управление еженедельными мероприятиями"), style=discord.ButtonStyle.secondary, custom_id="admin_weekly_events", row=1)
     async def weekly_events_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1332,35 +1396,35 @@ class AdminMainMenuView(discord.ui.View):
             view=WeeklyEventsManageSelectView(), ephemeral=True
         )
     
-    @discord.ui.button(label=es("📝 Отправка сообщения"), style=discord.ButtonStyle.success, custom_id="admin_send_message", row=1)
+    @discord.ui.button(label=es("📝 Отправка сообщения"), style=discord.ButtonStyle.success, custom_id="admin_send_message", row=2)
     async def send_message_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(SendMessageModal())
     
-    @discord.ui.button(label=es("🗑️ Удаление сообщения"), style=discord.ButtonStyle.danger, custom_id="admin_delete_message", row=1)
+    @discord.ui.button(label=es("🗑️ Удаление сообщения"), style=discord.ButtonStyle.danger, custom_id="admin_delete_message", row=2)
     async def delete_message_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(DeleteMessageModal())
     
-    @discord.ui.button(label=es("🏖️ Отпуск для бойца"), style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player", row=2)
+    @discord.ui.button(label=es("🏖️ Отпуск для бойца"), style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player", row=3)
     async def vacation_for_player_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(AdminVacationModal())
     
-    @discord.ui.button(label=es("🏖️ Список отпусков"), style=discord.ButtonStyle.secondary, custom_id="admin_vacation_list", row=2)
+    @discord.ui.button(label=es("🏖️ Список отпусков"), style=discord.ButtonStyle.secondary, custom_id="admin_vacation_list", row=3)
     async def vacation_list_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await show_vacation_list(interaction)
     
-    @discord.ui.button(label=es("🔍 Проверка таблицы"), style=discord.ButtonStyle.success, custom_id="admin_check_table", row=3)
+    @discord.ui.button(label=es("🔍 Проверка таблицы"), style=discord.ButtonStyle.success, custom_id="admin_check_table", row=4)
     async def check_table_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1371,7 +1435,7 @@ class AdminMainMenuView(discord.ui.View):
         await interaction.response.send_message(es("🔍 Запускаю проверку таблицы..."), ephemeral=True)
         await check_spreadsheet()
     
-    @discord.ui.button(label=es("🔍 Извлечение кода сообщения"), style=discord.ButtonStyle.secondary, custom_id="admin_extract_message", row=3)
+    @discord.ui.button(label=es("🔍 Извлечение кода сообщения"), style=discord.ButtonStyle.secondary, custom_id="admin_extract_message", row=4)
     async def extract_message_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1641,11 +1705,10 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление д
         event_start = datetime.fromtimestamp(event['start_time'], MSK)
         start_ts = int(event_start.timestamp())
         guild = thread.guild
-        role = discord.utils.get(guild.roles, name="Боец ArmA")
 
         if event_created_late(event):
             # Мероприятие создано менее чем за сутки — рассылаем по роли целиком (п.13)
-            mention_block = role.mention if role else "**@Боец ArmA**"
+            mention_block = get_army_role_mention(guild)
         else:
             # По умолчанию — только тем, кто отметился "Приду" (п.13)
             accepted = list(event.get('accepted', {}).keys())
@@ -1657,7 +1720,7 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление д
                 mention_block = " ".join(mentions)
             else:
                 # Никто ещё не отметился — некому слать индивидуально, пингуем роль как fallback
-                mention_block = role.mention if role else "**@Боец ArmA**"
+                mention_block = get_army_role_mention(guild)
 
         text = (
             mention_block + "\n\n" +
@@ -1825,7 +1888,7 @@ async def get_invited_by_uid(uid):
 
 # --- Форматирование сообщений ---
 
-async def build_anketa_message(uid, data):
+async def build_anketa_message(uid, data, mention_block: str = ""):
     callsign = data.get('callsign', '?')
     lines = []
     lines.append(f"Электронная почта: {data.get('email') or '—'}")
@@ -1878,7 +1941,8 @@ async def build_anketa_message(uid, data):
         lines.append(f"Опыт в {game}: {hours_str} — {exp_text}" if exp_text else f"Опыт в {game}: {hours_str}")
 
     body = "\n".join(f"> {line}" for line in lines)
-    header = f"**🔔 <@&{ROLE_KOMBAT_ARMA_ID}> Поступила новая анкета от бойца {callsign}:**"
+    ping_part = f"{mention_block} " if mention_block else ""
+    header = f"**🔔 {ping_part}Поступила новая анкета от бойца {callsign}:**"
     return header + "\n\n" + body
 
 
@@ -1914,14 +1978,14 @@ async def build_notification_message(uid, data):
 
 async def handle_new_profile_watch(doc_id, data):
     try:
-        text = await build_anketa_message(doc_id, data)
         channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
+        mention_block = get_anketa_leadership_mentions(channel.guild, data.get('gamesInterested', []))
+        text = await build_anketa_message(doc_id, data, mention_block=mention_block)
         await send_chunked(channel, text)
     except Exception as e:
         print(f"❌ Ошибка публикации новой анкеты ({doc_id}): {e}")
     finally:
         await set_watcher_last_ts('profiles', _extract_timestamp(data.get('createdAt')))
-
 
 async def handle_new_changelog_watch(doc_id, data):
     try:
@@ -2558,16 +2622,10 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
         try:
             thread = await message.create_thread(name=f"💬 Утверждение отпуска - {nickname}")
             guild = channel.guild
-            mentions = []
-            role_kombat = discord.utils.get(guild.roles, name="Комбат ArmA")
-            role_zam = discord.utils.get(guild.roles, name="Зам. комбата ArmA")
-            if role_kombat:
-                mentions.append(role_kombat.mention)
-            if role_zam:
-                mentions.append(role_zam.mention)
+            mention_block = get_leadership_mentions(guild, 'kombat_arma', 'zam_kombat_arma')
             vacation_mention = f"<#{VACATION_CHANNEL_ID}>"
-            if mentions:
-                await thread.send(f"{' '.join(mentions)}\n\n" + es(f"Новый запрос на отпуск от **{nickname}**! Перейдите в канал {vacation_mention} и рассмотрите рапорт."))
+            if mention_block:
+                await thread.send(f"{mention_block}\n\n" + es(f"Новый запрос на отпуск от **{nickname}**! Перейдите в канал {vacation_mention} и рассмотрите рапорт."))
             else:
                 await thread.send(es(f"Новый запрос на отпуск от **{nickname}**! Перейдите в канал {vacation_mention}."))
             vacations[nickname]['thread_id'] = thread.id
@@ -3108,9 +3166,7 @@ async def create_event(title, description, start_time, end_time, image_key='none
         events[event_id]['message_id'] = message.id
         thread = await message.create_thread(name=f"💬 {title}")
         events[event_id]['thread_id'] = thread.id
-        role = discord.utils.get(guild.roles, name="Боец ArmA")
-        if role:
-            await thread.send(f"{role.mention}\n\n" + es("📢 Бойцы, запланировано мероприятие! Ждем ваших отметок!"))
+        await thread.send(f"{get_army_role_mention(guild)}\n\n" + es("📢 Бойцы, запланировано мероприятие! Ждем ваших отметок!"))
         save_json(EVENTS_FILE, events)
     except Exception as e:
         print(f"❌ Ошибка публикации мероприятия: {e}")
@@ -3198,9 +3254,7 @@ async def check_event_reminders():
                     if thread:
                         if event_created_late(event):
                             # Мероприятие создано менее чем за сутки до начала — пингуем роль целиком (п.12)
-                            guild = thread.guild
-                            role = discord.utils.get(guild.roles, name="Боец ArmA")
-                            mention_block = role.mention if role else "@Боец ArmA"
+                            mention_block = get_army_role_mention(thread.guild)
                         else:
                             accepted = list(event.get('accepted', {}).keys())
                             mentions = []
