@@ -1306,7 +1306,7 @@ class AdminMainMenuView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
     
-    @discord.ui.button(label=es("📅 Создать мероприятие"), style=discord.ButtonStyle.primary, custom_id="admin_create_event", row=0)
+    @discord.ui.button(label=es("📅 Создать разовое мероприятие"), style=discord.ButtonStyle.primary, custom_id="admin_create_event", row=0)
     async def create_event_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1314,42 +1314,53 @@ class AdminMainMenuView(discord.ui.View):
         view = EventImageSelectView()
         await interaction.response.send_message(es("🖼️ Выберите картинку для мероприятия:"), view=view, ephemeral=True)
     
-    @discord.ui.button(label=es("📋 Список мероприятий"), style=discord.ButtonStyle.secondary, custom_id="admin_event_list", row=0)
+    @discord.ui.button(label=es("📋 Список разовых мероприятий"), style=discord.ButtonStyle.secondary, custom_id="admin_event_list", row=0)
     async def event_list_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await show_event_list(interaction)
+        
+    @discord.ui.button(label=es("🔁 Управление еженедельными мероприятиями"), style=discord.ButtonStyle.secondary, custom_id="admin_weekly_events", row=1)
+    async def weekly_events_button(self, interaction, button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+            return
+        ensure_weekly_events_file()
+        await interaction.response.send_message(
+            es("🔁 Управление еженедельными мероприятиями:"),
+            view=WeeklyEventsManageSelectView(), ephemeral=True
+        )
     
-    @discord.ui.button(label=es("📝 Отправить сообщение"), style=discord.ButtonStyle.success, custom_id="admin_send_message", row=1)
+    @discord.ui.button(label=es("📝 Отправка сообщения"), style=discord.ButtonStyle.success, custom_id="admin_send_message", row=2)
     async def send_message_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(SendMessageModal())
     
-    @discord.ui.button(label=es("🗑️ Удалить сообщение"), style=discord.ButtonStyle.danger, custom_id="admin_delete_message", row=1)
+    @discord.ui.button(label=es("🗑️ Удаление сообщения"), style=discord.ButtonStyle.danger, custom_id="admin_delete_message", row=2)
     async def delete_message_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(DeleteMessageModal())
     
-    @discord.ui.button(label=es("🏖️ Отпуск для бойца"), style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player", row=2)
+    @discord.ui.button(label=es("🏖️ Отпуск для бойца"), style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player", row=3)
     async def vacation_for_player_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(AdminVacationModal())
     
-    @discord.ui.button(label=es("🏖️ Список отпусков"), style=discord.ButtonStyle.secondary, custom_id="admin_vacation_list", row=2)
+    @discord.ui.button(label=es("🏖️ Список отпусков"), style=discord.ButtonStyle.secondary, custom_id="admin_vacation_list", row=3)
     async def vacation_list_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await show_vacation_list(interaction)
     
-    @discord.ui.button(label=es("🔍 Проверить таблицу"), style=discord.ButtonStyle.success, custom_id="admin_check_table", row=3)
+    @discord.ui.button(label=es("🔍 Проверка таблицы"), style=discord.ButtonStyle.success, custom_id="admin_check_table", row=4)
     async def check_table_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1360,14 +1371,14 @@ class AdminMainMenuView(discord.ui.View):
         await interaction.response.send_message(es("🔍 Запускаю проверку таблицы..."), ephemeral=True)
         await check_spreadsheet()
     
-    @discord.ui.button(label=es("🔍 Извлечь код сообщения"), style=discord.ButtonStyle.secondary, custom_id="admin_extract_message", row=3)
+    @discord.ui.button(label=es("🔍 Извлечение кода сообщения"), style=discord.ButtonStyle.secondary, custom_id="admin_extract_message", row=4)
     async def extract_message_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(ExtractMessageModal())
     
-    @discord.ui.button(label=es("🔄 Обновить шаблоны сообщений"), style=discord.ButtonStyle.primary, custom_id="admin_refresh_templates", row=3)
+    @discord.ui.button(label=es("🔄 Синхронизация оформления сообщений"), style=discord.ButtonStyle.primary, custom_id="admin_refresh_templates", row=5)
     async def refresh_templates_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1382,17 +1393,6 @@ class AdminMainMenuView(discord.ui.View):
             es(f"📅 Мероприятий обновлено: **{ev_updated}** (ошибок: {ev_errors})\n"
                f"🏖️ Отпусков обновлено: **{vac_updated}** (ошибок: {vac_errors})"),
             ephemeral=True
-        )
-
-    @discord.ui.button(label=es("🔁 Еженедельные мероприятия"), style=discord.ButtonStyle.secondary, custom_id="admin_weekly_events", row=4)
-    async def weekly_events_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-            return
-        ensure_weekly_events_file()
-        await interaction.response.send_message(
-            es("🔁 Управление еженедельными мероприятиями:"),
-            view=WeeklyEventsManageSelectView(), ephemeral=True
         )
 
 
@@ -2567,9 +2567,9 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
                 mentions.append(role_zam.mention)
             vacation_mention = f"<#{VACATION_CHANNEL_ID}>"
             if mentions:
-                await thread.send(f"{' '.join(mentions)}\n\n" + es(f"📋 Новый запрос на отпуск от **{nickname}**!\n\n") + es(f"👉 Перейдите в канал {vacation_mention} и рассмотрите рапорт."))
+                await thread.send(f"{' '.join(mentions)}\n\n" + es(f"Новый запрос на отпуск от **{nickname}**! Перейдите в канал {vacation_mention} и рассмотрите рапорт."))
             else:
-                await thread.send(es(f"📋 Новый запрос на отпуск от **{nickname}**!\n\n") + es(f"👉 Перейдите в канал {vacation_mention}."))
+                await thread.send(es(f"Новый запрос на отпуск от **{nickname}**! Перейдите в канал {vacation_mention}."))
             vacations[nickname]['thread_id'] = thread.id
         except Exception:
             pass
