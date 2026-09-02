@@ -257,7 +257,6 @@ def get_anketa_leadership_mentions(guild, games_interested: list) -> str:
 
 
 VOICE_CHANNEL_ID = 1284893513921728582
-VOICE_CHANNEL_URL = "https://discord.com/channels/734494109032513699/1284893513921728582"
 
 VOICE_ROOM_CATEGORY_ARMY = 1284893244878098464
 VOICE_ROOM_CATEGORY_PUBLIC = 1116657923360301157
@@ -357,14 +356,6 @@ EVENT_IMAGES = {
     'vylazka': {'file': 'vylazka-rounded.png', 'title': 'Клановая вылазка'},
     'mangust': {'file': 'mangust-rounded.png', 'title': 'Операция «Мангуст»'},
 }
-
-
-def get_image_path(image_key: str):
-    if image_key == 'none' or image_key not in EVENT_IMAGES:
-        return None
-    path = os.path.join(IMAGES_DIR, EVENT_IMAGES[image_key]['file'])
-    return path if os.path.exists(path) else None
-
 
 def get_image_info(image_key: str):
     if image_key == 'none' or image_key not in EVENT_IMAGES:
@@ -600,51 +591,6 @@ async def get_sheet_data_with_colors(sheet, range_name):
             break
     print(f"❌ Ошибка при получении данных с цветами из API: {last_error}")
     return []
-
-
-async def load_clan_members_from_sheet():
-    global CLAN_MEMBERS_CACHE, CLAN_MEMBERS_CACHE_TIME
-    current_time = datetime.now().timestamp()
-    if CLAN_MEMBERS_CACHE and CLAN_MEMBERS_CACHE_TIME and (current_time - CLAN_MEMBERS_CACHE_TIME) < CLAN_MEMBERS_CACHE_TTL:
-        return CLAN_MEMBERS_CACHE
-    if not gc:
-        print("⚠️ Google Sheets не инициализирован, использую кэш")
-        return CLAN_MEMBERS_CACHE
-    
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            loop = asyncio.get_event_loop()
-            spreadsheet = await loop.run_in_executor(EXECUTOR, gc.open_by_url, SPREADSHEET_URL)
-            sheet = spreadsheet.worksheet(SHEET_NAME)
-            data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J35')
-            if not data_with_colors or len(data_with_colors) < 2:
-                return CLAN_MEMBERS_CACHE
-            headers = [cell['value'] for cell in data_with_colors[0]]
-            rows = data_with_colors[1:]
-            if NICKNAME_COLUMN not in headers:
-                return CLAN_MEMBERS_CACHE
-            nick_idx = headers.index(NICKNAME_COLUMN)
-            members = []
-            for row in rows:
-                if nick_idx < len(row):
-                    raw_nickname = row[nick_idx]['value'].strip()
-                    nickname = extract_nickname(raw_nickname)
-                    if nickname:
-                        members.append(nickname)
-            CLAN_MEMBERS_CACHE = members
-            CLAN_MEMBERS_CACHE_TIME = current_time
-            print(f"✅ Загружено {len(members)} участников клана из таблицы")
-            return members
-        except Exception as e:
-            error_str = str(e)
-            if ('503' in error_str or '500' in error_str or '429' in error_str) and attempt < max_retries - 1:
-                wait_time = 2 * (attempt + 1)
-                print(f"⚠️ Google API ошибка (попытка {attempt + 1}/{max_retries}), повтор через {wait_time} сек...")
-                await asyncio.sleep(wait_time)
-                continue
-            print(f"❌ Ошибка загрузки списка клана: {e}")
-            return CLAN_MEMBERS_CACHE
 
 def _firebase_load_roster_sync():
     """Синхронное чтение всех callsign'ов из rosterPublic (выполняется в EXECUTOR)."""
@@ -2212,40 +2158,55 @@ def build_gamestats_notification_message(ko_delta, ks_delta, soldier_delta):
 
 
 def _extract_game_triples_from_wizard(wizard):
-    """[(players, commander, side_commander), ...] — один элемент на игру,
-    либо один элемент при явке 'в целом' (num_games == 0)."""
+    """[(players, squad_commanders_list, side_commander), ...] — один элемент на игру."""
     if wizard.num_games == 0:
-        return [(wizard.data.get('overall', []), wizard.commanders.get('overall'), wizard.side_commanders.get('overall'))]
+        return [(wizard.data.get('overall', []), wizard.commanders.get('overall') or [], wizard.side_commanders.get('overall'))]
     return [
-        (wizard.data.get(i, []), wizard.commanders.get(i), wizard.side_commanders.get(i))
+        (wizard.data.get(i, []), wizard.commanders.get(i) or [], wizard.side_commanders.get(i))
         for i in range(wizard.num_games)
     ]
 
 
+def _normalize_commanders_field(record_part, singular_key, plural_key):
+    """Обратная совместимость: старые записи хранили ОДНОГО командира
+    в поле singular_key (строка), новые — список в plural_key."""
+    if plural_key in record_part:
+        val = record_part.get(plural_key) or []
+        return val if isinstance(val, list) else ([val] if val else [])
+    val = record_part.get(singular_key)
+    return [val] if val else []
+
+
 def _extract_game_triples_from_record(record):
     """То же самое, но из уже сохранённой в Firebase записи явки
-    (нужно для вычисления 'старых' отыгрышей при повторной подаче явки)."""
+    (нужно для вычисления 'старых' отыгрышей и 'старых' командиров
+    при повторной подаче явки — чтобы не задваивать инкременты и сдвиги очереди)."""
     if not record:
         return []
     if 'overall_players' in record:
-        return [(record.get('overall_players', []), record.get('overall_commander'), record.get('overall_side_commander'))]
+        commanders = _normalize_commanders_field(record, 'overall_commander', 'overall_commanders')
+        return [(record.get('overall_players', []), commanders, record.get('overall_side_commander'))]
     games = record.get('games', {}) or {}
     triples = []
     for key in sorted(games.keys(), key=lambda k: int(k) if k.isdigit() else 0):
         g = games[key]
-        triples.append((g.get('players', []), g.get('commander'), g.get('side_commander')))
+        commanders = _normalize_commanders_field(g, 'commander', 'commanders')
+        triples.append((g.get('players', []), commanders, g.get('side_commander')))
     return triples
 
 
 def _tally_from_triples(triples):
+    """Считает отыгрыши по ролям. Поддерживает НЕСКОЛЬКО командиров отделения
+    на одну игру — каждый из них корректно получает +1 к koCount."""
     per_player = {}
 
     def bump(nickname, field):
         per_player.setdefault(nickname, {'ko': 0, 'ks': 0, 'soldier': 0})[field] += 1
 
-    for players, commander, side_commander in triples:
+    for players, squad_commanders, side_commander in triples:
+        squad_commanders = squad_commanders or []
         for player in (players or []):
-            is_ko = (player == commander)
+            is_ko = player in squad_commanders
             is_ks = (player == side_commander)
             if is_ko:
                 bump(player, 'ko')
@@ -2254,6 +2215,86 @@ def _tally_from_triples(triples):
             if not is_ko and not is_ks:
                 bump(player, 'soldier')
     return per_player
+
+def _move_uid_to_queue_back_sync(uid):
+    """Атомарно (в транзакции Firestore) перемещает uid в конец очереди
+    /queue/state.current, если он там присутствует. Если uid не найден —
+    ничего не делает: самовольно добавлять кого-либо в очередь — не задача
+    бота, это прерогатива администрации/сайта."""
+    doc_ref = fs_db.collection('queue').document('state')
+    transaction = fs_db.transaction()
+
+    @firestore.transactional
+    def _txn(transaction, doc_ref, uid):
+        snapshot = doc_ref.get(transaction=transaction)
+        data = snapshot.to_dict() if snapshot.exists else {}
+        current = list(data.get('current', []) or [])
+        idx = None
+        for i, entry in enumerate(current):
+            if isinstance(entry, dict) and entry.get('uid') == uid:
+                idx = i
+                break
+        if idx is None:
+            return False
+        entry = current.pop(idx)
+        current.append(entry)
+        transaction.set(doc_ref, {'current': current}, merge=True)
+        return True
+
+    return _txn(transaction, doc_ref, uid)
+
+
+async def move_squad_commander_to_queue_back(nickname: str):
+    uid = await get_uid_by_nickname(nickname)
+    if not uid:
+        print(f"⚠️ Не удалось найти uid для '{nickname}' — сдвиг очереди пропущен")
+        return
+    loop = asyncio.get_event_loop()
+    try:
+        moved = await loop.run_in_executor(EXECUTOR, _move_uid_to_queue_back_sync, uid)
+        if moved:
+            print(f"🔁 '{nickname}' сдвинут в конец очереди на командование отделением")
+    except Exception as e:
+        print(f"❌ Ошибка сдвига очереди для '{nickname}': {e}")
+    # Инвалидируем локальный кэш очереди, чтобы embed сразу показал актуальные данные
+    QUEUE_CACHE['current'] = None
+    QUEUE_CACHE['time'] = 0
+
+
+async def apply_squad_commander_queue_promotion(wizard, old_record=None):
+    """Сдвигает в конец очереди на командование отделением ВСЕХ НОВЫХ
+    (не назначавшихся ранее в этой же явке — важно при повторном редактировании)
+    командиров отделения, по одному, СТРОГО в порядке игр: сначала командир(ы)
+    первой игры, затем второй, и т.д. Если на одной игре несколько командиров —
+    порядок между ними не критичен (двигаются последовательно друг за другом).
+    Возвращает True, если была хотя бы одна фактическая перестановка."""
+    new_triples = _extract_game_triples_from_wizard(wizard)
+    old_triples = _extract_game_triples_from_record(old_record) if old_record else []
+
+    ordered_new_commanders = []
+    for game_idx, (_, new_commanders, _) in enumerate(new_triples):
+        old_commanders = old_triples[game_idx][1] if game_idx < len(old_triples) else []
+        for nickname in (new_commanders or []):
+            if nickname not in old_commanders:
+                ordered_new_commanders.append(nickname)
+
+    for nickname in ordered_new_commanders:
+        await move_squad_commander_to_queue_back(nickname)
+
+    return len(ordered_new_commanders) > 0
+
+
+async def refresh_all_active_event_embeds():
+    """Обновляет embed всех активных (ещё не начавшихся/идущих) мероприятий —
+    вызывается после сдвига очереди, чтобы поле 'Ожидаемый командир отделения'
+    сразу отражало актуальное состояние во всех будущих мероприятиях,
+    а не только в том, по которому заполнялась явка."""
+    events = load_json(EVENTS_FILE, {})
+    for event_id, event in events.items():
+        if event.get('status', 'active') != 'active':
+            continue
+        await refresh_event_message(event_id)
+        await asyncio.sleep(1)
 
 
 async def apply_attendance_to_gamestats(wizard, old_record=None):
@@ -2306,20 +2347,30 @@ class AttendanceWizard:
 
 
 class CommandersSelectView(discord.ui.View):
-    """Выбор командира отделения и (отдельно) командира стороны —
-    ТОЛЬКО из числа бойцов, отмеченных явившимися на этом шаге/матче (п.16)."""
+    """Выбор командира(ов) отделения (может быть НЕСКОЛЬКО на одну игру —
+    например, при нескольких отделениях сразу) и ОДНОГО командира стороны —
+    строго из числа бойцов, отмеченных явившимися на этом шаге/игре."""
     def __init__(self, wizard, present_players):
         super().__init__(timeout=300)
         self.wizard = wizard
-        self.squad_commander = None
+        self.squad_commanders = []  # список позывных — порядок выбора не критичен (по договорённости)
         self.side_commander = None
 
-        squad_options = [discord.SelectOption(label="— Без командира отделения —", value="none", emoji="🚫")]
-        for nick in present_players[:MAX_SELECT_OPTIONS - 1]:
-            squad_options.append(discord.SelectOption(label=nick, value=nick))
+        capped_players = present_players[:MAX_SELECT_OPTIONS]
+
+        if capped_players:
+            squad_options = [discord.SelectOption(label=nick, value=nick) for nick in capped_players]
+            squad_max = len(squad_options)
+            squad_disabled = False
+        else:
+            squad_options = [discord.SelectOption(label="— Нет явившихся —", value="__none__")]
+            squad_max = 1
+            squad_disabled = True
+
         self.squad_select = discord.ui.Select(
-            placeholder="🪖 Командир отделения...",
-            options=squad_options, min_values=1, max_values=1, row=0
+            placeholder="🪖 Командир(ы) отделения (можно несколько, необязательно)...",
+            options=squad_options, min_values=0, max_values=squad_max, row=0,
+            disabled=squad_disabled
         )
         self.squad_select.callback = self._squad_callback
         self.add_item(self.squad_select)
@@ -2342,8 +2393,7 @@ class CommandersSelectView(discord.ui.View):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Только комбат или заместитель!"), ephemeral=True)
             return
-        value = self.squad_select.values[0]
-        self.squad_commander = None if value == "none" else value
+        self.squad_commanders = [v for v in self.squad_select.values if v != "__none__"]
         await interaction.response.defer()
 
     async def _side_callback(self, interaction):
@@ -2359,11 +2409,12 @@ class CommandersSelectView(discord.ui.View):
             await interaction.response.send_message(es("⛔ Только комбат или заместитель!"), ephemeral=True)
             return
         key = "overall" if self.wizard.num_games == 0 else self.wizard.current_step
-        self.wizard.commanders[key] = self.squad_commander
+        self.wizard.commanders[key] = list(self.squad_commanders)
         self.wizard.side_commanders[key] = self.side_commander
         self.stop()
         await interaction.response.defer()
         await proceed_to_next_step(interaction, self.wizard)
+
 
 class AttendanceStepView(discord.ui.View):
     def __init__(self, wizard, step, clan_members):
@@ -2533,14 +2584,14 @@ async def finalize_attendance(interaction, wizard):
     
     if wizard.num_games == 0:
         record['overall_players'] = wizard.data.get('overall', [])
-        record['overall_commander'] = wizard.commanders.get('overall')
+        record['overall_commanders'] = wizard.commanders.get('overall') or []
         record['overall_side_commander'] = wizard.side_commanders.get('overall')
     else:
         record['games'] = {}
         for i in range(wizard.num_games):
             record['games'][str(i+1)] = {
                 'players': wizard.data.get(i, []),
-                'commander': wizard.commanders.get(i),
+                'commanders': wizard.commanders.get(i) or [],
                 'side_commander': wizard.side_commanders.get(i)
             }
     
@@ -2554,31 +2605,36 @@ async def finalize_attendance(interaction, wizard):
     report_text = es(f"🏆 **Отчёт о явке: {wizard.event_title}**\n\n")
     report_text += es(f"📋 Составил: **{interaction.user.display_name}**\n\n")
     
+    def _format_commanders(commanders_list):
+        if not commanders_list:
+            return es("*Не назначен*")
+        return "\n".join(commanders_list)
+
     if wizard.num_games == 0:
         players = wizard.data.get('overall', [])
-        commander = wizard.commanders.get('overall')
+        commanders = wizard.commanders.get('overall') or []
         side_commander = wizard.side_commanders.get('overall')
         
         report_text += es(f"👥 **Явились на мероприятие ({len(players)}):**\n")
         report_text += "\n".join(players) if players else es("*Никто не явился*")
         
-        report_text += "\n\n" + es("🪖 **Командир отделения:**\n")
-        report_text += commander if commander else es("*Не назначен*")
+        report_text += "\n\n" + es("🪖 **Командир(ы) отделения:**\n")
+        report_text += _format_commanders(commanders)
 
         report_text += "\n\n" + es("🎖️ **Командир стороны:**\n")
         report_text += side_commander if side_commander else es("*Не назначен*")
     else:
         for i in range(wizard.num_games):
             players = wizard.data.get(i, [])
-            commander = wizard.commanders.get(i)
+            commanders = wizard.commanders.get(i) or []
             side_commander = wizard.side_commanders.get(i)
             
-            report_text += es(f"🎮 **Матч {i+1}**\n\n")
+            report_text += es(f"🎮 **Игра {i+1}**\n\n")
             report_text += es(f"👥 Явились ({len(players)}):\n")
             report_text += "\n".join(players) if players else es("*Никто не явился*")
             
-            report_text += "\n\n" + es(f"🪖 Командир отделения:\n")
-            report_text += commander if commander else es("*Не назначен*")
+            report_text += "\n\n" + es(f"🪖 Командир(ы) отделения:\n")
+            report_text += _format_commanders(commanders)
 
             report_text += "\n\n" + es(f"🎖️ Командир стороны:\n")
             report_text += side_commander if side_commander else es("*Не назначен*")
@@ -2593,7 +2649,11 @@ async def finalize_attendance(interaction, wizard):
     save_json(ATTENDANCE_FILE, attendance)
     
     await apply_attendance_to_gamestats(wizard, old_record=old_record)
-    
+
+    queue_changed = await apply_squad_commander_queue_promotion(wizard, old_record=old_record)
+    if queue_changed:
+        await refresh_all_active_event_embeds()
+
     await interaction.followup.send(es("✅ Отчёт о явке опубликован в ветке мероприятия!"), ephemeral=True)
     print(f"✅ Отчёт о явке для '{wizard.event_title}' опубликован")
 
@@ -3938,7 +3998,7 @@ async def on_ready():
             title=es("🛠️ Панель управления комбата и заместителей"),
             description=("Здесь вы можете управлять всеми функциями бота через кнопки. "
                         "Функции бота разделены по строчкам:\n\n"
-                        "1. Мероприятия \n2. Сообщения \n3. Отпуска \n4. Еженедельные мероприятия \n5. Утилиты \n"),
+                        "1. Единоразовые мероприятия \n2. Еженедельные мероприятия \n3. Сообщения \n4. Отпуска \n5. Утилиты\n"),
             color=discord.Color.blue()
         )
         await admin_channel.send(embed=embed, view=AdminMainMenuView())
