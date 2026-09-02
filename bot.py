@@ -1618,9 +1618,9 @@ class ConfirmDeleteView(discord.ui.View):
         await interaction.response.send_message(es("🚫 Удаление отменено."), ephemeral=True)
 
 
-class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление  для скачивания модов")):
+class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление для скачивания модов")):
     server_name = discord.ui.TextInput(label="Название сервера (необязательно)", required=False, max_length=100)
-    password = discord.ui.TextInput(label="Пароль на моды (необязательно)", required=False, max_length=100)
+    password = discord.ui.TextInput(label="Пароль сервера (необязательно)", required=False, max_length=100)
 
     def __init__(self, event_id):
         super().__init__()
