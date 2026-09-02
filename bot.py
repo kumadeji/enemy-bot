@@ -1321,7 +1321,7 @@ class AdminMainMenuView(discord.ui.View):
             return
         await show_event_list(interaction)
         
-    @discord.ui.button(label=es("🔁 Управление еженедельными мероприятиями"), style=discord.ButtonStyle.secondary, custom_id="admin_weekly_events", row=1)
+    @discord.ui.button(label=es("🔁 Управление еженедельными мероприятиями"), style=discord.ButtonStyle.secondary, custom_id="admin_weekly_events", row=0)
     async def weekly_events_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1332,35 +1332,35 @@ class AdminMainMenuView(discord.ui.View):
             view=WeeklyEventsManageSelectView(), ephemeral=True
         )
     
-    @discord.ui.button(label=es("📝 Отправка сообщения"), style=discord.ButtonStyle.success, custom_id="admin_send_message", row=2)
+    @discord.ui.button(label=es("📝 Отправка сообщения"), style=discord.ButtonStyle.success, custom_id="admin_send_message", row=1)
     async def send_message_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(SendMessageModal())
     
-    @discord.ui.button(label=es("🗑️ Удаление сообщения"), style=discord.ButtonStyle.danger, custom_id="admin_delete_message", row=2)
+    @discord.ui.button(label=es("🗑️ Удаление сообщения"), style=discord.ButtonStyle.danger, custom_id="admin_delete_message", row=1)
     async def delete_message_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(DeleteMessageModal())
     
-    @discord.ui.button(label=es("🏖️ Отпуск для бойца"), style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player", row=3)
+    @discord.ui.button(label=es("🏖️ Отпуск для бойца"), style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player", row=2)
     async def vacation_for_player_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(AdminVacationModal())
     
-    @discord.ui.button(label=es("🏖️ Список отпусков"), style=discord.ButtonStyle.secondary, custom_id="admin_vacation_list", row=3)
+    @discord.ui.button(label=es("🏖️ Список отпусков"), style=discord.ButtonStyle.secondary, custom_id="admin_vacation_list", row=2)
     async def vacation_list_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await show_vacation_list(interaction)
     
-    @discord.ui.button(label=es("🔍 Проверка таблицы"), style=discord.ButtonStyle.success, custom_id="admin_check_table", row=4)
+    @discord.ui.button(label=es("🔍 Проверка таблицы"), style=discord.ButtonStyle.success, custom_id="admin_check_table", row=3)
     async def check_table_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
@@ -1371,14 +1371,14 @@ class AdminMainMenuView(discord.ui.View):
         await interaction.response.send_message(es("🔍 Запускаю проверку таблицы..."), ephemeral=True)
         await check_spreadsheet()
     
-    @discord.ui.button(label=es("🔍 Извлечение кода сообщения"), style=discord.ButtonStyle.secondary, custom_id="admin_extract_message", row=4)
+    @discord.ui.button(label=es("🔍 Извлечение кода сообщения"), style=discord.ButtonStyle.secondary, custom_id="admin_extract_message", row=3)
     async def extract_message_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(ExtractMessageModal())
     
-    @discord.ui.button(label=es("🔄 Синхронизация оформления сообщений"), style=discord.ButtonStyle.primary, custom_id="admin_refresh_templates", row=5)
+    @discord.ui.button(label=es("🔄 Синхронизация оформления сообщений"), style=discord.ButtonStyle.primary, custom_id="admin_refresh_templates", row=4)
     async def refresh_templates_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
