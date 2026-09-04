@@ -1,2 +1,9 @@
 credentials.json
 credentials_firebase.json
+backups/
+events_data.json
+vacations.json
+attendance_data.json
+weekly_events.json
+voice_rooms.json
+last_scheduled_check.json

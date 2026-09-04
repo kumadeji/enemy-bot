@@ -66,6 +66,36 @@ _disable_windows_quick_edit_mode()
 # Глобальный executor для синхронных операций (gspread использует requests)
 EXECUTOR = ThreadPoolExecutor(max_workers=5)
 
+# ============== МОДУЛЬНОСТЬ ХРАНИЛИЩА ДАННЫХ (Firebase / локальный JSON) ==============
+# Переключатель режима хранения СОБСТВЕННЫХ данных бота (мероприятия, отпуска,
+# явка, еженедельные мероприятия, временные голосовые комнаты, метки планировщика).
+#
+#   'firebase' (по умолчанию) — читаем и пишем в Firebase. При КАЖДОЙ записи
+#                                параллельно обновляется зеркальная резервная
+#                                копия в локальных JSON-файлах — на случай,
+#                                если Firebase станет недоступен и придётся
+#                                аварийно переключиться на них.
+#   'json'                    — работаем ИСКЛЮЧИТЕЛЬНО с локальными JSON-файлами,
+#                                подключение к Firebase для этих данных вообще
+#                                не устанавливается.
+#
+# ВАЖНО: переключатель касается только данных, которые генерирует сам бот.
+# Список бойцов клана (rosterPublic), очередь на командование (queue/state),
+# учёт отыгрышей (profiles/gameStats) и публикация новых анкет/уведомлений/
+# changeLog — это данные САЙТА клана, которые физически существуют только
+# в Firebase; при DATA_BACKEND='json' эти функции автоматически и безопасно
+# отключаются (без падений бота), так как эквивалента в JSON для них нет.
+#
+# Переключить можно прямо здесь (задать 'json') либо переменной окружения:
+#   set DATA_BACKEND=json      (Windows)
+#   export DATA_BACKEND=json  (Linux)
+DATA_BACKEND = os.environ.get('DATA_BACKEND', 'firebase').strip().lower()
+if DATA_BACKEND not in ('firebase', 'json'):
+    print(f"⚠️ Некорректное значение DATA_BACKEND='{DATA_BACKEND}', использую 'firebase' по умолчанию.")
+    DATA_BACKEND = 'firebase'
+USE_FIREBASE_BACKEND = (DATA_BACKEND == 'firebase')
+print(f"🗄️ Режим хранения данных бота: {DATA_BACKEND.upper()}")
+
 # ============== ЗАЩИТА ОТ ДВОЙНОГО ЗАПУСКА ==============
 
 LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.bot.lock')
@@ -225,12 +255,6 @@ def get_role_by_name(guild, name: str):
     return discord.utils.get(guild.roles, name=name)
 
 
-def get_army_role_mention(guild):
-    """Mention роли 'Боец ArmA' по готовому фиксированному ID."""
-    mention = get_role_mention_by_id(guild, 'boets_arma')
-    return mention if mention else "**@Боец ArmA**"
-
-
 def get_leadership_mentions(guild, *role_keys: str) -> str:
     """Собирает через пробел mentions нескольких ролей из ROLE_IDS,
     пропуская те, которых не оказалось на сервере."""
@@ -279,6 +303,15 @@ FIREBASE_ROSTER_COLLECTION = 'rosterPublic'
 # Если у вас в клане используется другой тег — поменяйте здесь.
 CLAN_TAG = "[En-Y]"
 
+# Игра, по которой бот определяет принадлежность к клану (composition).
+# Сейчас бот поддерживает только направление Arma Reforger.
+CLAN_ROSTER_GAME = "Arma Reforger"
+
+# Только эти composition считаются ДЕЙСТВУЮЩИМИ игроками клана.
+# Остальные (например, "Отбор", "Кандидат" и т.п.) физически не состоят
+# в клане и не должны иметь никаких прав бойца клана в боте.
+ACTIVE_CLAN_COMPOSITIONS = {"Личный состав", "Запас"}
+
 # Все "JSON-файлы" бота на самом деле хранятся как документы в Firestore,
 # в коллекции botData. Ключ словаря — старое имя файла (для обратной совместимости
 # со всем остальным кодом бота, который вызывает load_json('events_data.json', ...)
@@ -302,8 +335,8 @@ WEEKDAY_INDEX = {'mon': 0, 'tue': 1, 'wed': 2, 'thu': 3, 'fri': 4, 'sat': 5, 'su
 
 DEFAULT_WEEKLY_EVENTS = {
     "weekly_asvdv_rtvt": {
-        "name": "Суббота. Плановые RTvT на AS VDV",
-        "description": "Бойцы, в субботу пройдут плановые ротационные матчи Realistic TvT на сервере AS VDV. Матчи длинные - каждая по 60-90 минут. Ждём вас!",
+        "name": "Плановые RTvT на AS VDV",
+        "description": "Бойцы, в субботу пройдут плановые ротационные матчи Realistic TvT на сервере AS VDV. Матчи длинные - каждый по 60-90 минут. Ждём вас!",
         "day_of_week": "sat",
         "start_time": "16:30",
         "end_time": "19:30",
@@ -312,8 +345,8 @@ DEFAULT_WEEKLY_EVENTS = {
         "mandatory": True
     },
     "weekly_tt_tvt": {
-        "name": "Воскресенье. Плановые TvT на Triad Tactics",
-        "description": "Бойцы, в воскресенье пройдут плановые ротационные матчи TvT на сервере Triad Tactics. Матчи длинные - каждая по 60-90 минут. Ждём вас!",
+        "name": "Плановые TvT на Triad Tactics",
+        "description": "Бойцы, в воскресенье пройдут плановые ротационные матчи TvT на сервере Triad Tactics. Матчи длинные - каждый по 60-90 минут. Ждём вас!",
         "day_of_week": "sun",
         "start_time": "17:45",
         "end_time": "22:15",
@@ -434,6 +467,8 @@ def format_vacation_period(start_iso: str, end_iso: str) -> str:
 CLAN_MEMBERS_CACHE = []
 CLAN_MEMBERS_CACHE_TIME = None
 CLAN_MEMBERS_CACHE_TTL = 3600
+_ROSTER_UNAVAILABLE_WARNED = False
+
 
 VOICE_ROOMS = {}
 TRIGGER_CHANNEL_ARMY = None
@@ -443,25 +478,26 @@ VOICE_ROOM_CREATION_LOCKS = {}
 
 VACATION_RULES = es("""
 
-Боец, если ты будешь отсутствовать более 7 дней, оформи отпуск, чтобы не быть исключённым из клана за низкую активность!
+Боец, если ты будешь отсутствовать более 7 дней, оформи отпуск, чтобы не быть исключённым из клана за отсутствие отметок на мероприятиях с обязательной записью!
 
 **📌 Основные правила:**
-* Отпуск оформляется на срок от **7 дней до 1 месяца**
-* Рапорт можно продлить, создав новый со следующего дня после окончания предыдущего
+* Отпуск оформляется на срок от **7 дней до 1 месяца с обязательным указанием причины**
+* Отпуск **можно продлить**, создав новый со следующего дня после окончания предыдущего
+* Отпуск **можно досрочно закрыть** в любое время
 * После оформления отпуск должен быть **утверждён комбатом или заместителем**
 * Во время отпуска тебе **не нужно отмечаться в расписании на матчи**
 * Боец в отпуске **лишается возможности участия в матчах** до закрытия отпуска
 
-**✅ Уважительные причины:**
+**✏️ Причины:**
 * Командировки и мероприятия по работе
 * Семейные мероприятия
 * Проблемы со здоровьем
 * Длительные учебные мероприятия (например, сессия)
+* Отдых от игры, игровое выгорание
+* Длительное моральное, физическое утомление
 
-**❌ Неуважительные причины:**
-* Усталость от игры
-
-Боец, указывай честную и конкретную причину! Это помогает командованию планировать состав на матчи. Отпуск может быть аннулирован, если вы будете находится в отпуске, но постоянно играть в игры во время проводимых мероприятий в клане.
+Боец, указывай честную и конкретную причину! Это помогает командованию планировать состав на матчи.
+Учти, что если ты будешь постоянно оформлять отпуски для отдыха от игры и никогда не участвовать в мероприятиях клана, это может стать поводом для понижения в клане – вплоть до исключения, но с возможностью восстановления.
 """)
 
 # ============== ИНИЦИАЛИЗАЦИЯ ==============
@@ -501,15 +537,19 @@ except Exception as e:
     print(f"Ошибка при инициализации Google Sheets: {e}")
     gc = None
 
-try:
-    if not firebase_admin._apps:
-        _fb_cred = firebase_credentials.Certificate(FIREBASE_CREDENTIALS_FILE)
-        firebase_admin.initialize_app(_fb_cred, {'projectId': FIREBASE_PROJECT_ID})
-    fs_db = firestore.client()
-    print("✅ Firebase Admin SDK инициализирован")
-except Exception as e:
-    print(f"❌ Ошибка при инициализации Firebase: {e}")
+if USE_FIREBASE_BACKEND:
+    try:
+        if not firebase_admin._apps:
+            _fb_cred = firebase_credentials.Certificate(FIREBASE_CREDENTIALS_FILE)
+            firebase_admin.initialize_app(_fb_cred, {'projectId': FIREBASE_PROJECT_ID})
+        fs_db = firestore.client()
+        print("✅ Firebase Admin SDK инициализирован")
+    except Exception as e:
+        print(f"❌ Ошибка при инициализации Firebase: {e}")
+        fs_db = None
+else:
     fs_db = None
+    print("ℹ️ DATA_BACKEND='json' — подключение к Firebase пропущено (работаем только с локальными JSON-файлами).")
 
 
 # ============== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==============
@@ -593,14 +633,30 @@ async def get_sheet_data_with_colors(sheet, range_name):
     return []
 
 def _firebase_load_roster_sync():
-    """Синхронное чтение всех callsign'ов из rosterPublic (выполняется в EXECUTOR)."""
+    """Синхронное чтение всех callsign'ов из rosterPublic (выполняется в EXECUTOR).
+    В список попадают ТОЛЬКО игроки с composition 'Личный состав' или 'Запас'
+    по Arma Reforger (см. ACTIVE_CLAN_COMPOSITIONS) — это единственные составы,
+    которые считаются действующими игроками клана. Остальные (например, те,
+    кто ещё проходит отбор) не должны отображаться в списке 'Не отметились',
+    не должны иметь возможность отмечаться на мероприятиях и не считаются
+    частью клана ботом ни в каком другом месте кода — фильтрация именно здесь
+    автоматически распространяется на весь остальной функционал бота,
+    так как все проверки принадлежности к клану идут через эту функцию."""
     docs = fs_db.collection(FIREBASE_ROSTER_COLLECTION).stream()
     members = []
+    skipped = 0
     for doc in docs:
         data = doc.to_dict() or {}
         callsign = (data.get('callsign') or '').strip()
-        if callsign:
-            members.append(f"{CLAN_TAG}{callsign}")
+        if not callsign:
+            continue
+        composition = ((data.get('gameRoles') or {}).get(CLAN_ROSTER_GAME) or {}).get('composition', '')
+        if composition not in ACTIVE_CLAN_COMPOSITIONS:
+            skipped += 1
+            continue
+        members.append(f"{CLAN_TAG}{callsign}")
+    if skipped:
+        print(f"ℹ️ Пропущено {skipped} профилей из-за неподходящего состава (не 'Личный состав'/'Запас')")
     return members
 
 
@@ -613,8 +669,12 @@ async def load_clan_members_from_firebase():
     current_time = datetime.now().timestamp()
     if CLAN_MEMBERS_CACHE and CLAN_MEMBERS_CACHE_TIME and (current_time - CLAN_MEMBERS_CACHE_TIME) < CLAN_MEMBERS_CACHE_TTL:
         return CLAN_MEMBERS_CACHE
+    global _ROSTER_UNAVAILABLE_WARNED
     if not fs_db:
-        print("⚠️ Firebase не инициализирован, использую кэш списка клана")
+        if not _ROSTER_UNAVAILABLE_WARNED:
+            print("⚠️ Firebase недоступен — список бойцов клана из Firebase получить нельзя "
+                  "(нормально в режиме DATA_BACKEND='json'). Дальнейшие такие сообщения подавлены.")
+            _ROSTER_UNAVAILABLE_WARNED = True
         return CLAN_MEMBERS_CACHE
     try:
         loop = asyncio.get_event_loop()
@@ -871,6 +931,8 @@ async def scheduled_check_spreadsheet():
 _FIRESTORE_CACHE = {}
 _FIRESTORE_CACHE_LOCK = threading.Lock()
 
+BACKUP_SAFETY_DIR = os.path.join(BASE_DIR, 'backups')
+
 
 def _firestore_doc_ref(doc_name):
     return fs_db.collection('botData').document(doc_name)
@@ -888,7 +950,6 @@ def _firestore_read_sync(doc_name):
 def _firestore_write_sync(doc_name, data):
     """Синхронная запись (выполняется в EXECUTOR, не блокирует event loop)."""
     if not fs_db:
-        print(f"⚠️ Firebase не инициализирован — запись '{doc_name}' пропущена")
         return
     try:
         doc_ref = _firestore_doc_ref(doc_name)
@@ -897,11 +958,89 @@ def _firestore_write_sync(doc_name, data):
         print(f"❌ Ошибка записи в Firebase ({doc_name}): {e}")
 
 
+def _write_local_backup_sync(filename, data):
+    """Пишет резервную JSON-копию на диск. В режиме DATA_BACKEND='firebase'
+    вызывается при КАЖДОЙ записи (зеркалирование) — бэкапы всегда идентичны
+    тому, что лежит в Firebase, на случай аварийного переключения на них."""
+    try:
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"⚠️ Не удалось записать резервную копию '{filename}': {e}")
+
+
+def _read_local_backup_sync(filename, default):
+    if not os.path.exists(filename):
+        return default
+    try:
+        with open(filename, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"⚠️ Не удалось прочитать резервную копию '{filename}': {e}")
+        return default
+
+
+def _data_size(data) -> int:
+    if isinstance(data, dict):
+        return len(data)
+    if isinstance(data, list):
+        return len(data)
+    return 0 if data in (None, {}, []) else 1
+
+
+def _is_suspicious_wipe(old_data, new_data) -> bool:
+    """Эвристика 'подозрительного' массового стирания: было заметное
+    количество записей, стало пусто (или почти пусто) за один вызов.
+    НЕ блокирует запись (админ мог реально удалить всё намеренно —
+    например, удалить последнее мероприятие), но включает создание
+    защитного снапшота ПЕРЕД перезаписью, чтобы данные можно было
+    восстановить вручную при ошибке. Порог old_size >= 3 нужен, чтобы
+    не создавать лишний шум на естественных 'опустошениях' вроде
+    закрытия последней временной голосовой комнаты (0-2 штуки — норма)."""
+    old_size = _data_size(old_data)
+    new_size = _data_size(new_data)
+    if old_size < 3:
+        return False
+    if new_size == 0:
+        return True
+    if new_size < old_size * 0.2:
+        return True
+    return False
+
+
+def _save_wipe_safety_snapshot_sync(doc_name, old_data):
+    """Сохраняет 'слепок' данных ПЕРЕД подозрительным массовым стиранием —
+    и в отдельную коллекцию Firebase (botData_safety), и локально на диск
+    (backups/{doc_name}_wipe_TIMESTAMP.json). Это чисто аварийная копия
+    для ручного восстановления, в обычном чтении она не участвует."""
+    timestamp = datetime.now(MSK).strftime('%Y%m%d_%H%M%S')
+    if fs_db:
+        try:
+            fs_db.collection('botData_safety').document(f"{doc_name}_{timestamp}").set({
+                'data': old_data, 'savedAt': firestore.SERVER_TIMESTAMP, 'reason': 'suspicious_wipe'
+            })
+        except Exception as e:
+            print(f"⚠️ Не удалось сохранить защитный снапшот в Firebase для '{doc_name}': {e}")
+    try:
+        os.makedirs(BACKUP_SAFETY_DIR, exist_ok=True)
+        snapshot_path = os.path.join(BACKUP_SAFETY_DIR, f"{doc_name}_wipe_{timestamp}.json")
+        with open(snapshot_path, 'w', encoding='utf-8') as f:
+            json.dump(old_data, f, indent=2, ensure_ascii=False)
+        print(f"🛟 Обнаружено подозрительное массовое удаление данных в '{doc_name}' — "
+              f"создан защитный снапшот: {snapshot_path}")
+    except Exception as e:
+        print(f"⚠️ Не удалось сохранить локальный защитный снапшот для '{doc_name}': {e}")
+
+
 async def load_all_firebase_data():
-    """Загружает все данные бота из Firebase в память при старте.
-    Если в Firebase ещё пусто, а рядом лежит старый локальный JSON-файл —
-    один раз переносит его содержимое в облако (чтобы не потерять историю
-    при переходе со старой версии бота)."""
+    """Загружает все данные бота из Firebase в память при старте
+    (только в режиме DATA_BACKEND='firebase'). Если чтение конкретной
+    коллекции не удалось (сетевая ошибка и т.п.) — НЕ считаем её пустой,
+    а подстраховываемся локальным бэкап-файлом (если он есть), чтобы
+    не потерять реальные данные и случайно не затереть их где-то ниже."""
+    if not USE_FIREBASE_BACKEND:
+        print("ℹ️ DATA_BACKEND='json' — работаю напрямую с локальными JSON-файлами, Firebase не используется.")
+        return
     if not fs_db:
         print("⚠️ Firebase не инициализирован — данные бота НЕ будут сохраняться в облако!")
         return
@@ -909,59 +1048,90 @@ async def load_all_firebase_data():
     for local_name, doc_name in FIREBASE_DATA_MAP.items():
         try:
             data = await loop.run_in_executor(EXECUTOR, _firestore_read_sync, doc_name)
-            if not data and os.path.exists(local_name):
-                try:
-                    with open(local_name, 'r', encoding='utf-8') as f:
-                        local_data = json.load(f)
-                    if local_data:
-                        await loop.run_in_executor(EXECUTOR, _firestore_write_sync, doc_name, local_data)
-                        data = local_data
-                        print(f"📦 Мигрированы локальные данные '{local_name}' → Firebase ({doc_name})")
-                except Exception as mig_err:
-                    print(f"⚠️ Не удалось мигрировать '{local_name}' в Firebase: {mig_err}")
             with _FIRESTORE_CACHE_LOCK:
                 _FIRESTORE_CACHE[local_name] = data
+            # Зеркалируем актуальное состояние Firebase в локальный бэкап,
+            # чтобы бэкап был свежим даже если сегодня никто ничего не сохранял.
+            await loop.run_in_executor(EXECUTOR, _write_local_backup_sync, local_name, data)
         except Exception as e:
             print(f"❌ Ошибка загрузки '{doc_name}' из Firebase: {e}")
-            with _FIRESTORE_CACHE_LOCK:
-                _FIRESTORE_CACHE[local_name] = {}
-    print(f"✅ Данные бота загружены из Firebase ({len(FIREBASE_DATA_MAP)} коллекций)")
+            fallback = await loop.run_in_executor(EXECUTOR, _read_local_backup_sync, local_name, None)
+            if fallback is not None:
+                print(f"🛟 Использую локальный бэкап '{local_name}' вместо недоступных данных Firebase.")
+                with _FIRESTORE_CACHE_LOCK:
+                    _FIRESTORE_CACHE[local_name] = fallback
+            else:
+                print(f"⚠️ Локальный бэкап для '{local_name}' тоже не найден — коллекция будет считаться пустой.")
+                with _FIRESTORE_CACHE_LOCK:
+                    _FIRESTORE_CACHE[local_name] = {}
+    print(f"✅ Данные бота загружены из Firebase ({len(FIREBASE_DATA_MAP)} коллекций), локальные бэкапы синхронизированы.")
+
 
 def load_json(filename, default=None):
     if default is None:
         default = {}
-    if filename in FIREBASE_DATA_MAP:
-        with _FIRESTORE_CACHE_LOCK:
-            cached = _FIRESTORE_CACHE.get(filename)
-        if cached is None:
+    if filename not in FIREBASE_DATA_MAP:
+        if not os.path.exists(filename):
             return default
-        return copy.deepcopy(cached)
-    # Фоллбэк на локальный файл — для всего, что ещё не переведено на Firebase
-    if not os.path.exists(filename):
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return default
+
+    if not USE_FIREBASE_BACKEND:
+        # РЕЖИМ JSON: читаем напрямую с диска при каждом вызове, без кэша.
+        # Firebase не используется вообще.
+        return _read_local_backup_sync(filename, default)
+
+    # РЕЖИМ FIREBASE: читаем ТОЛЬКО из памяти (кэш, загруженный из Firebase
+    # при старте и обновляемый при каждой записи) — на диск даже не смотрим.
+    with _FIRESTORE_CACHE_LOCK:
+        cached = _FIRESTORE_CACHE.get(filename)
+    if cached is None:
         return default
-    try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    except Exception:
-        return default
+    return copy.deepcopy(cached)
 
 
 def save_json(filename, data):
-    if filename in FIREBASE_DATA_MAP:
-        with _FIRESTORE_CACHE_LOCK:
-            _FIRESTORE_CACHE[filename] = copy.deepcopy(data)
-        doc_name = FIREBASE_DATA_MAP[filename]
-        if fs_db:
-            try:
-                EXECUTOR.submit(_firestore_write_sync, doc_name, data)
-            except Exception as e:
-                print(f"❌ Не удалось запланировать запись в Firebase ({doc_name}): {e}")
+    if filename not in FIREBASE_DATA_MAP:
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            print(f"Ошибка сохранения {filename}: {e}")
         return
+
+    if not USE_FIREBASE_BACKEND:
+        # РЕЖИМ JSON: пишем напрямую на диск, Firebase не трогаем вообще.
+        _write_local_backup_sync(filename, data)
+        return
+
+    # РЕЖИМ FIREBASE: сразу обновляем кэш (для мгновенной консистентности
+    # внутри процесса), затем в фоне (через EXECUTOR, не блокируя event loop)
+    # пишем и в Firebase, и зеркальный бэкап на диск.
+    doc_name = FIREBASE_DATA_MAP[filename]
+    with _FIRESTORE_CACHE_LOCK:
+        old_data = _FIRESTORE_CACHE.get(filename)
+        _FIRESTORE_CACHE[filename] = copy.deepcopy(data)
+
+    if _is_suspicious_wipe(old_data, data):
+        try:
+            EXECUTOR.submit(_save_wipe_safety_snapshot_sync, doc_name, old_data)
+        except Exception as e:
+            print(f"❌ Не удалось запланировать защитный снапшот для '{doc_name}': {e}")
+
+    if fs_db:
+        try:
+            EXECUTOR.submit(_firestore_write_sync, doc_name, data)
+        except Exception as e:
+            print(f"❌ Не удалось запланировать запись в Firebase ({doc_name}): {e}")
+
     try:
-        with open(filename, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+        EXECUTOR.submit(_write_local_backup_sync, filename, data)
     except Exception as e:
-        print(f"Ошибка сохранения {filename}: {e}")
+        print(f"⚠️ Не удалось запланировать резервную запись '{filename}': {e}")
+
 
 def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
     vacations = load_json(VACATIONS_FILE, {})
@@ -984,6 +1154,25 @@ def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
 async def get_active_members(current_date: datetime) -> list:
     members = await load_clan_members_from_firebase()
     return [m for m in members if not is_on_vacation_dynamic(m, current_date)]
+
+
+async def build_mentions_for_nicknames(nicknames: list) -> str:
+    """Строит через пробел Discord-упоминания игроков по их позывным
+    (запасной вариант — жирный текст ника, если пользователь Discord не найден)."""
+    mentions = []
+    for nickname in nicknames:
+        member = await find_member_by_nickname(nickname)
+        mentions.append(member.mention if member else f"**{nickname}**")
+    return " ".join(mentions)
+
+
+async def get_all_active_members_mentions(current_time: datetime) -> str:
+    """Упоминания ВСЕХ действующих бойцов клана (composition из
+    ACTIVE_CLAN_COMPOSITIONS), которые НЕ в отпуске на момент вызова.
+    Используется везде, где раньше пинговалась роль 'Боец ArmA' целиком —
+    теперь эта роль нигде в коде не пингуется вообще."""
+    active_members = await get_active_members(current_time)
+    return await build_mentions_for_nicknames(active_members)
 
 
 async def get_vacation_role(guild):
@@ -1069,138 +1258,187 @@ class ExtractMessageModal(discord.ui.Modal, title=es("🔍 Извлечь код
 
 
 class EventCreateModal(discord.ui.Modal):
-    def __init__(self, image_key='none'):
+    def __init__(self, image_key='none', num_games=0, mandatory=True):
         super().__init__(title=es("📅 Создание мероприятия"))
         self.image_key = image_key
+        self.num_games = num_games
+        self.mandatory = mandatory
         self.event_title = discord.ui.TextInput(label="Название мероприятия", required=True, max_length=100)
         self.event_description = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, required=True, max_length=1000)
-        self.start_time = discord.ui.TextInput(label="Начало (ДД.ММ.ГГГГ ЧЧ:ММ)", required=True, max_length=16)
-        self.end_time = discord.ui.TextInput(label="Окончание (ДД.ММ.ГГГГ ЧЧ:ММ)", required=True, max_length=16)
-        self.num_games = discord.ui.TextInput(
-            label="Матчи;Обязательны ли отметки",
-            placeholder="Примеры: 2;Да или 0;Нет",
-            required=False, max_length=10, default="0;Нет"
-        )
+        self.event_date = discord.ui.TextInput(label="Дата мероприятия (ДД.ММ.ГГГГ)", placeholder="01.12.2026", required=True, max_length=10)
+        self.start_time = discord.ui.TextInput(label="Время начала (ЧЧ:ММ)", placeholder="19:30", required=True, max_length=5)
+        self.end_time = discord.ui.TextInput(label="Время окончания (ЧЧ:ММ)", placeholder="22:00", required=True, max_length=5)
         self.add_item(self.event_title)
         self.add_item(self.event_description)
+        self.add_item(self.event_date)
         self.add_item(self.start_time)
         self.add_item(self.end_time)
-        self.add_item(self.num_games)
 
     async def on_submit(self, interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            start = MSK.localize(datetime.strptime(self.start_time.value, "%d.%m.%Y %H:%M"))
-            end = MSK.localize(datetime.strptime(self.end_time.value, "%d.%m.%Y %H:%M"))
-            raw = self.num_games.value.strip()
-            if ';' in raw:
-                games_str, mandatory_str = raw.split(';', 1)
-            else:
-                games_str, mandatory_str = raw, 'Да'
-            games = int(games_str.strip() or "0")
-            mandatory = mandatory_str.strip().lower() not in ('нет', 'no', 'false', '0')
-            if games < 0 or games > MAX_GAMES:
-                await interaction.followup.send(es(f"❌ Количество матчей: 0-{MAX_GAMES}!"), ephemeral=True)
-                return
+            date_str = self.event_date.value.strip()
+            start = MSK.localize(datetime.strptime(f"{date_str} {self.start_time.value.strip()}", "%d.%m.%Y %H:%M"))
+            end = MSK.localize(datetime.strptime(f"{date_str} {self.end_time.value.strip()}", "%d.%m.%Y %H:%M"))
+            if end <= start:
+                end += timedelta(days=1)  # мероприятие переходит через полночь
             await create_event(self.event_title.value, self.event_description.value, start, end,
-                                image_key=self.image_key, num_games=games, mandatory=mandatory)
+                                image_key=self.image_key, num_games=self.num_games, mandatory=self.mandatory)
             await interaction.followup.send(es("✅ Мероприятие создано!"), ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
 
 class EventEditModal(discord.ui.Modal):
-    def __init__(self, event_id, current_title, current_description, current_start, current_end, image_key='none', num_games=0, mandatory=True):
+    def __init__(self, event_id, current_title, current_description, current_date, current_start_time, current_end_time,
+                 image_key='none', num_games=0, mandatory=True):
         super().__init__(title=es("✏️ Редактирование мероприятия"))
         self.event_id = event_id
         self.image_key = image_key
+        self.num_games = num_games
+        self.mandatory = mandatory
         self.event_title = discord.ui.TextInput(label="Название мероприятия", default=current_title, required=True, max_length=100)
         self.event_description = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, default=current_description, required=True, max_length=1000)
-        self.start_time = discord.ui.TextInput(label="Начало (ДД.ММ.ГГГГ ЧЧ:ММ)", default=current_start, required=True, max_length=16)
-        self.end_time = discord.ui.TextInput(label="Окончание (ДД.ММ.ГГГГ ЧЧ:ММ)", default=current_end, required=True, max_length=16)
-        self.num_games = discord.ui.TextInput(
-            label="Матчи;Обязательны ли отметки",
-            placeholder="Примеры: 2;Да или 0;Нет",
-            default=f"{num_games};{'Да' if mandatory else 'Нет'}",
-            required=False, max_length=10
-        )
+        self.event_date = discord.ui.TextInput(label="Дата мероприятия (ДД.ММ.ГГГГ)", default=current_date, required=True, max_length=10)
+        self.start_time = discord.ui.TextInput(label="Время начала (ЧЧ:ММ)", default=current_start_time, required=True, max_length=5)
+        self.end_time = discord.ui.TextInput(label="Время окончания (ЧЧ:ММ)", default=current_end_time, required=True, max_length=5)
         self.add_item(self.event_title)
         self.add_item(self.event_description)
+        self.add_item(self.event_date)
         self.add_item(self.start_time)
         self.add_item(self.end_time)
-        self.add_item(self.num_games)
 
     async def on_submit(self, interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            start = MSK.localize(datetime.strptime(self.start_time.value, "%d.%m.%Y %H:%M"))
-            end = MSK.localize(datetime.strptime(self.end_time.value, "%d.%m.%Y %H:%M"))
-            raw = self.num_games.value.strip()
-            if ';' in raw:
-                games_str, mandatory_str = raw.split(';', 1)
-            else:
-                games_str, mandatory_str = raw, 'Да'
-            games = int(games_str.strip() or "0")
-            mandatory = mandatory_str.strip().lower() not in ('нет', 'no', 'false', '0')
-            if games < 0 or games > MAX_GAMES:
-                await interaction.followup.send(es(f"❌ Количество матчей: 0-{MAX_GAMES}!"), ephemeral=True)
-                return
+            date_str = self.event_date.value.strip()
+            start = MSK.localize(datetime.strptime(f"{date_str} {self.start_time.value.strip()}", "%d.%m.%Y %H:%M"))
+            end = MSK.localize(datetime.strptime(f"{date_str} {self.end_time.value.strip()}", "%d.%m.%Y %H:%M"))
+            if end <= start:
+                end += timedelta(days=1)
             await update_event(self.event_id, self.event_title.value, self.event_description.value, start, end,
-                                image_key=self.image_key, num_games=games, mandatory=mandatory)
+                                image_key=self.image_key, num_games=self.num_games, mandatory=self.mandatory)
             await interaction.followup.send(es("✅ Мероприятие обновлено!"), ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
 
 
-
-class EventImageSelectView(discord.ui.View):
+class EventSetupView(discord.ui.View):
+    """Шаг настройки перед созданием мероприятия: картинка, количество игр,
+    обязательность отметок — вынесены сюда из модалки (Select вместо текстовых
+    полей), чтобы освободить место для разделения даты/времени на 3 поля,
+    не превышая лимит Discord в 5 текстовых полей на одну модалку."""
     def __init__(self):
-        super().__init__(timeout=120)
-        options = [discord.SelectOption(label="Без картинки", value="none", emoji="🚫")]
+        super().__init__(timeout=180)
+        self.image_key = 'none'
+        self.num_games = 0
+        self.mandatory = True
+
+        image_options = [discord.SelectOption(label="Без картинки", value="none", emoji="🚫", default=True)]
         for key, data in EVENT_IMAGES.items():
-            options.append(discord.SelectOption(label=data['title'], value=key, emoji="🖼️"))
-        self.select = discord.ui.Select(placeholder="🖼️ Выберите картинку для мероприятия...", options=options)
-        self.select.callback = self.select_callback
-        self.add_item(self.select)
-    async def select_callback(self, interaction):
-        selected_key = self.select.values[0]
-        self.stop()
-        await interaction.response.send_modal(EventCreateModal(image_key=selected_key))
+            image_options.append(discord.SelectOption(label=data['title'], value=key, emoji="🖼️"))
+        self.image_select = discord.ui.Select(placeholder="🖼️ Картинка (необязательно)...", options=image_options, row=0)
+        self.image_select.callback = self._image_cb
+        self.add_item(self.image_select)
 
+        games_options = [discord.SelectOption(label=f"{n} {pluralize_games(n)}", value=str(n), default=(n == 0)) for n in range(MAX_GAMES + 1)]
+        self.games_select = discord.ui.Select(placeholder="🎮 Количество игр...", options=games_options, row=1)
+        self.games_select.callback = self._games_cb
+        self.add_item(self.games_select)
 
-class EventEditSelectView(discord.ui.View):
-    def __init__(self, event_id):
-        super().__init__(timeout=120)
-        self.event_id = event_id
-        self.selected_image_key = "__keep__"  # по умолчанию — картинка не меняется
+        mandatory_options = [
+            discord.SelectOption(label="Отметки обязательны", value="yes", emoji="✅", default=True),
+            discord.SelectOption(label="Отметки необязательны", value="no", emoji="🚫"),
+        ]
+        self.mandatory_select = discord.ui.Select(placeholder="📌 Обязательность отметок...", options=mandatory_options, row=2)
+        self.mandatory_select.callback = self._mandatory_cb
+        self.add_item(self.mandatory_select)
 
-        options = [discord.SelectOption(label="⏮️ Оставить текущую", value="__keep__", emoji="✅", default=True)]
-        options.append(discord.SelectOption(label="Без картинки", value="none", emoji="🚫"))
-        for key, data in EVENT_IMAGES.items():
-            options.append(discord.SelectOption(label=data['title'], value=key, emoji="🖼️"))
-        self.select = discord.ui.Select(placeholder="🖼️ Выберите картинку (необязательно)...", options=options, row=0)
-        self.select.callback = self.select_callback
-        self.add_item(self.select)
-
-        next_btn = discord.ui.Button(label=es("➡️ Далее"), style=discord.ButtonStyle.primary, row=1)
-        next_btn.callback = self.next_callback
+        next_btn = discord.ui.Button(label=es("➡️ Далее"), style=discord.ButtonStyle.primary, row=3)
+        next_btn.callback = self._next_cb
         self.add_item(next_btn)
 
-    async def select_callback(self, interaction):
-        self.selected_image_key = self.select.values[0]
+    async def _image_cb(self, interaction):
+        self.image_key = self.image_select.values[0]
         await interaction.response.defer()
 
-    async def next_callback(self, interaction):
+    async def _games_cb(self, interaction):
+        self.num_games = int(self.games_select.values[0])
+        await interaction.response.defer()
+
+    async def _mandatory_cb(self, interaction):
+        self.mandatory = (self.mandatory_select.values[0] == "yes")
+        await interaction.response.defer()
+
+    async def _next_cb(self, interaction):
         self.stop()
-        await open_edit_modal(interaction, self.event_id, image_key=self.selected_image_key)
+        await interaction.response.send_modal(EventCreateModal(image_key=self.image_key, num_games=self.num_games, mandatory=self.mandatory))
+
+
+class EventEditSetupView(discord.ui.View):
+    """Аналог EventSetupView, но для редактирования — с предзаполнением
+    текущих значений картинки/количества игр/обязательности."""
+    def __init__(self, event_id):
+        super().__init__(timeout=180)
+        self.event_id = event_id
+        events = load_json(EVENTS_FILE, {})
+        event = events.get(event_id, {})
+        self.image_key = "__keep__"
+        self.num_games = event.get('num_games', 0)
+        self.mandatory = event.get('mandatory', True)
+
+        image_options = [discord.SelectOption(label="⏮️ Оставить текущую", value="__keep__", emoji="✅", default=True)]
+        image_options.append(discord.SelectOption(label="Без картинки", value="none", emoji="🚫"))
+        for key, data in EVENT_IMAGES.items():
+            image_options.append(discord.SelectOption(label=data['title'], value=key, emoji="🖼️"))
+        self.image_select = discord.ui.Select(placeholder="🖼️ Картинка (по умолчанию — текущая)...", options=image_options, row=0)
+        self.image_select.callback = self._image_cb
+        self.add_item(self.image_select)
+
+        games_options = [discord.SelectOption(label=f"{n} {pluralize_games(n)}", value=str(n), default=(n == self.num_games)) for n in range(MAX_GAMES + 1)]
+        self.games_select = discord.ui.Select(placeholder="🎮 Количество игр...", options=games_options, row=1)
+        self.games_select.callback = self._games_cb
+        self.add_item(self.games_select)
+
+        mandatory_options = [
+            discord.SelectOption(label="Отметки обязательны", value="yes", emoji="✅", default=self.mandatory),
+            discord.SelectOption(label="Отметки необязательны", value="no", emoji="🚫", default=(not self.mandatory)),
+        ]
+        self.mandatory_select = discord.ui.Select(placeholder="📌 Обязательность отметок...", options=mandatory_options, row=2)
+        self.mandatory_select.callback = self._mandatory_cb
+        self.add_item(self.mandatory_select)
+
+        next_btn = discord.ui.Button(label=es("➡️ Далее"), style=discord.ButtonStyle.primary, row=3)
+        next_btn.callback = self._next_cb
+        self.add_item(next_btn)
+
+    async def _image_cb(self, interaction):
+        self.image_key = self.image_select.values[0]
+        await interaction.response.defer()
+
+    async def _games_cb(self, interaction):
+        self.num_games = int(self.games_select.values[0])
+        await interaction.response.defer()
+
+    async def _mandatory_cb(self, interaction):
+        self.mandatory = (self.mandatory_select.values[0] == "yes")
+        await interaction.response.defer()
+
+    async def _next_cb(self, interaction):
+        self.stop()
+        await open_edit_modal(interaction, self.event_id, image_key=self.image_key, num_games=self.num_games, mandatory=self.mandatory)
+
 
 class WeeklyEventSetupView(discord.ui.View):
-    """Шаг 1: выбор дня недели и картинки. Шаг 2 — модалка с текстами."""
+    """Шаг 1: день недели, картинка, количество игр, обязательность.
+    Шаг 2 — модалка только с текстовыми полями (название/описание/время)."""
     def __init__(self, weekly_id=None, defaults=None):
         super().__init__(timeout=180)
         self.weekly_id = weekly_id
         self.defaults = defaults or {}
         self.day_of_week = self.defaults.get('day_of_week', 'sat')
         self.image_key = self.defaults.get('image_key', 'none')
+        self.num_games = self.defaults.get('num_games', 0)
+        self.mandatory = self.defaults.get('mandatory', True)
 
         day_options = [
             discord.SelectOption(label=name, value=key, default=(key == self.day_of_week))
@@ -1217,7 +1455,20 @@ class WeeklyEventSetupView(discord.ui.View):
         self.image_select.callback = self._image_callback
         self.add_item(self.image_select)
 
-        next_btn = discord.ui.Button(label=es("➡️ Далее"), style=discord.ButtonStyle.primary, row=2)
+        games_options = [discord.SelectOption(label=f"{n} {pluralize_games(n)}", value=str(n), default=(n == self.num_games)) for n in range(MAX_GAMES + 1)]
+        self.games_select = discord.ui.Select(placeholder="🎮 Количество игр...", options=games_options, row=2)
+        self.games_select.callback = self._games_callback
+        self.add_item(self.games_select)
+
+        mandatory_options = [
+            discord.SelectOption(label="Отметки обязательны", value="yes", emoji="✅", default=self.mandatory),
+            discord.SelectOption(label="Отметки необязательны", value="no", emoji="🚫", default=(not self.mandatory)),
+        ]
+        self.mandatory_select = discord.ui.Select(placeholder="📌 Обязательность отметок...", options=mandatory_options, row=3)
+        self.mandatory_select.callback = self._mandatory_callback
+        self.add_item(self.mandatory_select)
+
+        next_btn = discord.ui.Button(label=es("➡️ Далее"), style=discord.ButtonStyle.primary, row=4)
         next_btn.callback = self._next_callback
         self.add_item(next_btn)
 
@@ -1229,49 +1480,46 @@ class WeeklyEventSetupView(discord.ui.View):
         self.image_key = self.image_select.values[0]
         await interaction.response.defer()
 
+    async def _games_callback(self, interaction):
+        self.num_games = int(self.games_select.values[0])
+        await interaction.response.defer()
+
+    async def _mandatory_callback(self, interaction):
+        self.mandatory = (self.mandatory_select.values[0] == "yes")
+        await interaction.response.defer()
+
     async def _next_callback(self, interaction):
         self.stop()
         await interaction.response.send_modal(
             WeeklyEventModal(weekly_id=self.weekly_id, day_of_week=self.day_of_week,
-                              image_key=self.image_key, defaults=self.defaults)
+                              image_key=self.image_key, num_games=self.num_games,
+                              mandatory=self.mandatory, defaults=self.defaults)
         )
 
 
 class WeeklyEventModal(discord.ui.Modal):
-    def __init__(self, weekly_id=None, day_of_week='sat', image_key='none', defaults=None):
+    def __init__(self, weekly_id=None, day_of_week='sat', image_key='none', num_games=0, mandatory=True, defaults=None):
         super().__init__(title=es("🔁 Еженедельное мероприятие"))
         self.weekly_id = weekly_id
         self.day_of_week = day_of_week
         self.image_key = image_key
+        self.num_games = num_games
+        self.mandatory = mandatory
         defaults = defaults or {}
-        self.name_input = discord.ui.TextInput(label="Название", default=defaults.get('name', ''), required=True, max_length=100)
+        self.name_input = discord.ui.TextInput(label="Название", default=clean_event_title(defaults.get('name', '')), required=True, max_length=100)
         self.description_input = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, default=defaults.get('description', ''), required=True, max_length=1000)
-        self.start_time_input = discord.ui.TextInput(label="Начало (ЧЧ:ММ)", default=defaults.get('start_time', '16:30'), required=True, max_length=5)
-        self.end_time_input = discord.ui.TextInput(label="Окончание (ЧЧ:ММ)", default=defaults.get('end_time', '19:30'), required=True, max_length=5)
-        self.num_games_input = discord.ui.TextInput(
-            label="Матчи;Обязательны ли отметки",
-            placeholder="Примеры: 2;Да или 0;Нет",
-            default=f"{defaults.get('num_games', 0)};{'Да' if defaults.get('mandatory', True) else 'Нет'}",
-            required=False, max_length=10
-        )
+        self.start_time_input = discord.ui.TextInput(label="Время начала (ЧЧ:ММ)", default=defaults.get('start_time', '16:30'), required=True, max_length=5)
+        self.end_time_input = discord.ui.TextInput(label="Время окончания (ЧЧ:ММ)", default=defaults.get('end_time', '19:30'), required=True, max_length=5)
         self.add_item(self.name_input)
         self.add_item(self.description_input)
         self.add_item(self.start_time_input)
         self.add_item(self.end_time_input)
-        self.add_item(self.num_games_input)
 
     async def on_submit(self, interaction):
         await interaction.response.defer(ephemeral=True, thinking=True)
         try:
             start_h, start_m = map(int, self.start_time_input.value.strip().split(':'))
             end_h, end_m = map(int, self.end_time_input.value.strip().split(':'))
-            raw = self.num_games_input.value.strip()
-            if ';' in raw:
-                games_str, mandatory_str = raw.split(';', 1)
-            else:
-                games_str, mandatory_str = raw, 'Да'
-            num_games = int(games_str.strip() or "0")
-            mandatory = mandatory_str.strip().lower() not in ('нет', 'no', 'false', '0')
 
             weekly_events = load_json(WEEKLY_EVENTS_FILE, {})
             entry = {
@@ -1281,8 +1529,8 @@ class WeeklyEventModal(discord.ui.Modal):
                 'start_time': f"{start_h:02d}:{start_m:02d}",
                 'end_time': f"{end_h:02d}:{end_m:02d}",
                 'image_key': self.image_key,
-                'num_games': num_games,
-                'mandatory': mandatory
+                'num_games': self.num_games,
+                'mandatory': self.mandatory
             }
             weekly_id = self.weekly_id or str(uuid.uuid4())
             weekly_events[weekly_id] = entry
@@ -1366,8 +1614,8 @@ class AdminMainMenuView(discord.ui.View):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
-        view = EventImageSelectView()
-        await interaction.response.send_message(es("🖼️ Выберите картинку для мероприятия:"), view=view, ephemeral=True)
+        view = EventSetupView()
+        await interaction.response.send_message(es("📅 Настройте параметры мероприятия и нажмите Далее:"), view=view, ephemeral=True)
     
     @discord.ui.button(label=es("📋 Список единоразовых мероприятий"), style=discord.ButtonStyle.secondary, custom_id="admin_event_list", row=0)
     async def event_list_button(self, interaction, button):
@@ -1539,15 +1787,7 @@ def event_created_late(event: dict) -> bool:
     return (event.get('start_time', 0) - created_at) < 24 * 3600
 
 def desired_thread_name(event: dict) -> str:
-    status = event.get('status', 'active')
-    title = strip_status_prefix(event['title'])
-    if status == 'cancelled':
-        name = f"💬 Отменено. {title}"
-    elif status == 'completed':
-        name = f"💬 Завершено. {title}"
-    else:
-        name = f"💬 {title}"
-    return name[:100]
+    return f"💬 {build_display_title(event)}"[:100]
 
 
 async def refresh_event_message(event_id):
@@ -1597,7 +1837,7 @@ async def on_edit_button(interaction: discord.Interaction):
         await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
     await interaction.response.send_message(
-        es("🖼️ Выберите картинку (или оставьте текущую):"), view=EventEditSelectView(event_id), ephemeral=True
+        es("✏️ Измените параметры (или оставьте как есть) и нажмите Далее:"), view=EventEditSetupView(event_id), ephemeral=True
     )
 
 
@@ -1695,27 +1935,24 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление д
 
         event_start = datetime.fromtimestamp(event['start_time'], MSK)
         start_ts = int(event_start.timestamp())
-        guild = thread.guild
+        current_time = datetime.now(MSK)
 
         if event_created_late(event):
-            # Мероприятие создано менее чем за сутки — рассылаем по роли целиком (п.13)
-            mention_block = get_army_role_mention(guild)
+            # Мероприятие создано менее чем за сутки — тегаем всех активных,
+            # кто не в отпуске (роль 'Боец ArmA' целиком больше не пингуется).
+            mention_block = await get_all_active_members_mentions(current_time)
         else:
-            # По умолчанию — только тем, кто отметился "Приду" (п.13)
+            # По умолчанию — только тем, кто отметился "Приду"
             accepted = list(event.get('accepted', {}).keys())
-            mentions = []
-            for nickname in accepted:
-                member = await find_member_by_nickname(nickname)
-                mentions.append(member.mention if member else f"**{nickname}**")
-            if mentions:
-                mention_block = " ".join(mentions)
+            if accepted:
+                mention_block = await build_mentions_for_nicknames(accepted)
             else:
-                # Никто ещё не отметился — некому слать индивидуально, пингуем роль как fallback
-                mention_block = get_army_role_mention(guild)
+                # Никто ещё не отметился — тегаем всех активных, кто не в отпуске
+                mention_block = await get_all_active_members_mentions(current_time)
 
         text = (
             mention_block + "\n\n" +
-            f"Бойцы, внимание! {event['title']}\n\n"
+            f"📢 Бойцы, внимание!\n\n"
         )
         if self.server_name.value.strip():
             text += f"Сервер: {self.server_name.value.strip()}\n\n"
@@ -2510,7 +2747,13 @@ async def start_attendance_wizard(interaction, event_id):
     wizard = AttendanceWizard(event_id, num_games, event.get('title', ''))
     clan_members = await get_active_members(datetime.now(MSK))
     if not clan_members:
-        await interaction.response.send_message(es("❌ Список клана пуст!"), ephemeral=True)
+        if not USE_FIREBASE_BACKEND:
+            await interaction.response.send_message(
+                es("❌ Заполнение явки недоступно в аварийном режиме DATA_BACKEND='json' — список бойцов клана хранится в Firebase."),
+                ephemeral=True
+            )
+        else:
+            await interaction.response.send_message(es("❌ Список клана пуст!"), ephemeral=True)
         return
     view = AttendanceStepView(wizard, 0, clan_members)
     if num_games == 0:
@@ -2996,14 +3239,19 @@ async def handle_event_response(interaction, event_id, response_type):
         await interaction.response.send_message(es("⛔ Мероприятие уже завершено. Отметки больше не принимаются!"), ephemeral=True)
         return
 
-    # === Запрет на участие, если бойца нет в списке клана (Firebase) (п.9) ===
-    clan_members = await load_clan_members_from_firebase()
-    if nickname not in clan_members:
-        await interaction.response.send_message(
-            es("⛔ Вы не найдены в списке клана. Обратитесь к командованию, чтобы отметиться."),
-            ephemeral=True
-        )
-        return
+    # === Запрет на участие, если бойца нет в списке клана (только в режиме Firebase) (п.9) ===
+    # В аварийном режиме DATA_BACKEND='json' проверка членства недоступна —
+    # список бойцов физически хранится в Firebase, а не в наших JSON-файлах,
+    # поэтому гейт сознательно отключается, чтобы не заблокировать ВСЕХ бойцов
+    # подряд из-за отсутствия данных.
+    if USE_FIREBASE_BACKEND:
+        clan_members = await load_clan_members_from_firebase()
+        if nickname not in clan_members:
+            await interaction.response.send_message(
+                es("⛔ Вы не найдены в списке клана. Обратитесь к командованию, чтобы отметиться."),
+                ephemeral=True
+            )
+            return
 
     if is_on_vacation_dynamic(nickname, current_date):
         await interaction.response.send_message(es("🏖️ Вы сейчас в отпуске."), ephemeral=True)
@@ -3020,22 +3268,29 @@ async def handle_event_response(interaction, event_id, response_type):
     await refresh_event_message(event_id)
 
 
-async def open_edit_modal(interaction, event_id, image_key=None):
+async def open_edit_modal(interaction, event_id, image_key=None, num_games=None, mandatory=None):
     events = load_json(EVENTS_FILE, {})
     if event_id not in events:
         await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
     event = events[event_id]
-    # "__keep__" — оставить текущую картинку без изменений (п.5)
     if image_key is None or image_key == "__keep__":
         image_key = event.get('image_key', 'none')
-    start = datetime.fromtimestamp(event['start_time'], MSK).strftime("%d.%m.%Y %H:%M")
-    end = datetime.fromtimestamp(event['end_time'], MSK).strftime("%d.%m.%Y %H:%M")
+    if num_games is None:
+        num_games = event.get('num_games', 0)
+    if mandatory is None:
+        mandatory = event.get('mandatory', True)
+
+    start_dt = datetime.fromtimestamp(event['start_time'], MSK)
+    end_dt = datetime.fromtimestamp(event['end_time'], MSK)
     await interaction.response.send_modal(EventEditModal(
-        event_id=event_id, current_title=event['title'],
-        current_description=event['description'], current_start=start, current_end=end,
-        image_key=image_key, num_games=event.get('num_games', 0),
-        mandatory=event.get('mandatory', True)
+        event_id=event_id,
+        current_title=clean_event_title(event['title']),
+        current_description=event['description'],
+        current_date=start_dt.strftime("%d.%m.%Y"),
+        current_start_time=start_dt.strftime("%H:%M"),
+        current_end_time=end_dt.strftime("%H:%M"),
+        image_key=image_key, num_games=num_games, mandatory=mandatory
     ))
 
 
@@ -3138,21 +3393,49 @@ async def delete_event(interaction, event_id):
     await interaction.response.send_message(es("🗑️ Мероприятие полностью удалено!"), ephemeral=True)
 
 _STATUS_TITLE_PREFIXES = ("Завершено. ", "Отменено. ")
+WEEKDAY_NAMES_BY_INDEX = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 
 
-def strip_status_prefix(title: str) -> str:
-    """Убирает случайно задвоившийся префикс статуса, если он уже был
-    ранее вручную вписан прямо в название мероприятия."""
+def get_weekday_name(start_time_epoch: int) -> str:
+    """День недели мероприятия, вычисленный по его дате начала (МСК)."""
+    dt = datetime.fromtimestamp(start_time_epoch, MSK)
+    return WEEKDAY_NAMES_BY_INDEX[dt.weekday()]
+
+
+def clean_event_title(title: str) -> str:
+    """Убирает из НАЧАЛА названия все динамически добавляемые префиксы —
+    и статус ('Завершено. ', 'Отменено. '), и день недели ('Суббота. ' и т.д.) —
+    если они там случайно оказались (например, из старых данных, где день
+    недели или статус были вписаны вручную прямо в название). В базе данных
+    хранится ТОЛЬКО чистое название, без этих префиксов — они добавляются
+    исключительно при отображении (см. build_display_title)."""
     if not title:
         return title
+    prefixes = list(_STATUS_TITLE_PREFIXES) + [f"{day}. " for day in WEEKDAY_NAMES_BY_INDEX]
     changed = True
     while changed:
         changed = False
-        for prefix in _STATUS_TITLE_PREFIXES:
+        for prefix in prefixes:
             if title.startswith(prefix):
                 title = title[len(prefix):]
                 changed = True
     return title
+
+
+def build_display_title(event: dict) -> str:
+    """Итоговое отображаемое название: '{Статус. }{День недели. }{Чистое название}'.
+    День недели присутствует ВСЕГДА (даже при отмене/завершении), статус — только
+    когда применим. Используется в embed, названии ветки и списке мероприятий —
+    единая точка формирования, чтобы везде было гарантированно одинаково."""
+    status = event.get('status', 'active')
+    if status == 'cancelled':
+        title_prefix = 'Отменено. '
+    elif status == 'completed':
+        title_prefix = 'Завершено. '
+    else:
+        title_prefix = ''
+    weekday_name = get_weekday_name(event['start_time'])
+    return f"{title_prefix}{weekday_name}. {clean_event_title(event['title'])}"
 
 async def build_event_embed(event_id: str) -> discord.Embed:
     events = load_json(EVENTS_FILE, {})
@@ -3164,16 +3447,13 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
 
     status = event.get('status', 'active')
-    title_prefix = ''
     embed_color = event.get('color', 15844367)
     if status == 'cancelled':
-        title_prefix = 'Отменено. '
         embed_color = discord.Color.dark_grey().value
     elif status == 'completed':
-        title_prefix = 'Завершено. '
         embed_color = discord.Color.greyple().value
 
-    embed = discord.Embed(title=title_prefix + strip_status_prefix(event['title']), description=event['description'], color=embed_color)
+    embed = discord.Embed(title=build_display_title(event), description=event['description'], color=embed_color)
 
     # === ЧИСЛО МАТЧЕЙ (строка сверху, п.7) ===
     num_games = event.get('num_games', 0)
@@ -3181,7 +3461,7 @@ async def build_event_embed(event_id: str) -> discord.Embed:
         games_word = pluralize_games(num_games)
         embed.add_field(name=es("🎮 Плановые матчи"), value=f"Запланировано: {num_games} {games_word}", inline=False)
     else:
-        embed.add_field(name=es("🎮 Матчи"), value="Матчи на мероприятии не запланированы", inline=False)
+        embed.add_field(name=es("🎮 Плановые матчи"), value="Матчи на мероприятии не запланированы", inline=False)
 
     # === ОБЯЗАТЕЛЬНОСТЬ ОТМЕТОК (п.11) ===
     if event.get('mandatory', True):
@@ -3233,7 +3513,7 @@ async def get_or_create_thread(event, event_id, title):
     try:
         channel = await client.fetch_channel(event['channel_id'])
         message = await channel.fetch_message(event['message_id'])
-        thread = await message.create_thread(name=f"💬 {title}")
+        thread = await message.create_thread(name=desired_thread_name(event))
         events = load_json(EVENTS_FILE, {})
         if event_id in events:
             events[event_id]['thread_id'] = thread.id
@@ -3269,9 +3549,10 @@ async def create_event(title, description, start_time, end_time, image_key='none
         else:
             message = await channel.send(embed=embed, view=view)
         events[event_id]['message_id'] = message.id
-        thread = await message.create_thread(name=f"💬 {title}")
+        thread = await message.create_thread(name=desired_thread_name(events[event_id]))
         events[event_id]['thread_id'] = thread.id
-        await thread.send(f"{get_army_role_mention(guild)}\n\n" + es("📢 Бойцы, запланировано мероприятие! Ждем ваших отметок!"))
+        mention_block = await get_all_active_members_mentions(datetime.now(MSK))
+        await thread.send(f"{mention_block}\n\n" + es("📢 Бойцы, запланировано мероприятие! Ждем ваших отметок!"))
         save_json(EVENTS_FILE, events)
     except Exception as e:
         print(f"❌ Ошибка публикации мероприятия: {e}")
@@ -3284,7 +3565,7 @@ async def show_event_list(interaction):
     text = es("📋 **Активные мероприятия:**\n\n")
     for event_id, event in events.items():
         start = datetime.fromtimestamp(event['start_time'], MSK)
-        text += f"**{strip_status_prefix(event['title'])}**\nID: `{event_id}`\n"
+        text += f"**{build_display_title(event)}**\nID: `{event_id}`\n"
         text += f"Дата: {start.strftime('%d.%m.%Y %H:%M')}\n"
         num_games = event.get('num_games', 0)
         if num_games and num_games > 0:
@@ -3307,7 +3588,7 @@ async def post_weekly_events():
             if event_end <= event_start:
                 event_end += timedelta(days=1)
             await create_event(
-                entry['name'], entry['description'], event_start, event_end,
+                clean_event_title(entry['name']), entry['description'], event_start, event_end,
                 image_key=entry.get('image_key', 'none'),
                 num_games=entry.get('num_games', 0),
                 mandatory=entry.get('mandatory', True)
@@ -3358,21 +3639,23 @@ async def check_event_reminders():
                     should_send = True
                     if thread:
                         if event_created_late(event):
-                            # Мероприятие создано менее чем за сутки до начала — пингуем роль целиком (п.12)
-                            mention_block = get_army_role_mention(thread.guild)
+                            # Мероприятие создано менее чем за сутки — тегаем ТОЛЬКО тех,
+                            # кто ещё не отметился (не Приду / не Не приду), и кто не в отпуске.
+                            # Роль 'Боец ArmA' целиком больше нигде не пингуется.
+                            active_members = await get_active_members(current_time)
+                            accepted_keys = set(event.get('accepted', {}).keys())
+                            declined_keys = set(event.get('declined', {}).keys())
+                            unmarked = [m for m in active_members if m not in accepted_keys and m not in declined_keys]
+                            mention_block = await build_mentions_for_nicknames(unmarked)
+                            should_send = bool(unmarked)
                         else:
                             accepted = list(event.get('accepted', {}).keys())
-                            mentions = []
-                            for nickname in accepted:
-                                member = await find_member_by_nickname(nickname)
-                                mentions.append(member.mention if member else f"**{nickname}**")
-                            mention_block = " ".join(mentions)
+                            mention_block = await build_mentions_for_nicknames(accepted)
                             should_send = bool(accepted)
                         if should_send:
                             reminder_text = (
                                 mention_block + "\n\n" +
-                                f"Бойцы, внимание! {event['title']}\n\n" +
-                                f"Мероприятие начнется <t:{start_ts}:R>! Ждем вас на сборах! Заходите в голосовой канал <#{VOICE_CHANNEL_ID}>."
+                                f"📢 Бойцы, внимание! Мероприятие начнется <t:{start_ts}:R>! Ждем вас на сборах! Заходите в голосовой канал <#{VOICE_CHANNEL_ID}>."
                             )
                             await thread.send(reminder_text)
                     event['reminder_15min_sent'] = True
@@ -3434,7 +3717,7 @@ async def update_all_templates():
         if 'created_at' not in event:
             # считаем, что старые мероприятия создавались заранее (не «поздно»)
             event['created_at'] = event.get('start_time', int(datetime.now(MSK).timestamp())) - 7 * 24 * 3600
-        cleaned_title = strip_status_prefix(event.get('title', ''))
+        cleaned_title = clean_event_title(event.get('title', ''))
         if cleaned_title != event.get('title', ''):
             event['title'] = cleaned_title
         title = event.get('title', '').lower()
