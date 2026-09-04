@@ -3065,6 +3065,13 @@ async def close_vacation(interaction, nickname, early=False, by_admin=False):
     if vacation.get('status') != 'active':
         await interaction.response.send_message(es("⚠️ Отпуск уже закрыт!"), ephemeral=True)
         return
+
+    # Сразу подтверждаем interaction, ДО любых медленных сетевых операций
+    # (поиск участника гильдии, отправка DM, редактирование embed'а) —
+    # иначе при малейшей задержке Discord API исходная interaction "протухает"
+    # за 3 секунды и финальный ответ падает с 10062 Unknown interaction.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     vacation['status'] = 'ended_early' if early else 'ended_scheduled'
     vacation['closed_at'] = datetime.now(MSK).isoformat()
     vacation['closed_by'] = interaction.user.display_name
@@ -3089,7 +3096,7 @@ async def close_vacation(interaction, nickname, early=False, by_admin=False):
             await message.edit(embed=embed, view=None)
     except Exception:
         pass
-    await interaction.response.send_message(f"✅ Отпуск {nickname} закрыт.", ephemeral=True)
+    await interaction.followup.send(f"✅ Отпуск {nickname} закрыт.", ephemeral=True)
 
 
 async def show_vacation_list(interaction):
