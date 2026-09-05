@@ -4661,8 +4661,18 @@ async def update_all_templates():
     for event_id, record in attendance.items():
         if not record.get('attendance_message_id') or not record.get('thread_id'):
             continue
+        thread = None
+        was_locked = False
         try:
             thread = await client.fetch_channel(record['thread_id'])
+            # Большинство мероприятий на этот момент уже завершены — их ветки
+            # заблокированы/заархивированы (см. П.1/П.2), а Discord отклоняет
+            # ЛЮБУЮ правку содержимого в такой ветке (50083: Thread is archived).
+            # Поэтому временно открываем ветку перед редактированием.
+            was_locked = getattr(thread, 'locked', False) or getattr(thread, 'archived', False)
+            if was_locked:
+                await unlock_and_unarchive_thread(thread)
+
             message = await thread.fetch_message(record['attendance_message_id'])
             await message.edit(content=build_attendance_report_text(record))
             att_updated += 1
@@ -4672,6 +4682,11 @@ async def update_all_templates():
         except Exception as e:
             print(f"❌ Ошибка обновления отчёта явки '{record.get('title','?')}': {e}")
             att_errors += 1
+        finally:
+            # Возвращаем ветку в закрытое состояние, если она была такой ДО правки
+            # (то есть если мероприятие завершено и должно оставаться заблокированным).
+            if thread and was_locked:
+                await lock_and_archive_thread(thread)
 
     print(f"🔄 Итог обновления шаблонов:")
     print(f"   📅 Мероприятий: обновлено {ev_updated}, ошибок {ev_errors}")
