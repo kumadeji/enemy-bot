@@ -3202,12 +3202,12 @@ def render_reminder_2days_message(mention_block: str) -> str:
 def render_reminder_15min_message(mention_block: str, event: dict) -> str:
     start_ts = int(event['start_time'])
     return (mention_block + "\n\n" +
-        es(f"📢 Бойцы, внимание!\n\n" +
+        es("📢 Бойцы, внимание!") + "\n\n" +
         f"Мероприятие начнется <t:{start_ts}:R>! Ждем вас на сборах! Заходите в голосовой канал <#{VOICE_CHANNEL_ID}>.")
 
 def render_mods_message(mention_block: str, event: dict, server_name: str, password: str) -> str:
     start_ts = int(event['start_time'])
-    text = mention_block + "\n\n" + es(f"📢 Бойцы, внимание!\n\n"
+    text = mention_block + "\n\n" + es("📢 Бойцы, внимание!") + "\n\n"
     if server_name:
         text += f"Сервер: {server_name}\n\n"
     text += f"Мероприятие начнется <t:{start_ts}:R>! Моды уже можно начать скачивать!"
