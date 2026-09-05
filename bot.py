@@ -1411,9 +1411,14 @@ LOGGING_ANCHOR_DESCRIPTION = (
 )
 
 
+BOT_STARTED_AT = datetime.now(MSK)
+
 def build_admin_panel_embed():
-    return discord.Embed(title=es("🛠️ Панель управления комбата и заместителей"),
-                          description=ADMIN_PANEL_DESCRIPTION, color=ANCHOR_EMBED_COLOR)
+    embed = discord.Embed(title=es("🛠️ Панель управления комбата и заместителей"),
+                           description=ADMIN_PANEL_DESCRIPTION, color=ANCHOR_EMBED_COLOR)
+    started_str = BOT_STARTED_AT.strftime('%d.%m.%Y %H:%M')
+    embed.set_footer(text=f"Последний запуск бота: {started_str} МСК")
+    return embed
 
 
 def build_notifications_anchor_embed():
