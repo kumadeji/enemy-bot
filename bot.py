@@ -26,8 +26,13 @@ from collections import deque as _deque_early
 # во view/modal) дублируются в специальную ветку — LOG_THREAD_ID. Публикация
 # идёт пачками раз в 15 секунд, чтобы не спамить и не упираться в rate limit.
 
-LOG_THREAD_ID = 1545781439235100793
 LOG_FORWARD_LEVEL = logging.INFO  # при желании поднять до logging.WARNING, если шумно
+# LOG_THREAD_ID больше НЕ используется как фиксированная константа — теперь
+# ветка логов находится динамически через якорное сообщение "🔧 Логирование"
+# в ADMIN_CHANNEL_ID (см. ensure_admin_channel_anchors). Значение ниже — просто
+# запасной ID на случай самого первого запуска ДО того, как якоря созданы
+# (форвардер логов стартует раньше, чем on_ready успевает создать якоря).
+_FALLBACK_LOG_THREAD_ID = None
 
 _original_print = print  # сохраняем оригинальный print ДО подмены
 _log_forward_buffer = _deque_early(maxlen=2000)
@@ -77,8 +82,10 @@ _log_forward_thread_cache = None
 
 async def flush_log_buffer_to_discord():
     """Периодически (см. job в on_ready) отправляет накопленные строки логов
-    пачками в LOG_THREAD_ID. Использует _original_print для своих ошибок —
-    чтобы не зациклиться на пересылке сообщений о сбое самой пересылки."""
+    пачками в ветку якорного сообщения '🔧 Логирование' (ADMIN_CHANNEL_ID).
+    До того, как якорь создан (самое начало запуска бота), строки просто
+    копятся в буфере — ничего не теряется, они улетят при первом же
+    успешном определении ветки."""
     global _log_forward_thread_cache
     with _log_forward_lock:
         if not _log_forward_buffer:
@@ -89,7 +96,15 @@ async def flush_log_buffer_to_discord():
         return
     try:
         if _log_forward_thread_cache is None:
-            _log_forward_thread_cache = await client.fetch_channel(LOG_THREAD_ID)
+            thread_id = await get_logging_thread_id()
+            if not thread_id:
+                # Якорь ещё не создан (например, это самое начало запуска) —
+                # возвращаем строки обратно в буфер, попробуем в следующий раз.
+                with _log_forward_lock:
+                    for line in reversed(lines):
+                        _log_forward_buffer.appendleft(line)
+                return
+            _log_forward_thread_cache = await client.fetch_channel(thread_id)
         thread = _log_forward_thread_cache
         text = "\n".join(lines)
         chunk_size = 1900
@@ -308,7 +323,6 @@ EVENTS_CHANNEL_ID = 1311705378140196926
 VACATION_CHANNEL_ID = 1284905224099598407
 ADMIN_CHANNEL_ID = 1536632416511332362
 ANKETA_CHANNEL_ID = 1366767440939454504
-CHANGELOG_NOTIFICATIONS_CHANNEL_ID = 1536632416511332362
 
 # ============== ЕДИНЫЙ РЕЕСТР РОЛЕЙ (стандартизация) ==============
 # Роли с фиксированным ID собраны здесь в одном месте — это единственный
@@ -402,7 +416,7 @@ WEEKLY_EVENTS_FILE = 'weekly_events.json'
 LAST_SCHEDULED_CHECK_FILE = 'last_scheduled_check.json'
 VOICE_ROOMS_FILE = 'voice_rooms.json'
 CHECK_MESSAGES_FILE = 'check_messages.json'
-
+ADMIN_ANCHORS_FILE = 'admin_anchors.json'
 
 # ============== FIREBASE ==============
 
@@ -436,6 +450,7 @@ FIREBASE_DATA_MAP = {
     VOICE_ROOMS_FILE: 'voiceRooms',
     LAST_SCHEDULED_CHECK_FILE: 'lastScheduledCheck',
     CHECK_MESSAGES_FILE: 'checkMessages',
+    ADMIN_ANCHORS_FILE: 'adminAnchors',
 }
 
 
@@ -1370,6 +1385,116 @@ async def update_vacation_role(member, has_vacation: bool):
 
 # ============== UI КОМПОНЕНТЫ ==============
 
+# ============== ЯКОРНЫЕ СООБЩЕНИЯ АДМИН-КАНАЛА ==============
+# Три постоянных сообщения в ADMIN_CHANNEL_ID: панель управления, уведомления
+# (с сайта) и логирование. У двух последних есть собственные ветки — именно
+# в них публикуются новые уведомления/логи. ID всех трёх сообщений и обеих
+# веток хранятся в ADMIN_ANCHORS_FILE, чтобы бот находил их же при рестарте,
+# а не плодил дубликаты.
+
+ANCHOR_EMBED_COLOR = discord.Color.blue()
+
+ADMIN_PANEL_DESCRIPTION = (
+    "Здесь вы можете управлять всеми функциями бота через кнопки. "
+    "Функции бота разделены по строчкам:\n\n"
+    "1. Единоразовые мероприятия \n2. Еженедельные мероприятия \n3. Сообщения \n4. Отпуска \n5. Утилиты\n"
+)
+
+NOTIFICATIONS_ANCHOR_DESCRIPTION = (
+    "Здесь в ветке публикуются все уведомления с сайта для игроков — "
+    "изменения в профилях бойцов и системные уведомления (например, о зачтённых отыгрышах)."
+)
+
+LOGGING_ANCHOR_DESCRIPTION = (
+    "Здесь в ветке публикуются все логи бота — для диагностики проблем без необходимости "
+    "подключаться к серверу напрямую."
+)
+
+
+def build_admin_panel_embed():
+    return discord.Embed(title=es("🛠️ Панель управления комбата и заместителей"),
+                          description=ADMIN_PANEL_DESCRIPTION, color=ANCHOR_EMBED_COLOR)
+
+
+def build_notifications_anchor_embed():
+    return discord.Embed(title=es("ℹ️ Уведомления"),
+                          description=NOTIFICATIONS_ANCHOR_DESCRIPTION, color=ANCHOR_EMBED_COLOR)
+
+
+def build_logging_anchor_embed():
+    return discord.Embed(title=es("🔧 Логирование"),
+                          description=LOGGING_ANCHOR_DESCRIPTION, color=ANCHOR_EMBED_COLOR)
+
+
+async def _find_or_create_anchor(channel, title: str, embed_builder, thread_name: str = None, view=None):
+    """Ищет среди последних сообщений бота в канале embed с данным title.
+    Если не находит — создаёт новое сообщение (+ ветку, если thread_name задан).
+    Возвращает (message, thread_or_None)."""
+    async for message in channel.history(limit=50):
+        if message.author.id != client.user.id:
+            continue
+        if message.embeds and message.embeds[0].title == title:
+            thread = None
+            if thread_name and message.thread:
+                thread = message.thread
+            elif thread_name:
+                try:
+                    thread = await message.create_thread(name=thread_name)
+                except Exception:
+                    thread = None
+            return message, thread
+
+    message = await channel.send(embed=embed_builder(), view=view)
+    thread = None
+    if thread_name:
+        try:
+            thread = await message.create_thread(name=thread_name)
+        except Exception as e:
+            print(f"⚠️ Не удалось создать ветку '{thread_name}': {e}")
+    return message, thread
+
+
+async def ensure_admin_channel_anchors():
+    """Находит (или создаёт при самом первом запуске) три якорных сообщения
+    в ADMIN_CHANNEL_ID. Панель управления ОБНОВЛЯЕТСЯ при каждом старте бота
+    (актуализация embed+view); уведомления/логирование — только создаются
+    один раз, их оформление актуализируется через синхронизацию шаблонов."""
+    channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
+    anchors = load_json(ADMIN_ANCHORS_FILE, {})
+
+    panel_msg, _ = await _find_or_create_anchor(channel, es("🛠️ Панель управления комбата и заместителей"),
+                                                 build_admin_panel_embed, thread_name=None, view=AdminMainMenuView())
+    try:
+        await panel_msg.edit(embed=build_admin_panel_embed(), view=AdminMainMenuView())
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить панель управления: {e}")
+    anchors['panel_message_id'] = panel_msg.id
+
+    notif_msg, notif_thread = await _find_or_create_anchor(channel, es("ℹ️ Уведомления"),
+                                                            build_notifications_anchor_embed, thread_name="ℹ️ Уведомления")
+    anchors['notifications_message_id'] = notif_msg.id
+    if notif_thread:
+        anchors['notifications_thread_id'] = notif_thread.id
+
+    log_msg, log_thread = await _find_or_create_anchor(channel, es("🔧 Логирование"),
+                                                         build_logging_anchor_embed, thread_name="🔧 Логирование")
+    anchors['logging_message_id'] = log_msg.id
+    if log_thread:
+        anchors['logging_thread_id'] = log_thread.id
+
+    save_json(ADMIN_ANCHORS_FILE, anchors)
+    print(f"✅ Якорные сообщения админ-канала готовы (панель, уведомления, логирование)")
+
+
+async def get_notifications_thread_id():
+    anchors = load_json(ADMIN_ANCHORS_FILE, {})
+    return anchors.get('notifications_thread_id')
+
+
+async def get_logging_thread_id():
+    anchors = load_json(ADMIN_ANCHORS_FILE, {})
+    return anchors.get('logging_thread_id')
+
 class VacationModal(discord.ui.Modal, title=es("🏖️ Оформление отпуска")):
     start_date = discord.ui.TextInput(label="Дата начала (ДД.ММ.ГГГГ)", placeholder="15.08.2026", required=True, max_length=10)
     end_date = discord.ui.TextInput(label="Дата окончания (ДД.ММ.ГГГГ)", placeholder="22.08.2026", required=True, max_length=10)
@@ -1856,12 +1981,13 @@ class AdminMainMenuView(discord.ui.View):
                "Это может занять несколько минут."),
             ephemeral=True
         )
-        ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors, tn_fixed, tm_fixed, tl_fixed = await update_all_templates()
+        ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors, tn_fixed, tm_fixed, tl_fixed, anchors_fixed = await update_all_templates()
         await interaction.followup.send(
             es(f"📅 Мероприятий обновлено: **{ev_updated}** (ошибок: {ev_errors})\n"
                f"🏖️ Отпусков обновлено: **{vac_updated}** (ошибок: {vac_errors})\n"
                f"🏆 Отчётов о явке обновлено: **{att_updated}** (ошибок: {att_errors})\n"
-               f"💬 Названий веток исправлено: **{tn_fixed}**, сообщений в ветках: **{tm_fixed}**, блокировок: **{tl_fixed}**"),
+               f"💬 Названий веток исправлено: **{tn_fixed}**, сообщений в ветках: **{tm_fixed}**, блокировок: **{tl_fixed}**\n"
+               f"🛠️ Якорных сообщений обновлено: **{anchors_fixed}**"),
             ephemeral=True
         )
         
@@ -2395,9 +2521,11 @@ async def handle_new_profile_watch(doc_id, data):
 
 async def handle_new_changelog_watch(doc_id, data):
     try:
-        text = await build_changelog_message(doc_id, data)
-        channel = await client.fetch_channel(CHANGELOG_NOTIFICATIONS_CHANNEL_ID)
-        await send_chunked(channel, text)
+        thread_id = await get_notifications_thread_id()
+        if thread_id:
+            thread = await client.fetch_channel(thread_id)
+            text = await build_changelog_message(doc_id, data)
+            await send_chunked(thread, text)
     except Exception as e:
         print(f"❌ Ошибка публикации записи changeLog ({doc_id}): {e}")
     finally:
@@ -2406,9 +2534,11 @@ async def handle_new_changelog_watch(doc_id, data):
 
 async def handle_new_notification_watch(doc_id, data):
     try:
-        text = await build_notification_message(data.get('uid', ''), data)
-        channel = await client.fetch_channel(CHANGELOG_NOTIFICATIONS_CHANNEL_ID)
-        await send_chunked(channel, text)
+        thread_id = await get_notifications_thread_id()
+        if thread_id:
+            thread = await client.fetch_channel(thread_id)
+            text = await build_notification_message(data.get('uid', ''), data)
+            await send_chunked(thread, text)
     except Exception as e:
         print(f"❌ Ошибка публикации уведомления ({doc_id}): {e}")
     finally:
@@ -3072,12 +3202,12 @@ def render_reminder_2days_message(mention_block: str) -> str:
 def render_reminder_15min_message(mention_block: str, event: dict) -> str:
     start_ts = int(event['start_time'])
     return (mention_block + "\n\n" +
-        es(f"📢 Бойцы, внимание! {build_display_title(event)}") + "\n\n" +
+        es(f"📢 Бойцы, внимание!\n\n" +
         f"Мероприятие начнется <t:{start_ts}:R>! Ждем вас на сборах! Заходите в голосовой канал <#{VOICE_CHANNEL_ID}>.")
 
 def render_mods_message(mention_block: str, event: dict, server_name: str, password: str) -> str:
     start_ts = int(event['start_time'])
-    text = mention_block + "\n\n" + es(f"📢 Бойцы, внимание! {build_display_title(event)}") + "\n\n"
+    text = mention_block + "\n\n" + es(f"📢 Бойцы, внимание!\n\n"
     if server_name:
         text += f"Сервер: {server_name}\n\n"
     text += f"Мероприятие начнется <t:{start_ts}:R>! Моды уже можно начать скачивать!"
@@ -4237,7 +4367,39 @@ async def update_all_templates():
     - все сообщения мероприятий
     - все сообщения отпусков (и активные, и завершённые, и отклонённые)
     - правила отпусков в канале отпусков
+    - оформление трёх якорных сообщений админ-канала
     """
+    anchors_fixed = 0
+    try:
+        anchors = load_json(ADMIN_ANCHORS_FILE, {})
+        admin_channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
+
+        if anchors.get('panel_message_id'):
+            try:
+                msg = await admin_channel.fetch_message(anchors['panel_message_id'])
+                await msg.edit(embed=build_admin_panel_embed(), view=AdminMainMenuView())
+                anchors_fixed += 1
+            except Exception as e:
+                print(f"⚠️ Не удалось обновить якорь 'Панель управления': {e}")
+
+        if anchors.get('notifications_message_id'):
+            try:
+                msg = await admin_channel.fetch_message(anchors['notifications_message_id'])
+                await msg.edit(embed=build_notifications_anchor_embed())
+                anchors_fixed += 1
+            except Exception as e:
+                print(f"⚠️ Не удалось обновить якорь 'Уведомления': {e}")
+
+        if anchors.get('logging_message_id'):
+            try:
+                msg = await admin_channel.fetch_message(anchors['logging_message_id'])
+                await msg.edit(embed=build_logging_anchor_embed())
+                anchors_fixed += 1
+            except Exception as e:
+                print(f"⚠️ Не удалось обновить якорь 'Логирование': {e}")
+    except Exception as e:
+        print(f"❌ Ошибка синхронизации якорных сообщений: {e}")
+
     events = load_json(EVENTS_FILE, {})
     vacations = load_json(VACATIONS_FILE, {})
     
@@ -4514,9 +4676,9 @@ async def update_all_templates():
     print(f"   🏖️ Отпусков: обновлено {vac_updated}, ошибок {vac_errors}")
     print(f"   🏆 Отчётов о явке: обновлено {att_updated}, ошибок {att_errors}")
     print(f"   💬 Названий веток исправлено: {thread_names_fixed}, сообщений в ветках обновлено: {thread_messages_fixed}, блокировок исправлено: {thread_locks_fixed}")
+    print(f"   🛠️ Якорных сообщений обновлено: {anchors_fixed}")
     
-    return ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors, thread_names_fixed, thread_messages_fixed, thread_locks_fixed
-
+    return ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors, thread_names_fixed, thread_messages_fixed, thread_locks_fixed, anchors_fixed
 
 
 # ============== ПОСТОЯННАЯ ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ==============
@@ -4940,21 +5102,9 @@ async def on_ready():
     await setup_firestore_watchers()
 
     try:
-        admin_channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
-        try:
-            await admin_channel.purge(limit=None, check=lambda m: m.author == client.user)
-        except Exception:
-            pass
-        embed = discord.Embed(
-            title=es("🛠️ Панель управления комбата и заместителей"),
-            description=("Здесь вы можете управлять всеми функциями бота через кнопки. "
-                        "Функции бота разделены по строчкам:\n\n"
-                        "1. Единоразовые мероприятия \n2. Еженедельные мероприятия \n3. Сообщения \n4. Отпуска \n5. Утилиты\n"),
-            color=discord.Color.blue()
-        )
-        await admin_channel.send(embed=embed, view=AdminMainMenuView())
+        await ensure_admin_channel_anchors()
     except Exception as e:
-        print(f"⚠️ Не удалось опубликовать админ-меню: {e}")
+        print(f"⚠️ Не удалось инициализировать якорные сообщения админ-канала: {e}")
 
 
 @client.event
