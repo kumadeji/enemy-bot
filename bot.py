@@ -1903,7 +1903,7 @@ class WeeklyEventManageActionsView(discord.ui.View):
             await interaction.response.send_message(es("❌ Не найдено!"), ephemeral=True)
 
 
-async def _publish_all_existing_anketas_sync():
+def _publish_all_existing_anketas_sync():
     """Синхронно (в executor) читает ВСЕ документы profiles, сортирует по
     дате регистрации (createdAt) по возрастанию (сначала самые старые)."""
     docs = fs_db.collection('profiles').stream()
