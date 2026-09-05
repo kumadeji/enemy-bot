@@ -16,7 +16,92 @@ if sys.platform == 'win32':
     except Exception:
         pass
 
+import logging
+import threading as _threading_early
+from collections import deque as _deque_early
+
+# ============== ПЕРЕСЫЛКА ЛОГОВ БОТА В СПЕЦИАЛЬНУЮ ВЕТКУ DISCORD ==============
+# Все print()-сообщения бота (✅/❌/⚠️ и т.д.) и системные логи discord.py
+# (подключения/переподключения к gateway, rate limit, необработанные ошибки
+# во view/modal) дублируются в специальную ветку — LOG_THREAD_ID. Публикация
+# идёт пачками раз в 15 секунд, чтобы не спамить и не упираться в rate limit.
+
+LOG_THREAD_ID = 1545781439235100793
+LOG_FORWARD_LEVEL = logging.INFO  # при желании поднять до logging.WARNING, если шумно
+
+_original_print = print  # сохраняем оригинальный print ДО подмены
+_log_forward_buffer = _deque_early(maxlen=2000)
+_log_forward_lock = _threading_early.Lock()
+
+
+def _enqueue_log_line(line: str):
+    with _log_forward_lock:
+        _log_forward_buffer.append(line)
+
+
+def print(*args, **kwargs):
+    """Подменённый print(): работает как обычно + дублирует строку в очередь
+    на пересылку в Discord-ветку (см. flush_log_buffer_to_discord)."""
+    sep = kwargs.get('sep', ' ')
+    try:
+        _enqueue_log_line(sep.join(str(a) for a in args))
+    except Exception:
+        pass
+    _original_print(*args, **kwargs)
+
+
+class _DiscordLogHandler(logging.Handler):
+    """Перехватывает системные логи discord.py (discord.client, discord.gateway,
+    discord.http, discord.ui.view и т.д.) — то есть подключения, rate limit
+    и необработанные ошибки во view/modal, которые НЕ идут через наш print()."""
+    def emit(self, record):
+        try:
+            _enqueue_log_line(self.format(record))
+        except Exception:
+            pass
+
+
+def _setup_discord_log_forwarding():
+    handler = _DiscordLogHandler()
+    handler.setLevel(LOG_FORWARD_LEVEL)
+    handler.setFormatter(logging.Formatter(
+        '[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
+    ))
+    logging.getLogger('discord').addHandler(handler)
+
+
+_setup_discord_log_forwarding()
+
+_log_forward_thread_cache = None
+
+
+async def flush_log_buffer_to_discord():
+    """Периодически (см. job в on_ready) отправляет накопленные строки логов
+    пачками в LOG_THREAD_ID. Использует _original_print для своих ошибок —
+    чтобы не зациклиться на пересылке сообщений о сбое самой пересылки."""
+    global _log_forward_thread_cache
+    with _log_forward_lock:
+        if not _log_forward_buffer:
+            return
+        lines = list(_log_forward_buffer)
+        _log_forward_buffer.clear()
+    if not lines:
+        return
+    try:
+        if _log_forward_thread_cache is None:
+            _log_forward_thread_cache = await client.fetch_channel(LOG_THREAD_ID)
+        thread = _log_forward_thread_cache
+        text = "\n".join(lines)
+        chunk_size = 1900
+        for i in range(0, len(text), chunk_size):
+            chunk = text[i:i + chunk_size]
+            await thread.send(f"```\n{chunk}\n```")
+            await asyncio.sleep(0.5)
+    except Exception as e:
+        _original_print(f"⚠️ Не удалось отправить логи в Discord-ветку: {e}")
+
 import gspread
+
 import re
 import json
 import uuid
@@ -237,7 +322,30 @@ ROLE_IDS = {
     'zam_kombat_squad': 1503144759084974150,
     'boets_arma': 1284456321005129778,
     'otpusk': 1536500577553481768,
+    'zapas_arma': 1496435854531366913,
+    'clan_enemy': 1048133924645240903,
+    'lichnyj_sostav_arma': 1449782732480577696,
+    'minomyotchik_arma': 1444670257565405337,
+    'btv_arma': 1444670373768593509,
+    'pilot_arma': 1444670451409490090,
+    'vzvozdnyj_ks_arma': 1448035996653588614,
+    'bpla_pilot_arma': 1474032938847834306,
+    'ko_arma': 1528120615821905960,
 }
+
+EXPULSION_ROLE_KEYS = [
+    'zapas_arma', 'boets_arma', 'clan_enemy', 'lichnyj_sostav_arma',
+    'minomyotchik_arma', 'btv_arma', 'pilot_arma', 'vzvozdnyj_ks_arma',
+    'bpla_pilot_arma', 'ko_arma',
+]
+
+# ============== АВТОМАТИЧЕСКИЕ ЗАМЕЧАНИЯ/ВЫГОВОРЫ ЗА НЕАКТИВНОСТЬ ==============
+
+DISCIPLINE_CUTOFF = MSK.localize(datetime(2026, 9, 7, 0, 0, 0))
+MAX_ACTIVE_WARNINGS = 3
+MAX_ACTIVE_REPRIMANDS = 3
+WARNING_DURATION = timedelta(days=30)
+REPRIMAND_DURATION = timedelta(days=90)
 
 
 def get_role_mention_by_id(guild, role_key: str):
@@ -291,6 +399,8 @@ ATTENDANCE_FILE = 'attendance_data.json'
 WEEKLY_EVENTS_FILE = 'weekly_events.json'
 LAST_SCHEDULED_CHECK_FILE = 'last_scheduled_check.json'
 VOICE_ROOMS_FILE = 'voice_rooms.json'
+CHECK_MESSAGES_FILE = 'check_messages.json'
+
 
 # ============== FIREBASE ==============
 
@@ -323,7 +433,9 @@ FIREBASE_DATA_MAP = {
     WEEKLY_EVENTS_FILE: 'weeklyEvents',
     VOICE_ROOMS_FILE: 'voiceRooms',
     LAST_SCHEDULED_CHECK_FILE: 'lastScheduledCheck',
+    CHECK_MESSAGES_FILE: 'checkMessages',
 }
+
 
 # ============== ЕЖЕНЕДЕЛЬНЫЕ МЕРОПРИЯТИЯ: СПРАВОЧНИКИ ==============
 
@@ -467,6 +579,24 @@ def format_vacation_period(start_iso: str, end_iso: str) -> str:
 CLAN_MEMBERS_CACHE = []
 CLAN_MEMBERS_CACHE_TIME = None
 CLAN_MEMBERS_CACHE_TTL = 3600
+CLAN_MEMBER_CREATED_AT_CACHE = {}
+
+
+def get_member_created_at(nickname: str):
+    return CLAN_MEMBER_CREATED_AT_CACHE.get(nickname)
+
+
+def invalidate_clan_members_cache():
+    global CLAN_MEMBERS_CACHE_TIME
+    CLAN_MEMBERS_CACHE_TIME = None
+
+
+def _parse_firestore_dt(value):
+    """Приводит значение Firestore Timestamp к datetime с tzinfo, либо None."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else pytz.UTC.localize(value)
+    return None
+
 _ROSTER_UNAVAILABLE_WARNED = False
 
 
@@ -633,31 +763,34 @@ async def get_sheet_data_with_colors(sheet, range_name):
     return []
 
 def _firebase_load_roster_sync():
-    """Синхронное чтение всех callsign'ов из rosterPublic (выполняется в EXECUTOR).
-    В список попадают ТОЛЬКО игроки с composition 'Личный состав' или 'Запас'
-    по Arma Reforger (см. ACTIVE_CLAN_COMPOSITIONS) — это единственные составы,
-    которые считаются действующими игроками клана. Остальные (например, те,
-    кто ещё проходит отбор) не должны отображаться в списке 'Не отметились',
-    не должны иметь возможность отмечаться на мероприятиях и не считаются
-    частью клана ботом ни в каком другом месте кода — фильтрация именно здесь
-    автоматически распространяется на весь остальной функционал бота,
-    так как все проверки принадлежности к клану идут через эту функцию."""
-    docs = fs_db.collection(FIREBASE_ROSTER_COLLECTION).stream()
+    """Синхронное чтение состава клана из коллекции 'profiles' (Admin SDK
+    обходит правила безопасности — читать всю коллекцию для бота безопасно,
+    хотя клиентским приложениям сайта это запрещено правилами Firestore).
+    Возвращает (members, created_at_map) — members содержит ТОЛЬКО игроков
+    с composition 'Личный состав'/'Запас', created_at_map — дату регистрации
+    ВСЕХ найденных профилей (нужна для фильтрации 'Не отметились' у старых
+    мероприятий, см. get_active_members)."""
+    docs = fs_db.collection('profiles').stream()
     members = []
+    created_at_map = {}
     skipped = 0
     for doc in docs:
         data = doc.to_dict() or {}
         callsign = (data.get('callsign') or '').strip()
         if not callsign:
             continue
+        nickname = f"{CLAN_TAG}{callsign}"
+        created_at_dt = _parse_firestore_dt(data.get('createdAt'))
+        if created_at_dt:
+            created_at_map[nickname] = created_at_dt
         composition = ((data.get('gameRoles') or {}).get(CLAN_ROSTER_GAME) or {}).get('composition', '')
         if composition not in ACTIVE_CLAN_COMPOSITIONS:
             skipped += 1
             continue
-        members.append(f"{CLAN_TAG}{callsign}")
+        members.append(nickname)
     if skipped:
         print(f"ℹ️ Пропущено {skipped} профилей из-за неподходящего состава (не 'Личный состав'/'Запас')")
-    return members
+    return members, created_at_map
 
 
 async def load_clan_members_from_firebase():
@@ -678,9 +811,11 @@ async def load_clan_members_from_firebase():
         return CLAN_MEMBERS_CACHE
     try:
         loop = asyncio.get_event_loop()
-        members = await loop.run_in_executor(EXECUTOR, _firebase_load_roster_sync)
+        members, created_at_map = await loop.run_in_executor(EXECUTOR, _firebase_load_roster_sync)
         CLAN_MEMBERS_CACHE = members
         CLAN_MEMBERS_CACHE_TIME = current_time
+        global CLAN_MEMBER_CREATED_AT_CACHE
+        CLAN_MEMBER_CREATED_AT_CACHE = created_at_map
         print(f"✅ Загружено {len(members)} участников клана из Firebase")
         return members
     except Exception as e:
@@ -795,24 +930,27 @@ async def find_member_by_nickname(nickname: str):
         return None
 
 
-async def send_chunked(thread, text, user_name=""):
+async def send_chunked(thread, text, user_name="") -> list:
+    """Возвращает список ID отправленных сообщений (нужно для последующего удаления)."""
+    ids = []
     if not text:
-        return
+        return ids
     chunk_size = 1800
     if len(text) <= chunk_size:
-        await thread.send(text)
+        msg = await thread.send(text)
+        ids.append(msg.id)
         await asyncio.sleep(0.5)
-        return
-    chunks = []
-    for i in range(0, len(text), chunk_size):
-        chunks.append(text[i:i + chunk_size])
+        return ids
+    chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
     for chunk in chunks:
         try:
-            await thread.send(chunk)
+            msg = await thread.send(chunk)
+            ids.append(msg.id)
             await asyncio.sleep(0.5)
         except Exception as e:
             print(f"Ошибка при отправке части: {e}")
             raise
+    return ids
 
 
 # ============== ПОСТРОЕНИЕ ТЕКСТОВ ==============
@@ -859,9 +997,22 @@ async def check_spreadsheet():
         return
     async with check_lock:
         try:
+            thread = await client.fetch_channel(THREAD_ID)
+
+            # Удаляем сообщения ПРЕДЫДУЩЕЙ проверки перед публикацией новой —
+            # иначе в ветке копятся устаревшие отчёты о проблемах, которые
+            # бойцы могли уже исправить.
+            prev = load_json(CHECK_MESSAGES_FILE, {})
+            for msg_id in prev.get('message_ids', []):
+                try:
+                    old_msg = await thread.fetch_message(msg_id)
+                    await old_msg.delete()
+                except Exception:
+                    pass
+            save_json(CHECK_MESSAGES_FILE, {'message_ids': [], 'thread_id': THREAD_ID})
+
             if not gc:
                 return
-            # Выполняем синхронный gc.open_by_url в отдельном потоке
             loop = asyncio.get_event_loop()
             spreadsheet = await loop.run_in_executor(EXECUTOR, gc.open_by_url, SPREADSHEET_URL)
             sheet = spreadsheet.worksheet(SHEET_NAME)
@@ -871,7 +1022,6 @@ async def check_spreadsheet():
             headers = [cell['value'] for cell in data_with_colors[0]]
             rows = data_with_colors[1:]
             current_time = datetime.now(MSK)
-            thread = await client.fetch_channel(THREAD_ID)
             user_issues = {}
             users_not_found = []
             for row in rows:
@@ -900,16 +1050,20 @@ async def check_spreadsheet():
                         user_issues[discord_user] = issues
                     else:
                         users_not_found.append(nickname)
+
+            new_message_ids = []
             if user_issues or users_not_found:
                 intro = build_intro_message(current_time)
                 if len(intro) <= EXPECTED_INTRO_MAX_LEN:
-                    await send_chunked(thread, intro, "вводное сообщение")
+                    new_message_ids += await send_chunked(thread, intro, "вводное сообщение")
                 for discord_user, issues in user_issues.items():
                     user_msg = build_user_message(discord_user, issues)
-                    await send_chunked(thread, user_msg, discord_user.display_name)
+                    new_message_ids += await send_chunked(thread, user_msg, discord_user.display_name)
                 if users_not_found:
                     not_found_msg = ("\n\n" + es("⚠️ **Не удалось найти в Discord:**\n") + ", ".join(users_not_found))
-                    await send_chunked(thread, not_found_msg, "список ненайденных")
+                    new_message_ids += await send_chunked(thread, not_found_msg, "список ненайденных")
+
+            save_json(CHECK_MESSAGES_FILE, {'message_ids': new_message_ids, 'thread_id': THREAD_ID})
         except Exception as e:
             print(f"Ошибка при проверке: {e}")
 
@@ -1151,9 +1305,18 @@ def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
     return False
 
 
-async def get_active_members(current_date: datetime) -> list:
+async def get_active_members(current_date: datetime, registered_before: datetime = None) -> list:
+    """Список активных (не в отпуске) бойцов. Если передан registered_before —
+    дополнительно исключает бойцов, ещё не зарегистрированных на сайте на этот
+    момент (используется для 'Не отметились' у СТАРЫХ мероприятий)."""
     members = await load_clan_members_from_firebase()
-    return [m for m in members if not is_on_vacation_dynamic(m, current_date)]
+    filtered = [m for m in members if not is_on_vacation_dynamic(m, current_date)]
+    if registered_before is not None:
+        filtered = [
+            m for m in filtered
+            if get_member_created_at(m) is None or get_member_created_at(m) <= registered_before
+        ]
+    return filtered
 
 
 async def build_mentions_for_nicknames(nicknames: list) -> str:
@@ -1691,10 +1854,11 @@ class AdminMainMenuView(discord.ui.View):
                "Это может занять несколько секунд."),
             ephemeral=True
         )
-        ev_updated, ev_errors, vac_updated, vac_errors = await update_all_templates()
+        ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors = await update_all_templates()
         await interaction.followup.send(
             es(f"📅 Мероприятий обновлено: **{ev_updated}** (ошибок: {ev_errors})\n"
-               f"🏖️ Отпусков обновлено: **{vac_updated}** (ошибок: {vac_errors})"),
+               f"🏖️ Отпусков обновлено: **{vac_updated}** (ошибок: {vac_errors})\n"
+               f"🏆 Отчётов о явке обновлено: **{att_updated}** (ошибок: {att_errors})"),
             ephemeral=True
         )
 
@@ -1800,7 +1964,7 @@ async def refresh_event_message(event_id):
         channel = await client.fetch_channel(event['channel_id'])
         message = await channel.fetch_message(event['message_id'])
         embed = await build_event_embed(event_id)
-        view = build_event_view(event)
+        view = build_event_view(event, event_id)
         filename, path = get_image_info(event.get('image_key', 'none'))
         if filename and path:
             await message.edit(embed=embed, view=view, attachments=[discord.File(path, filename=filename)])
@@ -2008,8 +2172,12 @@ def make_mods_button():
     return b
 
 
-def build_event_view(event: dict) -> discord.ui.View:
-    """Строит нужный набор кнопок в зависимости от текущего статуса мероприятия."""
+def build_event_view(event: dict, event_id: str = None) -> discord.ui.View:
+    """Строит нужный набор кнопок в зависимости от текущего статуса мероприятия.
+    Кнопка '📝 Явка' ВСЕГДА доступна (даже если отчёт уже подан) — повторное
+    заполнение позволяет исправить данные; пересчёт gameStats и очереди
+    на командование корректно учитывает только изменения (см. finalize_attendance),
+    а старое сообщение отчёта удаляется перед публикацией нового."""
     status = event.get('status', 'active')
     view = discord.ui.View(timeout=None)
     if status == 'active':
@@ -2568,8 +2736,273 @@ async def apply_attendance_to_gamestats(wizard, old_record=None):
         if message:
             await create_gamestats_notification(uid, message)
 
+def _is_active_entry(entry, now_ms):
+    return entry.get('expiresAtMs', 0) > now_ms
+
+
+def _build_warning_reason(number: int) -> str:
+    if number <= 1:
+        return ("Неактивность. Замечание #1. Боец не отметился на мероприятии с обязательной "
+                "записью и не находился в отпуске. Нарушение п. 9 Устава")
+    return (f"Неактивность. Замечание #{number}. Боец повторно не отметился на мероприятии с обязательной "
+            "записью для всех бойцов и не находился в отпуске. Нарушение п. 9 Устава")
+
+
+def _build_reprimand_reason(number: int) -> str:
+    return (f"Неактивность. Выговор #{number}. Боец игнорирует неоднократные замечания о необходимости "
+            "отметок на мероприятия с обязательной записью и не находится в отпуске. Нарушение п. 9 Устава")
+
+
+def _build_disc_entry(entry_type: str, reason: str, duration: timedelta, now_ms: int) -> dict:
+    return {
+        'id': f"{now_ms}-{uuid.uuid4().hex[:6]}",
+        'type': entry_type,
+        'reason': reason,
+        'scope': GAMESTATS_GAME_NAME,
+        'issuedAtMs': now_ms,
+        'expiresAtMs': now_ms + int(duration.total_seconds() * 1000),
+        'source': 'auto_inactivity',
+    }
+
+
+def _apply_disciplinary_action_sync(uid):
+    """Транзакционно выносит замечание ИЛИ выговор (в зависимости от того,
+    что ещё не исчерпано из максимума 3), учитывая ВСЕ действующие записи
+    (не только автоматические) при подсчёте лимита. Нумерация #1/#2/#3 в
+    тексте — только по автоматическим записям причины 'Неактивность'.
+    При достижении 3 действующих выговоров (любого происхождения) —
+    переводит в 'Отставка'/'Дезертир' и в profiles, и в rosterPublic."""
+    profile_ref = fs_db.collection('profiles').document(uid)
+    roster_ref = fs_db.collection('rosterPublic').document(uid)
+    transaction = fs_db.transaction()
+
+    @firestore.transactional
+    def _txn(transaction):
+        snap = profile_ref.get(transaction=transaction)
+        if not snap.exists:
+            return {'action': None}
+        data = snap.to_dict() or {}
+        game_da = data.get('gameDisciplinaryActions', {}) or {}
+        actions = list(game_da.get(GAMESTATS_GAME_NAME, []) or [])
+        now_ms = int(datetime.now(MSK).timestamp() * 1000)
+
+        def active(a, t):
+            return _is_active_entry(a, now_ms) and a.get('type') == t
+
+        active_warnings = [a for a in actions if active(a, 'Замечание')]
+        active_reprimands = [a for a in actions if active(a, 'Выговор')]
+
+        result = {'action': None, 'expelled': False}
+
+        if len(active_warnings) < MAX_ACTIVE_WARNINGS:
+            number = len([a for a in active_warnings if a.get('source') == 'auto_inactivity']) + 1
+            reason = _build_warning_reason(number)
+            actions.append(_build_disc_entry('Замечание', reason, WARNING_DURATION, now_ms))
+            result['action'] = 'warning'
+            result['reason'] = reason
+        elif len(active_reprimands) < MAX_ACTIVE_REPRIMANDS:
+            number = len([a for a in active_reprimands if a.get('source') == 'auto_inactivity']) + 1
+            reason = _build_reprimand_reason(number)
+            actions.append(_build_disc_entry('Выговор', reason, REPRIMAND_DURATION, now_ms))
+            result['action'] = 'reprimand'
+            result['reason'] = reason
+        # иначе: уже максимум и того, и другого — ничего не добавляем,
+        # но ниже всё равно проверим порог исключения (например, если 3
+        # выговора набрались ранее вручную, без участия бота).
+
+        current_composition = ((data.get('gameRoles') or {}).get(GAMESTATS_GAME_NAME) or {}).get('composition', '')
+        final_active_reprimands = [a for a in actions if active(a, 'Выговор')]
+        should_expel = len(final_active_reprimands) >= MAX_ACTIVE_REPRIMANDS and current_composition != 'Отставка'
+
+        updates = {f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': actions}
+        roster_updates = {f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': actions}
+
+        if should_expel:
+            updates[f'gameRoles.{GAMESTATS_GAME_NAME}.composition'] = 'Отставка'
+            updates[f'gameRoles.{GAMESTATS_GAME_NAME}.position'] = 'Дезертир'
+            roster_updates[f'gameRoles.{GAMESTATS_GAME_NAME}.composition'] = 'Отставка'
+            roster_updates[f'gameRoles.{GAMESTATS_GAME_NAME}.position'] = 'Дезертир'
+            result['expelled'] = True
+
+        transaction.update(profile_ref, updates)
+        transaction.update(roster_ref, roster_updates)
+        return result
+
+    return _txn(transaction)
+
+
+async def apply_inactivity_discipline(uid):
+    if not fs_db:
+        return None
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(EXECUTOR, _apply_disciplinary_action_sync, uid)
+    except Exception as e:
+        print(f"❌ Ошибка применения дисциплинарного взыскания (uid={uid}): {e}")
+        return None
+
+
+async def process_inactivity_discipline_for_event(event_id):
+    """Выносит замечания/выговоры за неактивность всем, кто не отметился на
+    ОБЯЗАТЕЛЬНОМ мероприятии (и не был в отпуске), для мероприятий начиная
+    с DISCIPLINE_CUTOFF. Выполняется РОВНО ОДИН РАЗ на мероприятие."""
+    events = load_json(EVENTS_FILE, {})
+    event = events.get(event_id)
+    if not event or event.get('discipline_processed'):
+        return
+
+    if not event.get('mandatory', True):
+        event['discipline_processed'] = True
+        save_json(EVENTS_FILE, events)
+        return
+
+    event_start_dt = datetime.fromtimestamp(event['start_time'], MSK)
+    if event_start_dt < DISCIPLINE_CUTOFF:
+        event['discipline_processed'] = True
+        save_json(EVENTS_FILE, events)
+        return
+
+    current_time = datetime.now(MSK)
+    active_members = await get_active_members(current_time, registered_before=event_start_dt)
+    accepted = set(event.get('accepted', {}).keys())
+    declined = set(event.get('declined', {}).keys())
+    unmarked = [m for m in active_members if m not in accepted and m not in declined]
+
+    event['discipline_processed'] = True
+    save_json(EVENTS_FILE, events)
+
+    if not unmarked:
+        return
+
+    thread = await get_or_create_thread(event, event_id, event['title'])
+    any_expelled = False
+
+    for nickname in unmarked:
+        uid = await get_uid_by_nickname(nickname)
+        if not uid:
+            continue
+        result = await apply_inactivity_discipline(uid)
+        if not result or not result.get('action'):
+            continue
+
+        member = await find_member_by_nickname(nickname)
+        mention = member.mention if member else f"**{nickname}**"
+        action_word = "замечание" if result['action'] == 'warning' else "выговор"
+
+        if thread:
+            text = (
+                f"{mention}\n\n" +
+                es(f"⚠️ Боец, тебе вынесено {action_word} за неактивность:\n\n") +
+                f"> {result['reason']}\n\n" +
+                "Пожалуйста, не забывай отмечаться на мероприятиях с обязательной записью, если ты не находишься "
+                "в отпуске. Подробности — в твоём личном деле на сайте клана."
+            )
+            try:
+                await thread.send(text)
+            except Exception as e:
+                print(f"⚠️ Не удалось отправить уведомление о взыскании для {nickname}: {e}")
+
+        if result.get('expelled'):
+            any_expelled = True
+            if member:
+                guild = member.guild
+                roles_to_check = [guild.get_role(ROLE_IDS[key]) for key in EXPULSION_ROLE_KEYS]
+                present_roles = [r for r in roles_to_check if r and r in member.roles]
+                if present_roles:
+                    try:
+                        await member.remove_roles(*present_roles, reason="3 действующих выговора за неактивность")
+                    except Exception as e:
+                        print(f"⚠️ Не удалось снять роли у {nickname}: {e}")
+            if thread:
+                try:
+                    await thread.send(
+                        f"{mention}\n\n" +
+                        es("🚫 Боец достиг 3 действующих выговоров за неактивность и был исключен из клана.")
+                    )
+                except Exception:
+                    pass
+
+        await asyncio.sleep(1)
+
+    if any_expelled:
+        invalidate_clan_members_cache()
+        await refresh_all_active_event_embeds()
+
+
+def _cleanup_expired_disciplinary_actions_sync():
+    """Убирает ИСТЁКШИЕ записи (любого происхождения) из gameDisciplinaryActions
+    в profiles и rosterPublic. НИКОГДА не трогает composition/position/роли —
+    исключение необратимо без ручного вмешательства администрации."""
+    now_ms = int(datetime.now(MSK).timestamp() * 1000)
+    docs = fs_db.collection('profiles').stream()
+    cleaned = 0
+    for doc in docs:
+        data = doc.to_dict() or {}
+        game_da = (data.get('gameDisciplinaryActions') or {}).get(GAMESTATS_GAME_NAME, [])
+        if not game_da:
+            continue
+        filtered = [a for a in game_da if a.get('expiresAtMs', 0) > now_ms]
+        if len(filtered) != len(game_da):
+            uid = doc.id
+            fs_db.collection('profiles').document(uid).update({f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': filtered})
+            fs_db.collection('rosterPublic').document(uid).update({f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': filtered})
+            cleaned += 1
+    return cleaned
+
+
+async def cleanup_expired_disciplinary_actions():
+    if not fs_db:
+        return
+    loop = asyncio.get_event_loop()
+    try:
+        cleaned = await loop.run_in_executor(EXECUTOR, _cleanup_expired_disciplinary_actions_sync)
+        if cleaned:
+            print(f"🧹 Удалено просроченных замечаний/выговоров у {cleaned} бойцов")
+    except Exception as e:
+        print(f"❌ Ошибка очистки просроченных взысканий: {e}")
+
 
 # ============== МАСТЕР УЧЁТА ЯВКИ (с командирами отделений) ==============
+
+def build_attendance_report_text(record: dict) -> str:
+    """Единая точка генерации текста отчёта о явке — используется и при
+    первом создании отчёта, и при повторной синхронизации оформления."""
+    title = record.get('title', '')
+    report_text = es(f"🏆 **Отчёт о явке: {title}**\n\n")
+    report_text += es(f"📋 Составил: **{record.get('reported_by', '?')}**\n\n")
+
+    def _format_commanders(commanders_list):
+        return "\n".join(commanders_list) if commanders_list else es("*Не назначен*")
+
+    num_games = record.get('num_games', 0)
+    if num_games == 0:
+        players = record.get('overall_players', [])
+        commanders = _normalize_commanders_field(record, 'overall_commander', 'overall_commanders')
+        side_commander = record.get('overall_side_commander')
+
+        report_text += es(f"👥 **Явились на мероприятие ({len(players)}):**\n")
+        report_text += "\n".join(players) if players else es("*Никто не явился*")
+        report_text += "\n\n" + es("🪖 **Командир(ы) отделения:**\n") + _format_commanders(commanders)
+        report_text += "\n\n" + es("🎖️ **Командир стороны:**\n")
+        report_text += side_commander if side_commander else es("*Не назначен*")
+    else:
+        games = record.get('games', {}) or {}
+        for i in range(num_games):
+            g = games.get(str(i + 1), {})
+            players = g.get('players', [])
+            commanders = _normalize_commanders_field(g, 'commander', 'commanders')
+            side_commander = g.get('side_commander')
+
+            report_text += es(f"🎮 **Игра {i+1}**\n\n")
+            report_text += es(f"👥 Явились ({len(players)}):\n")
+            report_text += "\n".join(players) if players else es("*Никто не явился*")
+            report_text += "\n\n" + es(f"🪖 Командир(ы) отделения:\n") + _format_commanders(commanders)
+            report_text += "\n\n" + es(f"🎖️ Командир стороны:\n")
+            report_text += side_commander if side_commander else es("*Не назначен*")
+            if i < num_games - 1:
+                report_text += "\n\n"
+    return report_text
+
 
 class AttendanceWizard:
     def __init__(self, event_id, num_games, event_title):
@@ -2584,40 +3017,43 @@ class AttendanceWizard:
 
 
 class CommandersSelectView(discord.ui.View):
-    """Выбор командира(ов) отделения (может быть НЕСКОЛЬКО на одну игру —
-    например, при нескольких отделениях сразу) и ОДНОГО командира стороны —
-    строго из числа бойцов, отмеченных явившимися на этом шаге/игре."""
+    """Выбор командира(ов) отделения и командира стороны — строго из явившихся
+    на этом шаге/игре. Оба поля необязательны: если ничего не выбрано —
+    считается, что командир не назначен (без отдельного пункта 'Без командира')."""
     def __init__(self, wizard, present_players):
         super().__init__(timeout=300)
         self.wizard = wizard
-        self.squad_commanders = []  # список позывных — порядок выбора не критичен (по договорённости)
+        self.squad_commanders = []
         self.side_commander = None
 
         capped_players = present_players[:MAX_SELECT_OPTIONS]
 
         if capped_players:
             squad_options = [discord.SelectOption(label=nick, value=nick) for nick in capped_players]
-            squad_max = len(squad_options)
             squad_disabled = False
         else:
             squad_options = [discord.SelectOption(label="— Нет явившихся —", value="__none__")]
-            squad_max = 1
             squad_disabled = True
 
         self.squad_select = discord.ui.Select(
             placeholder="🪖 Командир(ы) отделения (можно несколько, необязательно)...",
-            options=squad_options, min_values=0, max_values=squad_max, row=0,
+            options=squad_options, min_values=0, max_values=len(squad_options), row=0,
             disabled=squad_disabled
         )
         self.squad_select.callback = self._squad_callback
         self.add_item(self.squad_select)
 
-        side_options = [discord.SelectOption(label="— Без командира стороны —", value="none", emoji="🚫")]
-        for nick in present_players[:MAX_SELECT_OPTIONS - 1]:
-            side_options.append(discord.SelectOption(label=nick, value=nick))
+        if capped_players:
+            side_options = [discord.SelectOption(label=nick, value=nick) for nick in capped_players]
+            side_disabled = False
+        else:
+            side_options = [discord.SelectOption(label="— Нет явившихся —", value="__none__")]
+            side_disabled = True
+
         self.side_select = discord.ui.Select(
-            placeholder="🎖️ Командир стороны...",
-            options=side_options, min_values=1, max_values=1, row=1
+            placeholder="🎖️ Командир стороны (необязательно)...",
+            options=side_options, min_values=0, max_values=1, row=1,
+            disabled=side_disabled
         )
         self.side_select.callback = self._side_callback
         self.add_item(self.side_select)
@@ -2637,8 +3073,8 @@ class CommandersSelectView(discord.ui.View):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Только комбат или заместитель!"), ephemeral=True)
             return
-        value = self.side_select.values[0]
-        self.side_commander = None if value == "none" else value
+        values = [v for v in self.side_select.values if v != "__none__"]
+        self.side_commander = values[0] if values else None
         await interaction.response.defer()
 
     async def _continue_callback(self, interaction):
@@ -2651,7 +3087,6 @@ class CommandersSelectView(discord.ui.View):
         self.stop()
         await interaction.response.defer()
         await proceed_to_next_step(interaction, self.wizard)
-
 
 class AttendanceStepView(discord.ui.View):
     def __init__(self, wizard, step, clan_members):
@@ -2747,19 +3182,23 @@ async def start_attendance_wizard(interaction, event_id):
     wizard = AttendanceWizard(event_id, num_games, event.get('title', ''))
     clan_members = await get_active_members(datetime.now(MSK))
     if not clan_members:
-        if not USE_FIREBASE_BACKEND:
-            await interaction.response.send_message(
-                es("❌ Заполнение явки недоступно в аварийном режиме DATA_BACKEND='json' — список бойцов клана хранится в Firebase."),
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(es("❌ Список клана пуст!"), ephemeral=True)
+        await interaction.response.send_message(es("❌ Список клана пуст!"), ephemeral=True)
         return
+
+    attendance = load_json(ATTENDANCE_FILE, {})
+    warning_prefix = ""
+    if event_id in attendance:
+        warning_prefix = (
+            es("⚠️ **Внимание: отчёт о явке для этого мероприятия уже существует!**\n") +
+            "Заполнение нового отчёта **полностью перезапишет** предыдущий — включая пересчёт "
+            "зачтённых отыгрышей и очереди на командование (старые значения будут отменены, новые применены).\n\n"
+        )
+
     view = AttendanceStepView(wizard, 0, clan_members)
     if num_games == 0:
-        title_text = es(f"👥 **{event.get('title', '')}**\n\n") + es("Выберите бойцов, явившихся на мероприятие:")
+        title_text = warning_prefix + es(f"👥 **{event.get('title', '')}**\n\n") + es("Выберите бойцов, явившихся на мероприятие:")
     else:
-        title_text = es(f"👥 **{event.get('title', '')}**\n\n") + es(f"**Матч 1** из {num_games}\nВыберите явившихся:")
+        title_text = warning_prefix + es(f"👥 **{event.get('title', '')}**\n\n") + es(f"**Матч 1** из {num_games}\nВыберите явившихся:")
     await interaction.response.send_message(title_text, view=view, ephemeral=True)
 
 
@@ -2845,45 +3284,7 @@ async def finalize_attendance(interaction, wizard):
     
     record['thread_id'] = thread.id
     
-    report_text = es(f"🏆 **Отчёт о явке: {wizard.event_title}**\n\n")
-    report_text += es(f"📋 Составил: **{interaction.user.display_name}**\n\n")
-    
-    def _format_commanders(commanders_list):
-        if not commanders_list:
-            return es("*Не назначен*")
-        return "\n".join(commanders_list)
-
-    if wizard.num_games == 0:
-        players = wizard.data.get('overall', [])
-        commanders = wizard.commanders.get('overall') or []
-        side_commander = wizard.side_commanders.get('overall')
-        
-        report_text += es(f"👥 **Явились на мероприятие ({len(players)}):**\n")
-        report_text += "\n".join(players) if players else es("*Никто не явился*")
-        
-        report_text += "\n\n" + es("🪖 **Командир(ы) отделения:**\n")
-        report_text += _format_commanders(commanders)
-
-        report_text += "\n\n" + es("🎖️ **Командир стороны:**\n")
-        report_text += side_commander if side_commander else es("*Не назначен*")
-    else:
-        for i in range(wizard.num_games):
-            players = wizard.data.get(i, [])
-            commanders = wizard.commanders.get(i) or []
-            side_commander = wizard.side_commanders.get(i)
-            
-            report_text += es(f"🎮 **Игра {i+1}**\n\n")
-            report_text += es(f"👥 Явились ({len(players)}):\n")
-            report_text += "\n".join(players) if players else es("*Никто не явился*")
-            
-            report_text += "\n\n" + es(f"🪖 Командир(ы) отделения:\n")
-            report_text += _format_commanders(commanders)
-
-            report_text += "\n\n" + es(f"🎖️ Командир стороны:\n")
-            report_text += side_commander if side_commander else es("*Не назначен*")
-            
-            if i < wizard.num_games - 1:
-                report_text += "\n\n"
+    report_text = build_attendance_report_text(record)
     
     new_msg = await thread.send(report_text)
     record['attendance_message_id'] = new_msg.id
@@ -3312,6 +3713,7 @@ async def update_event(event_id, title, description, start_time, end_time, image
     event['end_time'] = int(end_time.timestamp())
     if event.get('status') == 'completed' and event['end_time'] > int(datetime.now(MSK).timestamp()):
         event['status'] = 'active'
+        event['discipline_processed'] = False
     if image_key is not None:
         event['image_key'] = image_key
     if num_games is not None:
@@ -3362,6 +3764,8 @@ async def reactivate_event(interaction, event_id):
     event['status'] = 'completed' if datetime.now(MSK) > event_end else 'active'
     save_json(EVENTS_FILE, events)
     await refresh_event_message(event_id)
+    if event['status'] == 'completed':
+        await process_inactivity_discipline_for_event(event_id)
     if event.get('thread_id'):
         try:
             thread = await client.fetch_channel(event['thread_id'])
@@ -3448,7 +3852,8 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     events = load_json(EVENTS_FILE, {})
     event = events[event_id]
     current_date = datetime.now(MSK)
-    active_members = await get_active_members(current_date)
+    event_start_dt = datetime.fromtimestamp(event['start_time'], MSK)
+    active_members = await get_active_members(current_date, registered_before=event_start_dt)
     accepted = list(event.get('accepted', {}).keys())
     declined = list(event.get('declined', {}).keys())
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
@@ -3549,7 +3954,7 @@ async def create_event(title, description, start_time, end_time, image_key='none
         channel = await client.fetch_channel(EVENTS_CHANNEL_ID)
         guild = channel.guild
         embed = await build_event_embed(event_id)
-        view = build_event_view(events[event_id])
+        view = build_event_view(events[event_id], event_id)
         filename, path = get_image_info(image_key)
         if filename and path:
             message = await channel.send(embed=embed, view=view, file=discord.File(path, filename=filename))
@@ -3673,10 +4078,11 @@ async def check_event_reminders():
         save_json(EVENTS_FILE, events)
 
 async def check_event_completion():
-    """Автоматически переводит активные мероприятия в статус 'completed' после окончания (п.2, п.3)."""
+    """Автоматически переводит активные мероприятия в статус 'completed' после окончания."""
     events = load_json(EVENTS_FILE, {})
     current_time = datetime.now(MSK)
     changed = False
+    completed_ids = []
     for event_id, event in events.items():
         if event.get('status', 'active') != 'active':
             continue
@@ -3687,6 +4093,13 @@ async def check_event_completion():
         if current_time > event_end:
             event['status'] = 'completed'
             changed = True
+            completed_ids.append(event_id)
+    if changed:
+        # ВАЖНО: сохраняем ДО обновления сообщений — иначе refresh_event_message()
+        # заново читает данные и видит ещё старый статус 'active' (баг п.1).
+        save_json(EVENTS_FILE, events)
+        for event_id in completed_ids:
+            event = events[event_id]
             await refresh_event_message(event_id)
             if event.get('thread_id'):
                 try:
@@ -3695,8 +4108,7 @@ async def check_event_completion():
                     await thread.send(es(f"🏁 Мероприятие «{event['title']}» автоматически помечено как завершённое."))
                 except Exception:
                     pass
-    if changed:
-        save_json(EVENTS_FILE, events)
+            await process_inactivity_discipline_for_event(event_id)
 
 
 # ============== ОБНОВЛЕНИЕ ШАБЛОНОВ СООБЩЕНИЙ ==============
@@ -3765,9 +4177,9 @@ async def update_all_templates():
             embed = await build_event_embed(event_id)
             filename, path = get_image_info(image_key)
             if filename and path:
-                await message.edit(embed=embed, attachments=[discord.File(path, filename=filename)], view=build_event_view(event))
+                await message.edit(embed=embed, attachments=[discord.File(path, filename=filename)], view=build_event_view(event, event_id))
             else:
-                await message.edit(embed=embed, attachments=[], view=build_event_view(event))
+                await message.edit(embed=embed, attachments=[], view=build_event_view(event, event_id))
             ev_updated += 1
             await asyncio.sleep(4)  # Защита от rate limit
         except discord.NotFound:
@@ -3894,11 +4306,32 @@ async def update_all_templates():
         print(f"❌ Ошибка обновления правил отпусков: {e}")
         vac_errors += 1
     
+    # === 4. ОБНОВЛЕНИЕ ОТЧЁТОВ О ЯВКЕ В ВЕТКАХ МЕРОПРИЯТИЙ ===
+    attendance = load_json(ATTENDANCE_FILE, {})
+    att_updated = 0
+    att_errors = 0
+    for event_id, record in attendance.items():
+        if not record.get('attendance_message_id') or not record.get('thread_id'):
+            continue
+        try:
+            thread = await client.fetch_channel(record['thread_id'])
+            message = await thread.fetch_message(record['attendance_message_id'])
+            await message.edit(content=build_attendance_report_text(record))
+            att_updated += 1
+            await asyncio.sleep(2)
+        except discord.NotFound:
+            att_errors += 1
+        except Exception as e:
+            print(f"❌ Ошибка обновления отчёта явки '{record.get('title','?')}': {e}")
+            att_errors += 1
+
     print(f"🔄 Итог обновления шаблонов:")
     print(f"   📅 Мероприятий: обновлено {ev_updated}, ошибок {ev_errors}")
     print(f"   🏖️ Отпусков: обновлено {vac_updated}, ошибок {vac_errors}")
+    print(f"   🏆 Отчётов о явке: обновлено {att_updated}, ошибок {att_errors}")
     
-    return ev_updated, ev_errors, vac_updated, vac_errors
+    return ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors
+
 
 
 # ============== ПОСТОЯННАЯ ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ==============
@@ -4266,9 +4699,16 @@ async def on_ready():
         scheduler.add_job(load_clan_members_from_firebase, 'interval', hours=1, id='clan_cache_refresh', replace_existing=True)
     if not scheduler.get_job('voice_rooms_sweep'):
         scheduler.add_job(sweep_empty_voice_rooms, 'interval', minutes=10, id='voice_rooms_sweep', replace_existing=True)
-    
+    if not scheduler.get_job('log_forward_flush'):
+        scheduler.add_job(flush_log_buffer_to_discord, 'interval', seconds=15, id='log_forward_flush', replace_existing=True)
+    if not scheduler.get_job('disciplinary_cleanup'):
+        scheduler.add_job(cleanup_expired_disciplinary_actions, 'interval', hours=6, id='disciplinary_cleanup', replace_existing=True)
+
     if not scheduler.running:
         scheduler.start()
+
+    # Сразу отправляем всё, что накопилось в буфере логов за время запуска бота
+    await flush_log_buffer_to_discord()
     
     client.add_view(AdminMainMenuView())
     client.add_view(VacationRequestView())
