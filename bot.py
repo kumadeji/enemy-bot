@@ -1902,35 +1902,63 @@ class WeeklyEventManageActionsView(discord.ui.View):
         else:
             await interaction.response.send_message(es("❌ Не найдено!"), ephemeral=True)
 
-class TestAnketaModal(discord.ui.Modal, title=es("🧪 Тестовая публикация анкеты")):
-    profile_uid = discord.ui.TextInput(
-        label="UID профиля в Firebase",
-        placeholder="3Y1qZeszbihw5UM3y58bxz2ldP12",
-        default="3Y1qZeszbihw5UM3y58bxz2ldP12",
-        required=True, max_length=64
-    )
 
-    async def on_submit(self, interaction):
+async def _publish_all_existing_anketas_sync():
+    """Синхронно (в executor) читает ВСЕ документы profiles, сортирует по
+    дате регистрации (createdAt) по возрастанию (сначала самые старые)."""
+    docs = fs_db.collection('profiles').stream()
+    items = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        created_at_dt = _parse_firestore_dt(data.get('createdAt'))
+        items.append((created_at_dt or datetime.min.replace(tzinfo=pytz.UTC), doc.id, data))
+    items.sort(key=lambda x: x[0])
+    return items
+
+
+class ConfirmPublishAllAnketasView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @discord.ui.button(label=es("✅ Да, опубликовать все"), style=discord.ButtonStyle.success)
+    async def confirm(self, interaction, button):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        uid = self.profile_uid.value.strip()
         if not fs_db:
             await interaction.followup.send(es("❌ Firebase недоступен (режим DATA_BACKEND='json')."), ephemeral=True)
             return
         try:
             loop = asyncio.get_event_loop()
-            doc = await loop.run_in_executor(EXECUTOR, lambda: fs_db.collection('profiles').document(uid).get())
-            if not doc.exists:
-                await interaction.followup.send(es(f"❌ Профиль с UID `{uid}` не найден!"), ephemeral=True)
-                return
-            data = doc.to_dict() or {}
-            channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
-            mention_block = get_anketa_leadership_mentions(channel.guild, data.get('gamesInterested', []))
-            embed = await build_anketa_embed(uid, data)
-            msg = await channel.send(content=mention_block if mention_block else None, embed=embed)
-            save_anketa_message_info(uid, msg.id, channel.id)
-            await interaction.followup.send(es(f"✅ Тестовая анкета опубликована в <#{ANKETA_CHANNEL_ID}>!"), ephemeral=True)
+            items = await loop.run_in_executor(EXECUTOR, _publish_all_existing_anketas_sync)
         except Exception as e:
-            await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
+            await interaction.followup.send(f"❌ Ошибка чтения профилей: {e}", ephemeral=True)
+            return
+
+        channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
+        published = 0
+        skipped = 0
+        for created_at_dt, uid, data in items:
+            if get_anketa_message_info(uid):
+                skipped += 1
+                continue
+            try:
+                mention_block = get_anketa_leadership_mentions(channel.guild, data.get('gamesInterested', []))
+                embed = await build_anketa_embed(uid, data, is_new=False)
+                msg = await channel.send(content=mention_block if mention_block else None, embed=embed)
+                save_anketa_message_info(uid, msg.id, channel.id)
+                published += 1
+                await asyncio.sleep(1.5)
+            except Exception as e:
+                print(f"⚠️ Не удалось опубликовать анкету uid={uid}: {e}")
+
+        await interaction.followup.send(
+            es(f"✅ Опубликовано анкет: **{published}**. Пропущено (уже были опубликованы ранее): **{skipped}**."),
+            ephemeral=True
+        )
+
+    @discord.ui.button(label=es("🚫 Отмена"), style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        await interaction.response.send_message(es("🚫 Публикация отменена."), ephemeral=True)
+
 
 class AdminMainMenuView(discord.ui.View):
     def __init__(self):
@@ -2029,12 +2057,16 @@ class AdminMainMenuView(discord.ui.View):
         )
         
 
-    @discord.ui.button(label=es("🧪 Тест: опубликовать анкету"), style=discord.ButtonStyle.secondary, custom_id="admin_test_anketa", row=4)
-    async def test_anketa_button(self, interaction, button):
+    @discord.ui.button(label=es("📋 Опубликовать все анкеты"), style=discord.ButtonStyle.secondary, custom_id="admin_publish_all_anketas", row=4)
+    async def publish_all_anketas_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
-        await interaction.response.send_modal(TestAnketaModal())
+        await interaction.response.send_message(
+            es(f"⚠️ Это опубликует в <#{ANKETA_CHANNEL_ID}> ВСЕ существующие анкеты из Firebase "
+               "(по порядку даты регистрации), кроме тех, что уже были опубликованы ранее. Продолжить?"),
+            view=ConfirmPublishAllAnketasView(), ephemeral=True
+        )
 
         
     @discord.ui.button(label=es("🔧 Принудительный перезапуск бота"), style=discord.ButtonStyle.danger, custom_id="admin_force_restart", row=4)
@@ -2526,17 +2558,26 @@ def _safe_field_value(text: str, limit: int = 1024) -> str:
 
 # --- Форматирование сообщений ---
 
-async def build_anketa_embed(uid, data) -> discord.Embed:
+async def build_anketa_embed(uid, data, is_new: bool = True) -> discord.Embed:
     """Формирует оформленную анкету кандидата. Без эмодзи (кроме заголовка).
     Поля модульны — 'Опыт'/'Состав и должность' появляются отдельно для
     каждой игры из gamesInterested. Ссылки пишутся полностью, в <...>.
     Необязательные поля (дата рождения, телефон, telegram, vk, другой
-    контакт) показываются, только если реально заполнены."""
+    контакт) показываются, только если реально заполнены.
+    is_new=True -> заголовок 'Новая анкета: ...' (реальная новая регистрация)
+    is_new=False -> заголовок 'Имеющаяся анкета: ...' (массовая публикация
+                    уже существующих анкет через админ-кнопку)."""
     callsign = data.get('callsign', '?')
+    title_prefix = "Новая анкета" if is_new else "Имеющаяся анкета"
 
-    embed = discord.Embed(title=f"Новая анкета: {callsign}", color=discord.Color.gold())
+    embed = discord.Embed(title=f"{title_prefix}: {callsign}", color=discord.Color.gold())
+
+    created_at_dt = _parse_firestore_dt(data.get('createdAt'))
+    registered_str = created_at_dt.astimezone(MSK).strftime('%d.%m.%Y %H:%M') if created_at_dt else "—"
+    embed.add_field(name="Дата регистрации", value=registered_str, inline=False)
 
     embed.add_field(name="Электронная почта", value=_safe_field_value(data.get('email')), inline=False)
+
     embed.add_field(name="Имя и фамилия", value=_safe_field_value(data.get('fullName')), inline=True)
     embed.add_field(name="Возраст", value=_safe_field_value(str(data.get('age', '—'))), inline=True)
     embed.add_field(name="Часовой пояс", value=_safe_field_value(data.get('timezone')), inline=True)
@@ -2636,7 +2677,7 @@ async def handle_new_profile_watch(doc_id, data):
     try:
         channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
         mention_block = get_anketa_leadership_mentions(channel.guild, data.get('gamesInterested', []))
-        embed = await build_anketa_embed(doc_id, data)
+        embed = await build_anketa_embed(doc_id, data, is_new=True)
         msg = await channel.send(content=mention_block if mention_block else None, embed=embed)
         save_anketa_message_info(doc_id, msg.id, channel.id)
     except Exception as e:
@@ -2718,7 +2759,10 @@ async def handle_profile_modified_watch(uid, data):
     try:
         channel = await client.fetch_channel(anketa_info['channel_id'])
         message = await channel.fetch_message(anketa_info['message_id'])
-        embed = await build_anketa_embed(uid, data)
+        # Заголовок ('Новая анкета'/'Имеющаяся анкета') не должен слетать при
+        # live-обновлении — сохраняем ровно то, что уже было в сообщении.
+        was_new = bool(message.embeds and message.embeds[0].title and message.embeds[0].title.startswith("Новая анкета"))
+        embed = await build_anketa_embed(uid, data, is_new=was_new)
         await message.edit(embed=embed)
     except Exception as e:
         print(f"⚠️ Не удалось live-обновить анкету для uid={uid}: {e}")
