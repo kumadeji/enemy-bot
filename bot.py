@@ -417,6 +417,7 @@ LAST_SCHEDULED_CHECK_FILE = 'last_scheduled_check.json'
 VOICE_ROOMS_FILE = 'voice_rooms.json'
 CHECK_MESSAGES_FILE = 'check_messages.json'
 ADMIN_ANCHORS_FILE = 'admin_anchors.json'
+ANKETA_MESSAGES_FILE = 'anketa_messages.json'
 
 # ============== FIREBASE ==============
 
@@ -451,6 +452,7 @@ FIREBASE_DATA_MAP = {
     LAST_SCHEDULED_CHECK_FILE: 'lastScheduledCheck',
     CHECK_MESSAGES_FILE: 'checkMessages',
     ADMIN_ANCHORS_FILE: 'adminAnchors',
+    ANKETA_MESSAGES_FILE: 'anketaMessages',
 }
 
 
@@ -1924,7 +1926,8 @@ class TestAnketaModal(discord.ui.Modal, title=es("🧪 Тестовая публ
             channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
             mention_block = get_anketa_leadership_mentions(channel.guild, data.get('gamesInterested', []))
             embed = await build_anketa_embed(uid, data)
-            await channel.send(content=mention_block if mention_block else None, embed=embed)
+            msg = await channel.send(content=mention_block if mention_block else None, embed=embed)
+            save_anketa_message_info(uid, msg.id, channel.id)
             await interaction.followup.send(es(f"✅ Тестовая анкета опубликована в <#{ANKETA_CHANNEL_ID}>!"), ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
@@ -2461,71 +2464,139 @@ async def get_invited_by_uid(uid):
         return []
 
 
+def get_anketa_message_info(uid: str):
+    mapping = load_json(ANKETA_MESSAGES_FILE, {})
+    return mapping.get(uid)
+
+
+def save_anketa_message_info(uid: str, message_id: int, channel_id: int, thread_id: int = None):
+    mapping = load_json(ANKETA_MESSAGES_FILE, {})
+    entry = mapping.get(uid, {})
+    entry['message_id'] = message_id
+    entry['channel_id'] = channel_id
+    if thread_id is not None:
+        entry['thread_id'] = thread_id
+    mapping[uid] = entry
+    save_json(ANKETA_MESSAGES_FILE, mapping)
+
+
+def _firebase_read_profile_full_sync(uid):
+    doc = fs_db.collection('profiles').document(uid).get()
+    return (doc.to_dict() or {}) if doc.exists else None
+
+
+async def get_profile_data(uid: str):
+    if not fs_db:
+        return None
+    loop = asyncio.get_event_loop()
+    try:
+        return await loop.run_in_executor(EXECUTOR, _firebase_read_profile_full_sync, uid)
+    except Exception as e:
+        print(f"⚠️ Не удалось получить профиль {uid}: {e}")
+        return None
+
+
+async def find_member_by_discord_username(discord_username: str):
+    """Ищет участника гильдии по полю 'Discord ID' анкеты — это username
+    (например, 'kumadeji'), а НЕ отображаемое имя/позывной на сервере."""
+    if not discord_username:
+        return None
+    try:
+        channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
+        guild = channel.guild
+        uname_lower = discord_username.strip().lower()
+        for member in guild.members:
+            if member.name.lower() == uname_lower:
+                return member
+        for member in guild.members:
+            if str(member).lower() == uname_lower:
+                return member
+        return None
+    except Exception as e:
+        print(f"⚠️ Ошибка поиска участника по Discord ID '{discord_username}': {e}")
+        return None
+
+
+def _safe_field_value(text: str, limit: int = 1024) -> str:
+    text = text or "—"
+    if len(text) > limit:
+        return text[:limit - 3] + "..."
+    return text
+
+
 # --- Форматирование сообщений ---
 
 async def build_anketa_embed(uid, data) -> discord.Embed:
-    """Формирует красиво оформленный embed с анкетой кандидата."""
+    """Формирует оформленную анкету кандидата. Без эмодзи (кроме заголовка).
+    Поля модульны — 'Опыт'/'Состав и должность' появляются отдельно для
+    каждой игры из gamesInterested. Ссылки пишутся полностью, в <...>.
+    Необязательные поля (дата рождения, телефон, telegram, vk, другой
+    контакт) показываются, только если реально заполнены."""
     callsign = data.get('callsign', '?')
 
-    embed = discord.Embed(
-        title=es(f"📋 Новая анкета: {callsign}"),
-        color=discord.Color.gold()
-    )
+    embed = discord.Embed(title=f"Новая анкета: {callsign}", color=discord.Color.gold())
 
+    embed.add_field(name="Электронная почта", value=_safe_field_value(data.get('email')), inline=False)
+    embed.add_field(name="Имя и фамилия", value=_safe_field_value(data.get('fullName')), inline=True)
+    embed.add_field(name="Возраст", value=_safe_field_value(str(data.get('age', '—'))), inline=True)
+    embed.add_field(name="Часовой пояс", value=_safe_field_value(data.get('timezone')), inline=True)
+
+    birth_date = data.get('birthDate') or ''
+    if birth_date:
+        embed.add_field(name="Дата рождения", value=_safe_field_value(birth_date), inline=True)
+
+    discord_username = data.get('discordId') or ''
+    discord_value = discord_username or "—"
+    member = await find_member_by_discord_username(discord_username)
+    if member:
+        discord_value += f" (<https://discord.com/users/{member.id}>)"
+    embed.add_field(name="Discord ID", value=_safe_field_value(discord_value), inline=False)
+
+    embed.add_field(name="Steam ID", value=_safe_field_value(data.get('steamId')), inline=True)
     steam_url = data.get('steamProfileUrl') or ''
-    contact_lines = [
-        f"**Эл. почта:** {data.get('email') or '—'}",
-        f"**Discord ID:** {data.get('discordId') or '—'}",
-        f"**Steam ID:** {data.get('steamId') or '—'}",
-        f"**Steam-профиль:** [ссылка]({steam_url})" if steam_url else "**Steam-профиль:** —",
-        f"**Arma ID:** {data.get('armaId') or '—'}",
-    ]
-    embed.add_field(name=es("👤 Личные данные"),
-                     value=(f"**Имя:** {data.get('fullName') or '—'}\n"
-                            f"**Возраст:** {data.get('age', '—')}\n"
-                            f"**Дата рождения:** {data.get('birthDate') or '—'}\n"
-                            f"**Часовой пояс:** {data.get('timezone') or '—'}"),
-                     inline=False)
-    embed.add_field(name=es("📞 Контакты"), value="\n".join(contact_lines), inline=False)
+    embed.add_field(name="Ссылка на Steam", value=f"<{steam_url}>" if steam_url else "—", inline=True)
+    embed.add_field(name="Arma ID", value=_safe_field_value(data.get('armaId')), inline=True)
 
     extra = data.get('extraContacts', {}) or {}
-    extra_lines = []
     if extra.get('phone'):
-        extra_lines.append(f"**Телефон:** {extra['phone']}")
+        embed.add_field(name="Телефон", value=_safe_field_value(extra['phone']), inline=True)
     if data.get('telegramUrl'):
-        extra_lines.append(f"**Telegram:** [ссылка]({data['telegramUrl']})")
+        embed.add_field(name="Ссылка на Telegram", value=f"<{data['telegramUrl']}>", inline=True)
     if data.get('vkUrl'):
-        extra_lines.append(f"**ВКонтакте:** [ссылка]({data['vkUrl']})")
+        embed.add_field(name="Ссылка на ВКонтакте", value=f"<{data['vkUrl']}>", inline=True)
     if extra.get('other'):
-        extra_lines.append(f"**Другое:** {extra['other']}")
-    if extra_lines:
-        embed.add_field(name=es("📇 Доп. контакты"), value="\n".join(extra_lines), inline=False)
+        embed.add_field(name="Другой контакт", value=_safe_field_value(extra['other']), inline=False)
 
     referrer = data.get('referrerCallsign') or data.get('referredByText') or ''
-    invited = await get_invited_by_uid(uid)
-    how_found = data.get('howFound') or ''
-    if not how_found:
-        how_found = "Приглашён бойцом (см. ниже)" if referrer else "—"
-    embed.add_field(name=es("🔗 Приглашения"),
-                     value=(f"**Кем приглашён:** {referrer if referrer else '—'}\n"
-                            f"**Кого пригласил:** {', '.join(invited) if invited else '—'}\n"
-                            f"**Откуда узнал:** {how_found}"),
-                     inline=False)
+    embed.add_field(name="Кем приглашён", value=_safe_field_value(referrer), inline=True)
 
-    embed.add_field(name=es("🕒 Доступность"), value=data.get('availability') or '—', inline=False)
-    embed.add_field(name=es("💬 Почему хочет вступить"), value=data.get('whyJoin') or '—', inline=False)
+    invited = await get_invited_by_uid(uid)
+    embed.add_field(name="Кого пригласил", value=_safe_field_value(', '.join(invited) if invited else ''), inline=True)
+
+    embed.add_field(name="Доступность для игр", value=_safe_field_value(data.get('availability')), inline=False)
+
+    how_found = data.get('howFound') or ''
+    if not how_found and referrer:
+        how_found = "Приглашён бойцом (см. выше)"
+    embed.add_field(name="Откуда узнал?", value=_safe_field_value(how_found), inline=False)
 
     games = data.get('gamesInterested', []) or []
+    game_roles = data.get('gameRoles', {}) or {}
     exp_by_game = data.get('experienceByGame', {}) or {}
     hours_by_game = data.get('hoursByGame', {}) or {}
-    if games:
-        exp_lines = []
-        for game in games:
-            hours = hours_by_game.get(game)
-            hours_str = f"{hours} ч." if hours is not None else "? ч."
-            exp_text = exp_by_game.get(game, '')
-            exp_lines.append(f"**{game}:** {hours_str}" + (f" — {exp_text}" if exp_text else ""))
-        embed.add_field(name=es("🎮 Игровой опыт"), value="\n".join(exp_lines), inline=False)
+
+    for game in games:
+        role = game_roles.get(game, {}) or {}
+        composition = role.get('composition') or '—'
+        position = role.get('position') or '—'
+        embed.add_field(name=f"Состав и должность ({game})", value=f"{composition} — {position}", inline=True)
+
+    for game in games:
+        hours = hours_by_game.get(game)
+        hours_str = f"{hours} ч." if hours is not None else "—"
+        exp_text = exp_by_game.get(game, '')
+        value = f"{hours_str} — {exp_text}" if exp_text else hours_str
+        embed.add_field(name=f"Опыт в {game}", value=_safe_field_value(value), inline=False)
 
     embed.set_footer(text=f"UID: {uid}")
     return embed
@@ -2566,22 +2637,92 @@ async def handle_new_profile_watch(doc_id, data):
         channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
         mention_block = get_anketa_leadership_mentions(channel.guild, data.get('gamesInterested', []))
         embed = await build_anketa_embed(doc_id, data)
-        await channel.send(content=mention_block if mention_block else None, embed=embed)
+        msg = await channel.send(content=mention_block if mention_block else None, embed=embed)
+        save_anketa_message_info(doc_id, msg.id, channel.id)
     except Exception as e:
         print(f"❌ Ошибка публикации новой анкеты ({doc_id}): {e}")
     finally:
         await set_watcher_last_ts('profiles', _extract_timestamp(data.get('createdAt')))
 
 
+async def get_or_create_anketa_thread(uid: str, anketa_info: dict, fresh_data: dict = None):
+    """Возвращает (thread, message, channel) для ветки конкретной анкеты,
+    создавая ветку при первой необходимости. Открывает ветку, если она
+    оказалась заблокирована/заархивирована."""
+    channel = await client.fetch_channel(anketa_info['channel_id'])
+    message = await channel.fetch_message(anketa_info['message_id'])
+
+    thread = None
+    thread_id = anketa_info.get('thread_id')
+    if thread_id:
+        try:
+            thread = await client.fetch_channel(thread_id)
+        except Exception:
+            thread = None
+
+    if thread is None:
+        callsign = (fresh_data or {}).get('callsign', uid)
+        thread = await message.create_thread(name=es(f"💬 Изменения — {callsign}")[:100])
+        anketa_info['thread_id'] = thread.id
+        mapping = load_json(ANKETA_MESSAGES_FILE, {})
+        mapping[uid] = anketa_info
+        save_json(ANKETA_MESSAGES_FILE, mapping)
+    elif getattr(thread, 'locked', False) or getattr(thread, 'archived', False):
+        await unlock_and_unarchive_thread(thread)
+
+    return thread, message, channel
+
+
 async def handle_new_changelog_watch(doc_id, data):
+    """Публикует запись changeLog ИСКЛЮЧИТЕЛЬНО в ветку анкеты (никогда не
+    обновляет сам embed анкеты — это делает отдельный live-watcher профилей,
+    см. handle_profile_modified_watch, так как changeLog не отражает изменения
+    состава/должности, назначаемые вручную командованием)."""
+    uid = data.get('uid', '')
     try:
-        channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
-        text = await build_changelog_message(doc_id, data)
-        await send_chunked(channel, text)
+        anketa_info = get_anketa_message_info(uid) if uid else None
+        if anketa_info and anketa_info.get('channel_id') and anketa_info.get('message_id'):
+            fresh_data = await get_profile_data(uid)
+            thread, _, _ = await get_or_create_anketa_thread(uid, anketa_info, fresh_data)
+            text = await build_changelog_message(doc_id, data)
+            await send_chunked(thread, text)
+        else:
+            # Нет привязанной анкеты — публикуем как раньше, напрямую в канал анкет.
+            channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
+            text = await build_changelog_message(doc_id, data)
+            await send_chunked(channel, text)
     except Exception as e:
         print(f"❌ Ошибка публикации записи changeLog ({doc_id}): {e}")
     finally:
         await set_watcher_last_ts('changeLog', _extract_timestamp(data.get('createdAt')))
+
+_LAST_ANKETA_EMBED_SNAPSHOT = {}
+
+
+async def handle_profile_modified_watch(uid, data):
+    """Реагирует на MODIFIED-события коллекции 'profiles' — то есть на ЛЮБОЕ
+    изменение профиля бойца, включая состав/должность (которые назначаются
+    вручную командованием и НЕ проходят через changeLog). Если у этого uid
+    есть опубликованная анкета — embed обновляется live, без задержки.
+    Защита от дублирующих правок: пропускает, если снапшот данных не изменился
+    (Firestore иногда шлёт MODIFIED без реального изменения содержимого)."""
+    anketa_info = get_anketa_message_info(uid)
+    if not anketa_info or not anketa_info.get('channel_id') or not anketa_info.get('message_id'):
+        return
+
+    snapshot_key = json.dumps(data, sort_keys=True, default=str)
+    if _LAST_ANKETA_EMBED_SNAPSHOT.get(uid) == snapshot_key:
+        return
+    _LAST_ANKETA_EMBED_SNAPSHOT[uid] = snapshot_key
+
+    try:
+        channel = await client.fetch_channel(anketa_info['channel_id'])
+        message = await channel.fetch_message(anketa_info['message_id'])
+        embed = await build_anketa_embed(uid, data)
+        await message.edit(embed=embed)
+    except Exception as e:
+        print(f"⚠️ Не удалось live-обновить анкету для uid={uid}: {e}")
+
 
 async def handle_new_notification_watch(doc_id, data):
     try:
@@ -2595,12 +2736,15 @@ async def handle_new_notification_watch(doc_id, data):
     finally:
         await set_watcher_last_ts('notifications', _extract_timestamp(data.get('createdAt')))
 
-def _make_on_added_callback(handler_coro):
+def _make_on_added_callback(handler_coro, watch_types=('ADDED',)):
     """Обёртка над Firestore watch-колбэком (выполняется в отдельном grpc-потоке).
-    Передаёт обработку в основной event loop бота через run_coroutine_threadsafe."""
+    Передаёт обработку в основной event loop бота через run_coroutine_threadsafe.
+    watch_types позволяет реагировать не только на новые документы (ADDED),
+    но и на изменения существующих (MODIFIED) — нужно для live-обновления
+    embed'а анкеты при изменении состава/должности бойца."""
     def _callback(col_snapshot, changes, read_time):
         for change in changes:
-            if change.type.name != 'ADDED':
+            if change.type.name not in watch_types:
                 continue
             doc = change.document
             data = doc.to_dict() or {}
@@ -2648,6 +2792,20 @@ async def setup_firestore_watchers():
             print(f"✅ Запущено realtime-слежение за коллекцией '{collection_name}'")
         except Exception as e:
             print(f"❌ Не удалось запустить слежение за '{collection_name}': {e}")
+
+    # Отдельный watcher: live-обновление embed'а анкеты при ЛЮБОМ изменении
+    # документа в 'profiles' (включая состав/должность, которые НЕ проходят
+    # через changeLog). Слушаем ВСЮ коллекцию без фильтра по createdAt, так как
+    # интересуют именно MODIFIED-события уже существующих документов.
+    try:
+        watch = fs_db.collection('profiles').on_snapshot(
+            _make_on_added_callback(handle_profile_modified_watch, watch_types=('MODIFIED',))
+        )
+        FIRESTORE_WATCH_HANDLES.append(watch)
+        print("✅ Запущено live-слежение за изменениями профилей (для обновления анкет)")
+    except Exception as e:
+        print(f"❌ Не удалось запустить live-слежение за изменениями профилей: {e}")
+
 
 # ============== УЧЁТ ОТЫГРЫШЕЙ (GAMESTATS) ==============
 
