@@ -1402,7 +1402,7 @@ ADMIN_PANEL_DESCRIPTION = (
 
 NOTIFICATIONS_ANCHOR_DESCRIPTION = (
     "Здесь в ветке публикуются все уведомления с сайта для игроков — "
-    "изменения в профилях бойцов и системные уведомления (например, о зачтённых отыгрышах)."
+    "(например, дисциплинарные взыскания, зачтённые отыгрыши и т.п.)."
 )
 
 LOGGING_ANCHOR_DESCRIPTION = (
@@ -2521,16 +2521,13 @@ async def handle_new_profile_watch(doc_id, data):
 
 async def handle_new_changelog_watch(doc_id, data):
     try:
-        thread_id = await get_notifications_thread_id()
-        if thread_id:
-            thread = await client.fetch_channel(thread_id)
-            text = await build_changelog_message(doc_id, data)
-            await send_chunked(thread, text)
+        channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
+        text = await build_changelog_message(doc_id, data)
+        await send_chunked(channel, text)
     except Exception as e:
         print(f"❌ Ошибка публикации записи changeLog ({doc_id}): {e}")
     finally:
         await set_watcher_last_ts('changeLog', _extract_timestamp(data.get('createdAt')))
-
 
 async def handle_new_notification_watch(doc_id, data):
     try:
