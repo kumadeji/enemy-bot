@@ -188,11 +188,32 @@ LOCK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), '.bot.lock'
 _lock_file_handle = None  # держим открытым на весь срок жизни процесса
 
 
+def _release_instance_lock():
+    """Освобождает lock-файл. Вынесена на уровень модуля (не вложена в
+    acquire_single_instance_lock), чтобы её можно было вызвать вручную —
+    например, при принудительном перезапуске через админ-панель."""
+    global _lock_file_handle
+    try:
+        if _lock_file_handle and not _lock_file_handle.closed:
+            if os.name == 'nt':
+                import msvcrt
+                try:
+                    _lock_file_handle.seek(0)
+                    msvcrt.locking(_lock_file_handle.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                import fcntl
+                fcntl.flock(_lock_file_handle.fileno(), fcntl.LOCK_UN)
+            _lock_file_handle.close()
+        if os.path.exists(LOCK_FILE):
+            os.remove(LOCK_FILE)
+    except Exception as e:
+        print(f"Ошибка при удалении lock-файла: {e}")
+
+
 def acquire_single_instance_lock():
-    """OS-level эксклюзивная блокировка файла.
-    В отличие от PID-based проверки, гарантированно снимается ОС даже
-    при аварийном завершении процесса (kill -9, крах, обрыв питания),
-    поэтому 'устаревших' блокировок больше не бывает в принципе."""
+    """OS-level эксклюзивная блокировка файла."""
     global _lock_file_handle
     _lock_file_handle = open(LOCK_FILE, 'a+')
     try:
@@ -211,30 +232,11 @@ def acquire_single_instance_lock():
     _lock_file_handle.write(str(os.getpid()))
     _lock_file_handle.flush()
 
-    def _cleanup():
-        try:
-            if _lock_file_handle and not _lock_file_handle.closed:
-                if os.name == 'nt':
-                    import msvcrt
-                    try:
-                        _lock_file_handle.seek(0)
-                        msvcrt.locking(_lock_file_handle.fileno(), msvcrt.LK_UNLCK, 1)
-                    except OSError:
-                        pass
-                else:
-                    import fcntl
-                    fcntl.flock(_lock_file_handle.fileno(), fcntl.LOCK_UN)
-                _lock_file_handle.close()
-            if os.path.exists(LOCK_FILE):
-                os.remove(LOCK_FILE)
-        except Exception as e:
-            print(f"Ошибка при удалении lock-файла: {e}")
-
-    atexit.register(_cleanup)
+    atexit.register(_release_instance_lock)
 
     def _signal_handler(signum, frame):
         print(f"Получен сигнал {signum}, завершаю работу...")
-        _cleanup()
+        _release_instance_lock()
         sys.exit(0)
 
     signal.signal(signal.SIGTERM, _signal_handler)
@@ -1854,14 +1856,23 @@ class AdminMainMenuView(discord.ui.View):
                "Это может занять несколько минут."),
             ephemeral=True
         )
-        ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors = await update_all_templates()
+        ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors, tn_fixed, tm_fixed, tl_fixed = await update_all_templates()
         await interaction.followup.send(
             es(f"📅 Мероприятий обновлено: **{ev_updated}** (ошибок: {ev_errors})\n"
                f"🏖️ Отпусков обновлено: **{vac_updated}** (ошибок: {vac_errors})\n"
-               f"🏆 Отчётов о явке обновлено: **{att_updated}** (ошибок: {att_errors})"),
+               f"🏆 Отчётов о явке обновлено: **{att_updated}** (ошибок: {att_errors})\n"
+               f"💬 Названий веток исправлено: **{tn_fixed}**, сообщений в ветках: **{tm_fixed}**, блокировок: **{tl_fixed}**"),
             ephemeral=True
         )
-
+        
+    @discord.ui.button(label=es("🔧 Принудительный перезапуск бота"), style=discord.ButtonStyle.danger, custom_id="admin_force_restart", row=4)
+    async def force_restart_button(self, interaction, button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+            return
+        await interaction.response.send_message(es("🔧 Перезапускаю бота... Новый процесс запустится через несколько секунд."), ephemeral=True)
+        await asyncio.sleep(1)
+        await force_restart_bot()
 
 class VacationRequestView(discord.ui.View):
     def __init__(self):
@@ -2114,18 +2125,17 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление д
                 # Никто ещё не отметился — тегаем всех активных, кто не в отпуске
                 mention_block = await get_all_active_members_mentions(current_time)
 
-        text = (
-            mention_block + "\n\n" +
-            f"📢 Бойцы, внимание!\n\n"
-        )
-        if self.server_name.value.strip():
-            text += f"Сервер: {self.server_name.value.strip()}\n\n"
+        server_name = self.server_name.value.strip()
+        password = self.password.value.strip()
+        text = render_mods_message(mention_block, event, server_name, password)
 
-        text += f"Мероприятие начнется <t:{start_ts}:R>! Моды уже можно начать скачивать!"
-        if self.password.value.strip():
-            text += f" Пароль: {self.password.value.strip()}"
-
-        await thread.send(text)
+        msg = await thread.send(text)
+        events_fresh = load_json(EVENTS_FILE, {})
+        fresh_event = events_fresh.get(self.event_id)
+        if fresh_event:
+            record_thread_message(fresh_event, msg.id, 'mods', mention_block=mention_block,
+                                   extra={'server_name': server_name, 'password': password})
+            save_json(EVENTS_FILE, events_fresh)
         await interaction.response.send_message(es("✅ Объявление для скачивания модов отправлено!"), ephemeral=True)
 
 
@@ -3004,6 +3014,78 @@ def build_attendance_report_text(record: dict) -> str:
     return report_text
 
 
+async def lock_and_archive_thread(thread):
+    """Закрывает и блокирует ветку обсуждения (locked+archived)."""
+    if not thread:
+        return
+    try:
+        await thread.edit(locked=True, archived=True)
+    except Exception as e:
+        print(f"⚠️ Не удалось закрыть/заблокировать ветку {thread.id}: {e}")
+
+
+async def unlock_and_unarchive_thread(thread):
+    """Открывает ветку перед публикацией сообщения, если она была
+    заблокирована/заархивирована ранее (например, отчёт о явке подаётся
+    повторно уже после автоматического завершения мероприятия)."""
+    if not thread:
+        return
+    try:
+        if getattr(thread, 'locked', False) or getattr(thread, 'archived', False):
+            await thread.edit(locked=False, archived=False)
+    except Exception as e:
+        print(f"⚠️ Не удалось открыть ветку {thread.id}: {e}")
+
+
+def record_thread_message(event: dict, message_id: int, kind: str, mention_block: str = "", extra: dict = None):
+    """Регистрирует сообщение, отправленное ботом в ветку мероприятия, чтобы
+    функция синхронизации могла впоследствии найти и переформатировать его."""
+    event.setdefault('thread_messages', [])
+    event['thread_messages'].append({
+        'id': message_id, 'kind': kind,
+        'mention_block': mention_block, 'extra': extra or {}
+    })
+
+
+# --- Единые шаблоны сообщений (используются и при отправке, и при синхронизации) ---
+
+def render_announcement_message(mention_block: str) -> str:
+    return f"{mention_block}\n\n" + es("📢 Бойцы, запланировано мероприятие! Ждем ваших отметок!")
+
+def render_completion_message(event: dict) -> str:
+    return es(f"🏁 Мероприятие «{clean_event_title(event['title'])}» автоматически помечено как завершённое.")
+
+def render_early_completion_message(event: dict) -> str:
+    return es(f"🏁 Мероприятие «{clean_event_title(event['title'])}» завершено досрочно после публикации отчёта о явке.")
+
+def render_cancel_message(event: dict, by_user: str) -> str:
+    return es(f"🚫 Мероприятие «{clean_event_title(event['title'])}» отменено командованием ({by_user}).")
+
+def render_reactivate_message(event: dict) -> str:
+    return es(f"🔄 Мероприятие «{clean_event_title(event['title'])}» снова активно.")
+
+def render_reminder_2days_message(mention_block: str) -> str:
+    return (mention_block + "\n\n" +
+        "Бойцы, ждём ваших отметок! До мероприятия осталось 2 суток, но вы пока ещё не отметились! " +
+        f"Пожалуйста, отметьтесь в основном посте в <#{EVENTS_CHANNEL_ID}>.")
+
+def render_reminder_15min_message(mention_block: str, event: dict) -> str:
+    start_ts = int(event['start_time'])
+    return (mention_block + "\n\n" +
+        es(f"📢 Бойцы, внимание! {build_display_title(event)}") + "\n\n" +
+        f"Мероприятие начнется <t:{start_ts}:R>! Ждем вас на сборах! Заходите в голосовой канал <#{VOICE_CHANNEL_ID}>.")
+
+def render_mods_message(mention_block: str, event: dict, server_name: str, password: str) -> str:
+    start_ts = int(event['start_time'])
+    text = mention_block + "\n\n" + es(f"📢 Бойцы, внимание! {build_display_title(event)}") + "\n\n"
+    if server_name:
+        text += f"Сервер: {server_name}\n\n"
+    text += f"Мероприятие начнется <t:{start_ts}:R>! Моды уже можно начать скачивать!"
+    if password:
+        text += f" Пароль: {password}"
+    return text
+
+
 class AttendanceWizard:
     def __init__(self, event_id, num_games, event_title):
         self.event_id = event_id
@@ -3242,6 +3324,12 @@ async def finalize_attendance(interaction, wizard):
     attendance = load_json(ATTENDANCE_FILE, {})
     old_record = attendance.get(wizard.event_id)
 
+    record['thread_id'] = thread.id
+
+    # Если ветка уже закрыта (мероприятие ранее было автоматически завершено) —
+    # открываем её на время публикации отчёта, заблокируем обратно ниже.
+    await unlock_and_unarchive_thread(thread)
+
     if old_record:
         if old_record.get('attendance_message_id') and old_record.get('thread_id'):
             try:
@@ -3297,6 +3385,32 @@ async def finalize_attendance(interaction, wizard):
     queue_changed = await apply_squad_commander_queue_promotion(wizard, old_record=old_record)
     if queue_changed:
         await refresh_all_active_event_embeds()
+
+    # === Завершение мероприятия при подаче явки (п.1, п.2) ===
+    event_end_dt = datetime.fromtimestamp(event['end_time'], MSK)
+    now = datetime.now(MSK)
+    events_fresh = load_json(EVENTS_FILE, {})
+    fresh_event = events_fresh.get(wizard.event_id)
+    if fresh_event and fresh_event.get('status') != 'completed':
+        was_early = now < event_end_dt
+        fresh_event['status'] = 'completed'
+        save_json(EVENTS_FILE, events_fresh)
+        await refresh_event_message(wizard.event_id)
+        try:
+            await thread.edit(name=desired_thread_name(fresh_event))
+        except Exception:
+            pass
+        if was_early:
+            try:
+                msg = await thread.send(render_early_completion_message(fresh_event))
+                record_thread_message(fresh_event, msg.id, 'early_completion')
+                save_json(EVENTS_FILE, events_fresh)
+            except Exception:
+                pass
+        await process_inactivity_discipline_for_event(wizard.event_id)
+
+    # Ветка закрывается и блокируется в ЛЮБОМ случае — раз отчёт о явке опубликован (п.2)
+    await lock_and_archive_thread(thread)
 
     await interaction.followup.send(es("✅ Отчёт о явке опубликован в ветке мероприятия!"), ephemeral=True)
     print(f"✅ Отчёт о явке для '{wizard.event_title}' опубликован")
@@ -3711,7 +3825,8 @@ async def update_event(event_id, title, description, start_time, end_time, image
     event['description'] = description
     event['start_time'] = int(start_time.timestamp())
     event['end_time'] = int(end_time.timestamp())
-    if event.get('status') == 'completed' and event['end_time'] > int(datetime.now(MSK).timestamp()):
+    became_active_again = (event.get('status') == 'completed' and event['end_time'] > int(datetime.now(MSK).timestamp()))
+    if became_active_again:
         event['status'] = 'active'
         event['discipline_processed'] = False
     if image_key is not None:
@@ -3724,6 +3839,12 @@ async def update_event(event_id, title, description, start_time, end_time, image
     event['reminder_15min_sent'] = False
     save_json(EVENTS_FILE, events)
     await refresh_event_message(event_id)
+    if became_active_again and event.get('thread_id'):
+        try:
+            thread = await client.fetch_channel(event['thread_id'])
+            await unlock_and_unarchive_thread(thread)
+        except Exception:
+            pass
 
 
 async def cancel_event(interaction, event_id):
@@ -3743,8 +3864,11 @@ async def cancel_event(interaction, event_id):
     if event.get('thread_id'):
         try:
             thread = await client.fetch_channel(event['thread_id'])
+            await unlock_and_unarchive_thread(thread)
             await thread.edit(name=desired_thread_name(event))
-            await thread.send(es(f"🚫 Мероприятие «{event['title']}» отменено командованием ({interaction.user.display_name})."))
+            msg = await thread.send(render_cancel_message(event, interaction.user.display_name))
+            record_thread_message(event, msg.id, 'cancelled', extra={'by_user': interaction.user.display_name})
+            save_json(EVENTS_FILE, events)
         except Exception:
             pass
     await interaction.response.send_message(es("✅ Мероприятие отменено! Данные сохранены, его можно снова активировать."), ephemeral=True)
@@ -3764,13 +3888,16 @@ async def reactivate_event(interaction, event_id):
     event['status'] = 'completed' if datetime.now(MSK) > event_end else 'active'
     save_json(EVENTS_FILE, events)
     await refresh_event_message(event_id)
-    if event['status'] == 'completed':
-        await process_inactivity_discipline_for_event(event_id)
     if event.get('thread_id'):
         try:
             thread = await client.fetch_channel(event['thread_id'])
+            await unlock_and_unarchive_thread(thread)
             await thread.edit(name=desired_thread_name(event))
-            await thread.send(es(f"🔄 Мероприятие «{event['title']}» снова активно."))
+            msg = await thread.send(render_reactivate_message(event))
+            record_thread_message(event, msg.id, 'reactivated')
+            save_json(EVENTS_FILE, events)
+            if event['status'] == 'completed':
+                await lock_and_archive_thread(thread)
         except Exception:
             pass
     await interaction.response.send_message(es("✅ Мероприятие активировано снова!"), ephemeral=True)
@@ -3964,7 +4091,8 @@ async def create_event(title, description, start_time, end_time, image_key='none
         thread = await message.create_thread(name=desired_thread_name(events[event_id]))
         events[event_id]['thread_id'] = thread.id
         mention_block = await get_all_active_members_mentions(datetime.now(MSK))
-        await thread.send(f"{mention_block}\n\n" + es("📢 Бойцы, запланировано мероприятие! Ждем ваших отметок!"))
+        announcement_msg = await thread.send(render_announcement_message(mention_block))
+        record_thread_message(events[event_id], announcement_msg.id, 'announcement', mention_block=mention_block)
         save_json(EVENTS_FILE, events)
     except Exception as e:
         print(f"❌ Ошибка публикации мероприятия: {e}")
@@ -4031,16 +4159,9 @@ async def check_event_reminders():
                     if unmarked:
                         thread = await get_or_create_thread(event, event_id, event['title'])
                         if thread:
-                            mentions = []
-                            for nickname in unmarked:
-                                member = await find_member_by_nickname(nickname)
-                                mentions.append(member.mention if member else f"**{nickname}**")
-                            reminder_text = (
-                                " ".join(mentions) + "\n\n" +
-                                "Бойцы, ждём ваших отметок! До мероприятия осталось 2 суток, но вы пока ещё не отметились! " +
-                                f"Пожалуйста, отметьтесь в основном посте в <#{EVENTS_CHANNEL_ID}>."
-                            )
-                            await thread.send(reminder_text)
+                            mention_block = await build_mentions_for_nicknames(unmarked)
+                            msg = await thread.send(render_reminder_2days_message(mention_block))
+                            record_thread_message(event, msg.id, 'reminder_2days', mention_block=mention_block)
                     event['reminder_2days_sent'] = True
                     changed = True
 
@@ -4065,11 +4186,8 @@ async def check_event_reminders():
                             mention_block = await build_mentions_for_nicknames(accepted)
                             should_send = bool(accepted)
                         if should_send:
-                            reminder_text = (
-                                mention_block + "\n\n" +
-                                f"📢 Бойцы, внимание! Мероприятие начнется <t:{start_ts}:R>! Ждем вас на сборах! Заходите в голосовой канал <#{VOICE_CHANNEL_ID}>."
-                            )
-                            await thread.send(reminder_text)
+                            msg = await thread.send(render_reminder_15min_message(mention_block, event))
+                            record_thread_message(event, msg.id, 'reminder_15min', mention_block=mention_block)
                     event['reminder_15min_sent'] = True
                     changed = True
         except Exception:
@@ -4095,8 +4213,6 @@ async def check_event_completion():
             changed = True
             completed_ids.append(event_id)
     if changed:
-        # ВАЖНО: сохраняем ДО обновления сообщений — иначе refresh_event_message()
-        # заново читает данные и видит ещё старый статус 'active' (баг п.1).
         save_json(EVENTS_FILE, events)
         for event_id in completed_ids:
             event = events[event_id]
@@ -4105,10 +4221,13 @@ async def check_event_completion():
                 try:
                     thread = await client.fetch_channel(event['thread_id'])
                     await thread.edit(name=desired_thread_name(event))
-                    await thread.send(es(f"🏁 Мероприятие «{event['title']}» автоматически помечено как завершённое."))
+                    msg = await thread.send(render_completion_message(event))
+                    record_thread_message(event, msg.id, 'completion')
+                    await lock_and_archive_thread(thread)
                 except Exception:
                     pass
             await process_inactivity_discipline_for_event(event_id)
+        save_json(EVENTS_FILE, events)
 
 
 # ============== ОБНОВЛЕНИЕ ШАБЛОНОВ СООБЩЕНИЙ ==============
@@ -4189,7 +4308,72 @@ async def update_all_templates():
             ev_errors += 1
     
     save_json(EVENTS_FILE, events)
-    
+
+    # === 1.5. РЕСИНХРОНИЗАЦИЯ НАЗВАНИЙ ВЕТОК, ВСЕХ СООБЩЕНИЙ БОТА В НИХ, БЛОКИРОВКИ (п.3, п.4) ===
+    thread_names_fixed = 0
+    thread_messages_fixed = 0
+    thread_locks_fixed = 0
+    attendance_for_sync = load_json(ATTENDANCE_FILE, {})
+    for event_id, event in events.items():
+        thread_id = event.get('thread_id')
+        if not thread_id:
+            continue
+        try:
+            thread = await client.fetch_channel(thread_id)
+        except Exception:
+            continue
+
+        desired_name = desired_thread_name(event)
+        if thread.name != desired_name:
+            try:
+                was_locked = getattr(thread, 'locked', False)
+                if was_locked:
+                    await unlock_and_unarchive_thread(thread)
+                await thread.edit(name=desired_name)
+                if was_locked:
+                    await lock_and_archive_thread(thread)
+                thread_names_fixed += 1
+            except Exception as e:
+                print(f"⚠️ Не удалось обновить название ветки {thread_id}: {e}")
+
+        for msg_record in event.get('thread_messages', []):
+            try:
+                msg = await thread.fetch_message(msg_record['id'])
+            except Exception:
+                continue
+            kind = msg_record.get('kind')
+            extra = msg_record.get('extra', {})
+            mention_block = msg_record.get('mention_block', '')
+            new_text = None
+            if kind == 'announcement':
+                new_text = render_announcement_message(mention_block)
+            elif kind == 'completion':
+                new_text = render_completion_message(event)
+            elif kind == 'early_completion':
+                new_text = render_early_completion_message(event)
+            elif kind == 'cancelled':
+                new_text = render_cancel_message(event, extra.get('by_user', '?'))
+            elif kind == 'reactivated':
+                new_text = render_reactivate_message(event)
+            elif kind == 'reminder_2days':
+                new_text = render_reminder_2days_message(mention_block)
+            elif kind == 'reminder_15min':
+                new_text = render_reminder_15min_message(mention_block, event)
+            elif kind == 'mods':
+                new_text = render_mods_message(mention_block, event, extra.get('server_name'), extra.get('password'))
+            if new_text is not None and msg.content != new_text:
+                try:
+                    await msg.edit(content=new_text)
+                    thread_messages_fixed += 1
+                    await asyncio.sleep(1)
+                except Exception as e:
+                    print(f"⚠️ Не удалось обновить сообщение {msg_record.get('id')} в ветке {thread_id}: {e}")
+
+        if event.get('status') == 'completed' and event_id in attendance_for_sync:
+            if not getattr(thread, 'locked', False) or not getattr(thread, 'archived', False):
+                await lock_and_archive_thread(thread)
+                thread_locks_fixed += 1
+
     # === 2. ОБНОВЛЕНИЕ СООБЩЕНИЙ ОТПУСКОВ ===
     for nickname, data in vacations.items():
         if not data.get('message_id') or not data.get('channel_id'):
@@ -4329,8 +4513,9 @@ async def update_all_templates():
     print(f"   📅 Мероприятий: обновлено {ev_updated}, ошибок {ev_errors}")
     print(f"   🏖️ Отпусков: обновлено {vac_updated}, ошибок {vac_errors}")
     print(f"   🏆 Отчётов о явке: обновлено {att_updated}, ошибок {att_errors}")
+    print(f"   💬 Названий веток исправлено: {thread_names_fixed}, сообщений в ветках обновлено: {thread_messages_fixed}, блокировок исправлено: {thread_locks_fixed}")
     
-    return ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors
+    return ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors, thread_names_fixed, thread_messages_fixed, thread_locks_fixed
 
 
 
@@ -4633,6 +4818,42 @@ async def sweep_empty_voice_rooms():
     поверх обычной логики удаления при выходе из комнаты."""
     for channel_id in list(VOICE_ROOMS.keys()):
         await cleanup_empty_temp_room(channel_id)
+
+async def force_restart_bot():
+    """Освобождает lock-файл, поднимает НОВЫЙ независимый процесс бота
+    (вывод которого продолжает писаться в тот же logs/bot_output.log)
+    и завершает текущий процесс. Вызывается кнопкой '🔄 Принудительный
+    перезапуск' в админ-панели."""
+    try:
+        await flush_log_buffer_to_discord()
+    except Exception:
+        pass
+
+    try:
+        _release_instance_lock()
+    except Exception as e:
+        _original_print(f"⚠️ Ошибка при освобождении lock-файла перед перезапуском: {e}")
+
+    try:
+        log_dir = os.path.join(BASE_DIR, 'logs')
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, 'bot_output.log')
+        log_file = open(log_path, 'a', encoding='utf-8')
+        kwargs = {}
+        if os.name == 'nt':
+            kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            kwargs['start_new_session'] = True
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__)],
+            cwd=BASE_DIR, stdout=log_file, stderr=log_file, stdin=subprocess.DEVNULL,
+            **kwargs
+        )
+        _original_print("🔄 Новый процесс бота запущен, завершаю текущий...")
+    except Exception as e:
+        _original_print(f"❌ Не удалось запустить новый процесс бота при перезапуске: {e}")
+
+    os._exit(0)
 
 
 # ============== СОБЫТИЯ DISCORD ==============
