@@ -1900,6 +1900,35 @@ class WeeklyEventManageActionsView(discord.ui.View):
         else:
             await interaction.response.send_message(es("❌ Не найдено!"), ephemeral=True)
 
+class TestAnketaModal(discord.ui.Modal, title=es("🧪 Тестовая публикация анкеты")):
+    profile_uid = discord.ui.TextInput(
+        label="UID профиля в Firebase",
+        placeholder="3Y1qZeszbihw5UM3y58bxz2ldP12",
+        default="3Y1qZeszbihw5UM3y58bxz2ldP12",
+        required=True, max_length=64
+    )
+
+    async def on_submit(self, interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        uid = self.profile_uid.value.strip()
+        if not fs_db:
+            await interaction.followup.send(es("❌ Firebase недоступен (режим DATA_BACKEND='json')."), ephemeral=True)
+            return
+        try:
+            loop = asyncio.get_event_loop()
+            doc = await loop.run_in_executor(EXECUTOR, lambda: fs_db.collection('profiles').document(uid).get())
+            if not doc.exists:
+                await interaction.followup.send(es(f"❌ Профиль с UID `{uid}` не найден!"), ephemeral=True)
+                return
+            data = doc.to_dict() or {}
+            channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
+            mention_block = get_anketa_leadership_mentions(channel.guild, data.get('gamesInterested', []))
+            embed = await build_anketa_embed(uid, data)
+            await channel.send(content=mention_block if mention_block else None, embed=embed)
+            await interaction.followup.send(es(f"✅ Тестовая анкета опубликована в <#{ANKETA_CHANNEL_ID}>!"), ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
+
 class AdminMainMenuView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -1995,6 +2024,15 @@ class AdminMainMenuView(discord.ui.View):
                f"🛠️ Якорных сообщений обновлено: **{anchors_fixed}**"),
             ephemeral=True
         )
+        
+
+    @discord.ui.button(label=es("🧪 Тест: опубликовать анкету"), style=discord.ButtonStyle.secondary, custom_id="admin_test_anketa", row=4)
+    async def test_anketa_button(self, interaction, button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+            return
+        await interaction.response.send_modal(TestAnketaModal())
+
         
     @discord.ui.button(label=es("🔧 Принудительный перезапуск бота"), style=discord.ButtonStyle.danger, custom_id="admin_force_restart", row=4)
     async def force_restart_button(self, interaction, button):
@@ -2425,62 +2463,72 @@ async def get_invited_by_uid(uid):
 
 # --- Форматирование сообщений ---
 
-async def build_anketa_message(uid, data, mention_block: str = ""):
+async def build_anketa_embed(uid, data) -> discord.Embed:
+    """Формирует красиво оформленный embed с анкетой кандидата."""
     callsign = data.get('callsign', '?')
-    lines = []
-    lines.append(f"Электронная почта: {data.get('email') or '—'}")
-    lines.append(f"Имя и фамилия: {data.get('fullName') or '—'}")
-    lines.append(f"Возраст: {data.get('age', '—')}")
-    lines.append(f"Discord ID: {data.get('discordId') or '—'}")
-    lines.append(f"Steam ID: {data.get('steamId') or '—'}")
+
+    embed = discord.Embed(
+        title=es(f"📋 Новая анкета: {callsign}"),
+        color=discord.Color.gold()
+    )
+
     steam_url = data.get('steamProfileUrl') or ''
-    lines.append(f"Ссылка на Steam: <{steam_url}>" if steam_url else "Ссылка на Steam: —")
-    lines.append(f"Arma ID: {data.get('armaId') or '—'}")
-    lines.append(f"Часовой пояс: {data.get('timezone') or '—'}")
-    lines.append(f"Дата рождения: {data.get('birthDate') or '—'}")
+    contact_lines = [
+        f"**Эл. почта:** {data.get('email') or '—'}",
+        f"**Discord ID:** {data.get('discordId') or '—'}",
+        f"**Steam ID:** {data.get('steamId') or '—'}",
+        f"**Steam-профиль:** [ссылка]({steam_url})" if steam_url else "**Steam-профиль:** —",
+        f"**Arma ID:** {data.get('armaId') or '—'}",
+    ]
+    embed.add_field(name=es("👤 Личные данные"),
+                     value=(f"**Имя:** {data.get('fullName') or '—'}\n"
+                            f"**Возраст:** {data.get('age', '—')}\n"
+                            f"**Дата рождения:** {data.get('birthDate') or '—'}\n"
+                            f"**Часовой пояс:** {data.get('timezone') or '—'}"),
+                     inline=False)
+    embed.add_field(name=es("📞 Контакты"), value="\n".join(contact_lines), inline=False)
 
     extra = data.get('extraContacts', {}) or {}
+    extra_lines = []
     if extra.get('phone'):
-        lines.append(f"Телефон: {extra['phone']}")
+        extra_lines.append(f"**Телефон:** {extra['phone']}")
     if data.get('telegramUrl'):
-        lines.append(f"Ссылка на Telegram: <{data['telegramUrl']}>")
+        extra_lines.append(f"**Telegram:** [ссылка]({data['telegramUrl']})")
     if data.get('vkUrl'):
-        lines.append(f"Ссылка на ВКонтакте: <{data['vkUrl']}>")
+        extra_lines.append(f"**ВКонтакте:** [ссылка]({data['vkUrl']})")
     if extra.get('other'):
-        lines.append(f"Другой контакт: {extra['other']}")
+        extra_lines.append(f"**Другое:** {extra['other']}")
+    if extra_lines:
+        embed.add_field(name=es("📇 Доп. контакты"), value="\n".join(extra_lines), inline=False)
 
     referrer = data.get('referrerCallsign') or data.get('referredByText') or ''
-    lines.append(f"Кем приглашён: {referrer if referrer else '—'}")
-
     invited = await get_invited_by_uid(uid)
-    lines.append(f"Кого пригласил: {', '.join(invited) if invited else '—'}")
-
-    lines.append(f"Доступность для игр: {data.get('availability') or '—'}")
-    lines.append(f"Почему хочет вступить? {data.get('whyJoin') or '—'}")
-
     how_found = data.get('howFound') or ''
-    if how_found:
-        lines.append(f"Откуда узнал? {how_found}")
-    elif referrer:
-        lines.append("Откуда узнал? Приглашён бойцом (см. выше)")
-    else:
-        lines.append("Откуда узнал? —")
+    if not how_found:
+        how_found = "Приглашён бойцом (см. ниже)" if referrer else "—"
+    embed.add_field(name=es("🔗 Приглашения"),
+                     value=(f"**Кем приглашён:** {referrer if referrer else '—'}\n"
+                            f"**Кого пригласил:** {', '.join(invited) if invited else '—'}\n"
+                            f"**Откуда узнал:** {how_found}"),
+                     inline=False)
+
+    embed.add_field(name=es("🕒 Доступность"), value=data.get('availability') or '—', inline=False)
+    embed.add_field(name=es("💬 Почему хочет вступить"), value=data.get('whyJoin') or '—', inline=False)
 
     games = data.get('gamesInterested', []) or []
-    lines.append(f"Игры, в которых заинтересован: {', '.join(games) if games else '—'}")
-
     exp_by_game = data.get('experienceByGame', {}) or {}
     hours_by_game = data.get('hoursByGame', {}) or {}
-    for game in games:
-        hours = hours_by_game.get(game)
-        hours_str = f"{hours} ч." if hours is not None else "? ч."
-        exp_text = exp_by_game.get(game, '')
-        lines.append(f"Опыт в {game}: {hours_str} — {exp_text}" if exp_text else f"Опыт в {game}: {hours_str}")
+    if games:
+        exp_lines = []
+        for game in games:
+            hours = hours_by_game.get(game)
+            hours_str = f"{hours} ч." if hours is not None else "? ч."
+            exp_text = exp_by_game.get(game, '')
+            exp_lines.append(f"**{game}:** {hours_str}" + (f" — {exp_text}" if exp_text else ""))
+        embed.add_field(name=es("🎮 Игровой опыт"), value="\n".join(exp_lines), inline=False)
 
-    body = "\n".join(f"> {line}" for line in lines)
-    ping_part = f"{mention_block} " if mention_block else ""
-    header = f"**🔔 {ping_part}Поступила новая анкета от бойца {callsign}:**"
-    return header + "\n\n" + body
+    embed.set_footer(text=f"UID: {uid}")
+    return embed
 
 
 async def build_changelog_message(uid, data):
@@ -2517,12 +2565,13 @@ async def handle_new_profile_watch(doc_id, data):
     try:
         channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
         mention_block = get_anketa_leadership_mentions(channel.guild, data.get('gamesInterested', []))
-        text = await build_anketa_message(doc_id, data, mention_block=mention_block)
-        await send_chunked(channel, text)
+        embed = await build_anketa_embed(doc_id, data)
+        await channel.send(content=mention_block if mention_block else None, embed=embed)
     except Exception as e:
         print(f"❌ Ошибка публикации новой анкеты ({doc_id}): {e}")
     finally:
         await set_watcher_last_ts('profiles', _extract_timestamp(data.get('createdAt')))
+
 
 async def handle_new_changelog_watch(doc_id, data):
     try:
