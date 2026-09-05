@@ -1915,51 +1915,6 @@ def _publish_all_existing_anketas_sync():
     items.sort(key=lambda x: x[0])
     return items
 
-
-class ConfirmPublishAllAnketasView(discord.ui.View):
-    def __init__(self):
-        super().__init__(timeout=60)
-
-    @discord.ui.button(label=es("✅ Да, опубликовать все"), style=discord.ButtonStyle.success)
-    async def confirm(self, interaction, button):
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        if not fs_db:
-            await interaction.followup.send(es("❌ Firebase недоступен (режим DATA_BACKEND='json')."), ephemeral=True)
-            return
-        try:
-            loop = asyncio.get_event_loop()
-            items = await loop.run_in_executor(EXECUTOR, _publish_all_existing_anketas_sync)
-        except Exception as e:
-            await interaction.followup.send(f"❌ Ошибка чтения профилей: {e}", ephemeral=True)
-            return
-
-        channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
-        published = 0
-        skipped = 0
-        for created_at_dt, uid, data in items:
-            if get_anketa_message_info(uid):
-                skipped += 1
-                continue
-            try:
-                mention_block = get_anketa_leadership_mentions(channel.guild, data.get('gamesInterested', []))
-                embed = await build_anketa_embed(uid, data, is_new=False)
-                msg = await channel.send(content=mention_block if mention_block else None, embed=embed)
-                save_anketa_message_info(uid, msg.id, channel.id)
-                published += 1
-                await asyncio.sleep(1.5)
-            except Exception as e:
-                print(f"⚠️ Не удалось опубликовать анкету uid={uid}: {e}")
-
-        await interaction.followup.send(
-            es(f"✅ Опубликовано анкет: **{published}**. Пропущено (уже были опубликованы ранее): **{skipped}**."),
-            ephemeral=True
-        )
-
-    @discord.ui.button(label=es("🚫 Отмена"), style=discord.ButtonStyle.secondary)
-    async def cancel(self, interaction, button):
-        await interaction.response.send_message(es("🚫 Публикация отменена."), ephemeral=True)
-
-
 class AdminMainMenuView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
@@ -2055,19 +2010,6 @@ class AdminMainMenuView(discord.ui.View):
                f"🛠️ Якорных сообщений обновлено: **{anchors_fixed}**"),
             ephemeral=True
         )
-        
-
-    @discord.ui.button(label=es("📋 Опубликовать все анкеты"), style=discord.ButtonStyle.secondary, custom_id="admin_publish_all_anketas", row=4)
-    async def publish_all_anketas_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-            return
-        await interaction.response.send_message(
-            es(f"⚠️ Это опубликует в <#{ANKETA_CHANNEL_ID}> ВСЕ существующие анкеты из Firebase "
-               "(по порядку даты регистрации), кроме тех, что уже были опубликованы ранее. Продолжить?"),
-            view=ConfirmPublishAllAnketasView(), ephemeral=True
-        )
-
         
     @discord.ui.button(label=es("🔧 Принудительный перезапуск бота"), style=discord.ButtonStyle.danger, custom_id="admin_force_restart", row=4)
     async def force_restart_button(self, interaction, button):
