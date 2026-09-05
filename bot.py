@@ -1851,7 +1851,7 @@ class AdminMainMenuView(discord.ui.View):
             return
         await interaction.response.send_message(
             es("🔄 Начинаю обновление шаблонов всех сообщений...\n"
-               "Это может занять несколько секунд."),
+               "Это может занять несколько минут."),
             ephemeral=True
         )
         ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors = await update_all_templates()
