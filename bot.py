@@ -2043,7 +2043,7 @@ class AdminMainMenuView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label=es("🧹 Очистка логи"), style=discord.ButtonStyle.danger, custom_id="admin_clear_logs", row=4)
+    @discord.ui.button(label=es("🧹 Очистка логов"), style=discord.ButtonStyle.danger, custom_id="admin_clear_logs", row=4)
     async def clear_logs_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
