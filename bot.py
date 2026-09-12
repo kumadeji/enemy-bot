@@ -11,10 +11,15 @@ import atexit
 # Принудительно переключаем оба потока на UTF-8 в самом начале, до первого print().
 if sys.platform == 'win32':
     try:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+        # line_buffering=True — построчный сброс буфера вместо блочного
+        # (~8 КБ). Без этого при перенаправлении вывода в файл (>> в .bat)
+        # print() может физически не долетать до диска долгое время —
+        # особенно критично при os._exit(), который не флашит буферы вообще.
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
     except Exception:
         pass
+
 
 import logging
 import threading as _threading_early
@@ -318,29 +323,34 @@ acquire_single_instance_lock()
 
 # ============== УТИЛИТА ДЛЯ ЗАМЕНЫ ПРОБЕЛОВ ПОСЛЕ ЭМОДЗИ ==============
 
+_ES_REPLACEMENTS = {
+    '🔔 ': '🔔ㅤ', '📌 ': '📌ㅤ', '✅ ': '✅ㅤ', '❌ ': '❌ㅤ',
+    '❓ ': '❓ㅤ', '💡 ': '💡ㅤ', '🏖️ ': '🏖️ㅤ', '🏖 ': '🏖ㅤ',
+    '📅 ': '📅ㅤ', '📝 ': '📝ㅤ', '🗑️ ': '🗑️ㅤ', '🔄 ': '🔄ㅤ',
+    '🔍 ': '🔍ㅤ', '⏰ ': '⏰ㅤ', '👤 ': '👤ㅤ', '🛠️ ': '🛠️ㅤ',
+    '⚡ ': '⚡ㅤ', '📍 ': '📍ㅤ', '👉 ': '👉ㅤ', '📤 ': '📤ㅤ',
+    '⚠️ ': '⚠️ㅤ', '🔴 ': '🔴ㅤ', '🟡 ': '🟡ㅤ', 'ℹ️ ': 'ℹ️ㅤ',
+    '⛔ ': '⛔ㅤ', '🎯 ': '🎯ㅤ', '🔧 ': '🔧ㅤ', '💬 ': '💬ㅤ',
+    '📋 ': '📋ㅤ', '📖 ': '📖ㅤ', '📞 ': '📞ㅤ', '✏️ ': '✏️ㅤ',
+    '💥 ': '💥ㅤ', '⭐ ': '⭐ㅤ', '🧪 ': '🧪ㅤ', '📭 ': '📭ㅤ',
+    '📢 ': '📢ㅤ', '⏳ ': '⏳ㅤ', '🎮 ': '🎮ㅤ', '👥 ': '👥ㅤ',
+    '🕹️ ': '🕹️ㅤ', '🏆 ': '🏆ㅤ', '🪖 ': '🪖ㅤ', '🔵 ': '🔵ㅤ',
+    '🍻 ': '🍻ㅤ', '🚪 ': '🚪ㅤ', '➡️ ': '➡️ㅤ', '⏭️ ': '⏭️ㅤ',
+    '🖼️ ': '🖼️ㅤ', '🚫 ': '🚫ㅤ', '🎖️ ': '🎖️ㅤ', '🧩 ': '🧩ㅤ',
+    '🏁 ': '🏁ㅤ', '🚀 ': '🚀ㅤ', '🔁 ': '🔁ㅤ',
+}
+# Один скомпилированный regex вместо 64 последовательных str.replace()
+# на каждый вызов (раньше es() создавала словарь заново и делала 64 прохода
+# по строке при КАЖДОМ вызове — а вызывается она сотни раз за один рендер
+# embed'а/сообщения).
+_ES_PATTERN = re.compile('|'.join(re.escape(k) for k in sorted(_ES_REPLACEMENTS, key=len, reverse=True)))
+
+
 def es(text):
     """Заменяет обычный пробел после эмодзи на символ ㅤ (U+3164)"""
-    replacements = {
-        '🔔 ': '🔔ㅤ', '📌 ': '📌ㅤ', '✅ ': '✅ㅤ', '❌ ': '❌ㅤ',
-        '❓ ': '❓ㅤ', '💡 ': '💡ㅤ', '🏖️ ': '🏖️ㅤ', '🏖 ': '🏖ㅤ',
-        '📅 ': '📅ㅤ', '📝 ': '📝ㅤ', '🗑️ ': '🗑️ㅤ', '🔄 ': '🔄ㅤ',
-        '🔍 ': '🔍ㅤ', '⏰ ': '⏰ㅤ', '👤 ': '👤ㅤ', '🛠️ ': '🛠️ㅤ',
-        '⚡ ': '⚡ㅤ', '📍 ': '📍ㅤ', '👉 ': '👉ㅤ', '📤 ': '📤ㅤ',
-        '⚠️ ': '⚠️ㅤ', '🔴 ': '🔴ㅤ', '🟡 ': '🟡ㅤ', 'ℹ️ ': 'ℹ️ㅤ',
-        '⛔ ': '⛔ㅤ', '🎯 ': '🎯ㅤ', '🔧 ': '🔧ㅤ', '💬 ': '💬ㅤ',
-        '📋 ': '📋ㅤ', '📖 ': '📖ㅤ', '📞 ': '📞ㅤ', '✏️ ': '✏️ㅤ',
-        '💥 ': '💥ㅤ', '⭐ ': '⭐ㅤ', '🧪 ': '🧪ㅤ', '📭 ': '📭ㅤ',
-        '📢 ': '📢ㅤ', '⏳ ': '⏳ㅤ', '🎮 ': '🎮ㅤ', '👥 ': '👥ㅤ',
-        '🕹️ ': '🕹️ㅤ', '🏆 ': '🏆ㅤ', '🪖 ': '🪖ㅤ', '🔵 ': '🔵ㅤ',
-        '🍻 ': '🍻ㅤ', '🚪 ': '🚪ㅤ', '➡️ ': '➡️ㅤ', '⏭️ ': '⏭️ㅤ',
-        '🖼️ ': '🖼️ㅤ', '🚫 ': '🚫ㅤ', '🎖️ ': '🎖️ㅤ', '🧩 ': '🧩ㅤ',
-        '🏁 ': '🏁ㅤ', '🚀 ': '🚀ㅤ', '🔁 ': '🔁ㅤ', '🧹 ': '🧹ㅤ',
-    }
     if not isinstance(text, str):
         return text
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-    return text
+    return _ES_PATTERN.sub(lambda m: _ES_REPLACEMENTS[m.group(0)], text)
 
 
 # ============== НАСТРОЙКИ ==============
@@ -721,6 +731,8 @@ scheduler = AsyncIOScheduler(timezone=MSK, job_defaults={
 
 
 check_lock = asyncio.Lock()
+_events_write_lock = asyncio.Lock()
+
 
 
 class MessageDeduplicator:
@@ -1418,30 +1430,42 @@ def save_json(filename, data):
         print(f"⚠️ Не удалось запланировать резервную запись '{filename}': {e}")
 
 
-def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
-    vacations = load_json(VACATIONS_FILE, {})
-    clean_nickname = nickname.strip().lower()
+def build_active_vacation_set(vacations: dict, current_date: datetime) -> set:
+    """Строит множество ников, находящихся в активном отпуске на current_date,
+    ОДИН РАЗ за весь набор отпусков — вместо того чтобы для каждого бойца
+    заново читать (с deepcopy) и построчно перебирать ВЕСЬ словарь отпусков
+    (раньше get_active_members на N бойцов делал N таких проходов)."""
     current_date_only = current_date.date()
+    active = set()
     for vac_name, data in vacations.items():
-        if clean_nickname == vac_name.strip().lower():
-            if data.get('status') != 'active':
-                continue
-            try:
-                start = datetime.fromisoformat(data['start']).date()
-                end = datetime.fromisoformat(data['end']).date()
-                if start <= current_date_only <= end:
-                    return True
-            except Exception:
-                continue
-    return False
+        if data.get('status') != 'active':
+            continue
+        try:
+            start = datetime.fromisoformat(data['start']).date()
+            end = datetime.fromisoformat(data['end']).date()
+            if start <= current_date_only <= end:
+                active.add(vac_name.strip().lower())
+        except Exception:
+            continue
+    return active
+
+
+def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
+    """Сохранена для мест, где нужна разовая проверка ОДНОГО бойца
+    (например, при отметке 'Приду' конкретным человеком) — там читать
+    все отпуска целиком один раз тоже нормально, просто не в цикле."""
+    vacations = load_json(VACATIONS_FILE, {})
+    active_set = build_active_vacation_set(vacations, current_date)
+    return nickname.strip().lower() in active_set
 
 
 async def get_active_members(current_date: datetime, registered_before: datetime = None) -> list:
-    """Список активных (не в отпуске) бойцов. Если передан registered_before —
-    дополнительно исключает бойцов, ещё не зарегистрированных на сайте на этот
-    момент (используется для 'Не отметились' у СТАРЫХ мероприятий)."""
+    """Список активных (не в отпуске) бойцов. Отпуска читаются и разбираются
+    РОВНО ОДИН РАЗ за вызов (а не по разу на каждого бойца клана)."""
     members = await load_clan_members_from_firebase()
-    filtered = [m for m in members if not is_on_vacation_dynamic(m, current_date)]
+    vacations = load_json(VACATIONS_FILE, {})
+    active_vacation_set = build_active_vacation_set(vacations, current_date)
+    filtered = [m for m in members if m.strip().lower() not in active_vacation_set]
     if registered_before is not None:
         filtered = [
             m for m in filtered
@@ -2265,7 +2289,14 @@ def desired_thread_name(event: dict) -> str:
 
 
 async def refresh_event_message(event_id):
-    """Перерисовывает сообщение мероприятия (embed + актуальный набор кнопок)."""
+    """Перерисовывает сообщение мероприятия (embed + актуальный набор кнопок).
+
+    ВАЖНО: attachments передаётся ТОЛЬКО если image_key реально изменился
+    с последнего рендера. Раньше File(path) прикреплялся заново при КАЖДОМ
+    вызове (то есть на каждый клик 'Приду'/'Не приду') — это повторный
+    multipart-upload одного и того же PNG-файла с диска. Если attachments
+    вообще не передавать, discord.py сохраняет уже прикреплённое вложение,
+    и embed.set_image(url='attachment://...') продолжает работать."""
     events = load_json(EVENTS_FILE, {})
     event = events.get(event_id)
     if not event:
@@ -2275,13 +2306,54 @@ async def refresh_event_message(event_id):
         message = await channel.fetch_message(event['message_id'])
         embed = await build_event_embed(event_id)
         view = build_event_view(event, event_id)
-        filename, path = get_image_info(event.get('image_key', 'none'))
-        if filename and path:
-            await message.edit(embed=embed, view=view, attachments=[discord.File(path, filename=filename)])
+
+        image_key = event.get('image_key', 'none')
+        last_image_key = event.get('_last_rendered_image_key')
+
+        if image_key != last_image_key:
+            filename, path = get_image_info(image_key)
+            if filename and path:
+                await message.edit(embed=embed, view=view, attachments=[discord.File(path, filename=filename)])
+            else:
+                await message.edit(embed=embed, view=view, attachments=[])
+            event['_last_rendered_image_key'] = image_key
+            save_json(EVENTS_FILE, events)
         else:
-            await message.edit(embed=embed, view=view, attachments=[])
+            await message.edit(embed=embed, view=view)
     except Exception as e:
         print(f"⚠️ Не удалось обновить сообщение мероприятия: {e}")
+
+
+class EmbedRefresher:
+    """Коалесирует запросы на обновление embed'а мероприятия: если за короткое
+    окно (delay секунд) по одному и тому же event_id пришло несколько
+    запросов (например, 20 бойцов подряд жмут 'Приду' после общего пинга),
+    реальный refresh_event_message() выполняется РОВНО ОДИН РАЗ на event_id,
+    а не по разу на каждый клик — это резко снижает число edit-запросов
+    к Discord (и связанный с ними риск 429) и заодно СУЖАЕТ окно гонки
+    'load-modify-save' между параллельными обработчиками."""
+    def __init__(self, delay: float = 1.5):
+        self._delay = delay
+        self._pending: set[str] = set()
+        self._task: asyncio.Task | None = None
+
+    def schedule(self, event_id: str):
+        self._pending.add(event_id)
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._run())
+
+    async def _run(self):
+        await asyncio.sleep(self._delay)
+        ids, self._pending = self._pending, set()
+        for eid in ids:
+            try:
+                await refresh_event_message(eid)
+            except Exception as e:
+                print(f"⚠️ EmbedRefresher: ошибка обновления {eid}: {e}")
+
+
+embed_refresher = EmbedRefresher(delay=1.5)
+
 
 
 # --- Коллбэки кнопок (standalone-функции, чтобы работать в разных сочетаниях View) ---
@@ -4442,8 +4514,13 @@ async def handle_event_response(interaction, event_id, response_type):
         event['declined'][nickname] = True
         event['accepted'].pop(nickname, None)
         await interaction.response.send_message(es("❌ Вы отказались от участия!"), ephemeral=True)
-    save_json(EVENTS_FILE, events)
-    await refresh_event_message(event_id)
+    # Блокировка нужна, потому что фоновые задачи (check_event_reminders,
+    # check_event_completion) держат СВОЙ снимок events в памяти дольше,
+    # чем занимает это присвоение — без лока их save_json мог бы перезаписать
+    # только что сохранённую здесь отметку бойца устаревшим снимком.
+    async with _events_write_lock:
+        save_json(EVENTS_FILE, events)
+    embed_refresher.schedule(event_id)
 
 
 async def open_edit_modal(interaction, event_id, image_key=None, num_games=None, mandatory=None):
@@ -4851,7 +4928,21 @@ async def check_event_reminders():
         except Exception:
             pass
     if changed:
-        save_json(EVENTS_FILE, events)
+        # Между началом функции (load) и этой строкой прошло время, за
+        # которое бойцы могли жать 'Приду'/'Не приду' через
+        # handle_event_response. Перечитываем актуальный снимок ПОД ЛОКОМ
+        # и переносим в него только изменения ЭТОЙ функции (флаги напоминаний),
+        # чтобы не затереть чужие отметки устаревшей копией events.
+        async with _events_write_lock:
+            fresh_events = load_json(EVENTS_FILE, {})
+            for event_id, event in events.items():
+                fresh = fresh_events.get(event_id)
+                if fresh is None:
+                    continue
+                fresh['reminder_2days_sent'] = event.get('reminder_2days_sent', fresh.get('reminder_2days_sent'))
+                fresh['reminder_15min_sent'] = event.get('reminder_15min_sent', fresh.get('reminder_15min_sent'))
+            save_json(EVENTS_FILE, fresh_events)
+
 
 async def check_event_completion():
     """Автоматически переводит активные мероприятия в статус 'completed' после окончания."""
@@ -4871,7 +4962,17 @@ async def check_event_completion():
             changed = True
             completed_ids.append(event_id)
     if changed:
-        save_json(EVENTS_FILE, events)
+        # Аналогично check_event_reminders: переносим только смену статуса
+        # на completed в актуальный снимок под локом, не затирая отметки,
+        # которые могли прийти параллельно через handle_event_response.
+        async with _events_write_lock:
+            fresh_events = load_json(EVENTS_FILE, {})
+            for event_id in completed_ids:
+                fresh = fresh_events.get(event_id)
+                if fresh is not None:
+                    fresh['status'] = 'completed'
+            save_json(EVENTS_FILE, fresh_events)
+            events = fresh_events
         for event_id in completed_ids:
             event = events[event_id]
             await refresh_event_message(event_id)
@@ -5605,7 +5706,19 @@ async def force_restart_bot():
     except Exception:
         pass
 
+    # os._exit() НЕ сбрасывает буферы stdout/stderr на диск (в отличие от
+    # sys.exit()) — если вывод перенаправлен в файл (а не в интерактивный
+    # терминал), Python использует блочную буферизацию, и все print() из
+    # этой функции могли остаться только во внутреннем буфере интерпретатора,
+    # физически не попав в bot_output.log до убийства процесса.
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+
     os._exit(0)
+
 
 
 
