@@ -1679,24 +1679,53 @@ def save_json(filename, data):
         print(f"⚠️ Не удалось запланировать резервную запись '{filename}': {e}")
 
 
-def build_active_vacation_set(vacations: dict, current_date: datetime) -> set:
-    """Строит множество ников, находящихся в активном отпуске на current_date,
-    ОДИН РАЗ за весь набор отпусков — вместо того чтобы для каждого бойца
-    заново читать (с deepcopy) и построчно перебирать ВЕСЬ словарь отпусков
-    (раньше get_active_members на N бойцов делал N таких проходов)."""
-    current_date_only = current_date.date()
-    active = set()
-    for vac_name, data in vacations.items():
-        if data.get('status') != 'active':
+def build_vacation_set_for_date(vacations: dict, target_date: datetime) -> set:
+    """Множество ников (в нижнем регистре), которые находились/находятся
+    в отпуске НА УКАЗАННУЮ ДАТУ. Строится ОДИН РАЗ за весь набор отпусков —
+    вместо N проходов по всему словарю (по одному на каждого бойца).
+
+    ВАЖНО: учитываются не только отпуска со статусом 'active', но и уже
+    ЗАВЕРШЁННЫЕ ('ended_early', 'ended_scheduled'). Проверка по одному лишь
+    'active' ломала историю: боец, бывший в отпуске в день ПРОШЕДШЕГО
+    мероприятия, но уже вышедший из него, задним числом попадал в список
+    «Не отметились» — и, что гораздо хуже, получал дисциплинарное взыскание
+    за мероприятие, на котором отсутствовал легитимно.
+
+    Для досрочно закрытых отпусков фактическим окончанием считается дата
+    closed_at (включительно), а не изначально запланированный end.
+
+    'pending'  — ещё не утверждён, боец обязан отмечаться → НЕ учитываем.
+    'rejected' — отклонён, отпуска не было вовсе        → НЕ учитываем.
+    """
+    target_date_only = target_date.date() if hasattr(target_date, 'date') else target_date
+    result = set()
+    for vac_name, data in (vacations or {}).items():
+        if data.get('status') not in ('active', 'ended_early', 'ended_scheduled'):
             continue
         try:
             start = datetime.fromisoformat(data['start']).date()
             end = datetime.fromisoformat(data['end']).date()
-            if start <= current_date_only <= end:
-                active.add(vac_name.strip().lower())
         except Exception:
             continue
-    return active
+        # Досрочное закрытие: реальный конец — дата закрытия. День закрытия
+        # включаем: лучше лишний раз не пингануть вернувшегося, чем выдать
+        # взыскание тому, кто в этот день ещё был в отпуске.
+        if data.get('status') == 'ended_early' and data.get('closed_at'):
+            try:
+                closed = datetime.fromisoformat(data['closed_at']).date()
+                if closed < end:
+                    end = closed
+            except Exception:
+                pass
+        if start <= target_date_only <= end:
+            result.add(vac_name.strip().lower())
+    return result
+
+
+def build_active_vacation_set(vacations: dict, current_date: datetime) -> set:
+    """Обратно совместимая обёртка — чтобы не менять все места вызова разом.
+    Новый код должен использовать build_vacation_set_for_date()."""
+    return build_vacation_set_for_date(vacations, current_date)
 
 
 def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
@@ -3954,8 +3983,14 @@ async def process_inactivity_discipline_for_event(event_id):
         await _mark_discipline_processed(event_id)
         return
 
-    current_time = datetime.now(MSK)
-    active_members = await get_active_members(current_time, registered_before=event_start_dt)
+    # Взыскание выносится за отсутствие НА МЕРОПРИЯТИИ — значит и отпуска
+    # надо проверять на дату мероприятия, а не на момент запуска обработки.
+    # Иначе сценарий: мероприятие прошло, пока боец был в отпуске; отпуск
+    # закончился; бот перезапустился, recover_incomplete_discipline
+    # доработала событие уже «сегодняшней» датой — и боец получил взыскание
+    # за мероприятие, на котором отсутствовал законно.
+    active_members = await get_active_members(event_start_dt, registered_before=event_start_dt)
+
     accepted = set(event.get('accepted', {}).keys())
     declined = set(event.get('declined', {}).keys())
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
@@ -4240,13 +4275,17 @@ def render_reactivate_message(event: dict) -> str:
     return es(f"🔄 Мероприятие «{clean_event_title(event['title'])}» снова активно.")
 
 def render_reminder_2days_message(mention_block: str) -> str:
+    # es() обязателен: он подставляет узкий пробел U+3164 после эмодзи,
+    # иначе Discord склеивает 📢 с текстом (визуально пропадает отступ).
+    # Раньше здесь его не было — при этом в render_announcement_message и
+    # render_reminder_15min_message он стоял, отсюда и разное оформление.
     return (mention_block + "\n\n" +
-        "📢 Бойцы, ждём ваших отметок! До мероприятия осталось 2 суток, но вы пока ещё не отметились! " +
+        es("📢 Бойцы, ждём ваших отметок! До мероприятия осталось 2 суток, но вы пока ещё не отметились! ") +
         f"Пожалуйста, отметьтесь в основном посте в <#{EVENTS_CHANNEL_ID}>.")
 
 def render_reminder_1day_message(mention_block: str) -> str:
     return (mention_block + "\n\n" +
-        "📢 Бойцы, ждём ваших отметок! До мероприятия остались одни сутки, но вы пока ещё не отметились! " +
+        es("📢 Бойцы, ждём ваших отметок! До мероприятия остались одни сутки, но вы пока ещё не отметились! ") +
         f"Пожалуйста, отметьтесь в основном посте в <#{EVENTS_CHANNEL_ID}>.")
 
 def render_reminder_15min_message(mention_block: str, event: dict) -> str:
@@ -5581,9 +5620,18 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     # (build_event_embed вызывается на каждый refresh) отпуска
     # пересчитывались дважды, а get_expected_squad_commander вдобавок
     # делала это ещё и на КАЖДОГО кандидата в очереди командования.
-    vacation_set = build_active_vacation_set(load_json(VACATIONS_FILE, {}), current_date)
+    
+    # Отпуска считаем НА ДАТУ МЕРОПРИЯТИЯ, а не на «сейчас».
+    # Для прошедших мероприятий это единственный корректный вариант: иначе
+    # боец, бывший тогда в отпуске, задним числом попадает в «Не отметились».
+    # Для будущих — тоже правильнее: тот, кто уйдёт в отпуск до старта,
+    # не должен получать пинги и взыскания за это мероприятие.
+    # (registered_before ниже уже использовал event_start_dt — логика была
+    # задумана верно, но для отпусков не доведена.)
+    vacation_set = build_vacation_set_for_date(load_json(VACATIONS_FILE, {}), event_start_dt)
 
-    active_members = await get_active_members(current_date, registered_before=event_start_dt, vacation_set=vacation_set)
+    active_members = await get_active_members(event_start_dt, registered_before=event_start_dt, vacation_set=vacation_set)
+
     accepted = list(event.get('accepted', {}).keys())
     declined = list(event.get('declined', {}).keys())
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
@@ -5627,7 +5675,9 @@ async def build_event_embed(event_id: str) -> discord.Embed:
 
     # === ОЖИДАЕМЫЙ КОМАНДИР ОТДЕЛЕНИЯ (очередь Firebase) (п.4) ===
     if status == 'active':
-        expected_commander = await get_expected_squad_commander(event, current_date, vacation_set=vacation_set)
+        # vacation_set построен на дату мероприятия — командир не должен
+        # назначаться тому, кто на эту дату в отпуске.
+        expected_commander = await get_expected_squad_commander(event, event_start_dt, vacation_set=vacation_set)
         embed.add_field(
             name=es("🪖 Ожидаемый командир отделения"),
             value=expected_commander if expected_commander else "Не определён",
@@ -5921,7 +5971,7 @@ async def check_event_reminders():
             # должно было уйти напоминание, оно наверстается при следующем
             # запуске (флаг reminder_2days_sent гарантирует отсутствие дублей).
             if event.get('mandatory', True) and not event.get('reminder_2days_sent', False) and timedelta(hours=24) < time_until_start <= timedelta(hours=48):
-                    active_members = await get_active_members(current_time)
+                    active_members = await get_active_members(event_start, registered_before=event_start)
                     accepted = list(event.get('accepted', {}).keys())
                     declined = list(event.get('declined', {}).keys())
                     unmarked = [m for m in active_members if m not in accepted and m not in declined]
@@ -5945,7 +5995,7 @@ async def check_event_reminders():
             # если 2-суточное окно было пропущено (например, мероприятие
             # создано позже, чем за 48ч до старта), суточное всё равно сработает.
             if event.get('mandatory', True) and not event.get('reminder_1day_sent', False) and timedelta(minutes=15) < time_until_start <= timedelta(hours=24):
-                    active_members = await get_active_members(current_time)
+                    active_members = await get_active_members(event_start, registered_before=event_start)
                     accepted = list(event.get('accepted', {}).keys())
                     declined = list(event.get('declined', {}).keys())
                     unmarked = [m for m in active_members if m not in accepted and m not in declined]
@@ -5978,7 +6028,7 @@ async def check_event_reminders():
                             # Мероприятие создано менее чем за сутки — тегаем ТОЛЬКО тех,
                             # кто ещё не отметился (не Приду / не Не приду), и кто не в отпуске.
                             # Роль 'Боец ArmA' целиком больше нигде не пингуется.
-                            active_members = await get_active_members(current_time)
+                            active_members = await get_active_members(event_start, registered_before=event_start)
                             accepted_keys = set(event.get('accepted', {}).keys())
                             declined_keys = set(event.get('declined', {}).keys())
                             unmarked = [m for m in active_members if m not in accepted_keys and m not in declined_keys]
@@ -6059,9 +6109,11 @@ async def check_event_completion():
                 fresh = fresh_events.get(event_id)
                 if fresh is not None:
                     fresh['status'] = 'completed'
-                    # Список сообщений в ветке больше не нужен после
-                    # завершения — ветка блокируется ниже.
-                    fresh.pop('thread_messages', None)
+                    # thread_messages НЕ чистим: в нём лежат ID анонса и всех
+                    # напоминаний, по которым update_all_templates (секция 1.5)
+                    # переформатирует старые сообщения при смене шаблонов.
+                    # Без них история завершённых мероприятий навсегда
+                    # застывает в старом оформлении — ресинхронизировать нечего.
             save_json(EVENTS_FILE, fresh_events)
             events = fresh_events
 
