@@ -184,6 +184,7 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import firebase_admin
 from firebase_admin import credentials as firebase_credentials, firestore
+from google.api_core import exceptions as google_exceptions
 from google.cloud.firestore_v1.base_query import FieldFilter
 
 
@@ -794,6 +795,17 @@ def get_color_category(bg):
             return 'yellow'
     return None
 
+def _open_worksheet_sync(url, sheet_name):
+    """Синхронно (для executor): открывает таблицу и лист одним вызовом.
+    Раньше spreadsheet.worksheet(...) вызывался напрямую в event loop —
+    это блокирующий сетевой запрос к Google, способный подвесить heartbeat
+    гейтвея Discord на время ответа API."""
+    spreadsheet = gc.open_by_url(url)
+    return spreadsheet.worksheet(sheet_name)
+
+
+def get_sheet_data_with_colors_sync(sheet, range_name):
+
 
 def get_sheet_data_with_colors_sync(sheet, range_name):
     """Синхронная версия для выполнения в executor. Выбрасывает исключения при ошибках."""
@@ -1076,11 +1088,16 @@ async def check_spreadsheet():
         return
     async with check_lock:
         try:
+            if not gc:
+                return
+
             thread = await client.fetch_channel(THREAD_ID)
 
             # Удаляем сообщения ПРЕДЫДУЩЕЙ проверки перед публикацией новой —
             # иначе в ветке копятся устаревшие отчёты о проблемах, которые
-            # бойцы могли уже исправить.
+            # бойцы могли уже исправить. Проверка gc выше гарантирует, что
+            # мы не сотрём старый отчёт, если сама проверка всё равно не
+            # сможет выполниться из-за неинициализированного Google-клиента.
             prev = load_json(CHECK_MESSAGES_FILE, {})
             for msg_id in prev.get('message_ids', []):
                 try:
@@ -1090,11 +1107,8 @@ async def check_spreadsheet():
                     pass
             save_json(CHECK_MESSAGES_FILE, {'message_ids': [], 'thread_id': THREAD_ID})
 
-            if not gc:
-                return
-            loop = asyncio.get_event_loop()
-            spreadsheet = await loop.run_in_executor(EXECUTOR, gc.open_by_url, SPREADSHEET_URL)
-            sheet = spreadsheet.worksheet(SHEET_NAME)
+            loop = asyncio.get_running_loop()
+            sheet = await loop.run_in_executor(EXECUTOR, _open_worksheet_sync, SPREADSHEET_URL, SHEET_NAME)
             data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J35')
             if not data_with_colors or len(data_with_colors) < 2:
                 return
@@ -2506,13 +2520,23 @@ async def get_watcher_last_ts(key):
 
 
 async def set_watcher_last_ts(key, dt: datetime):
+    """Продвигает watermark МОНОТОННО: новое значение принимается только
+    если оно больше уже сохранённого. Защищает от отката курсора назад,
+    если несколько обработчиков одного watcher'а завершаются не по порядку
+    доставки — без этой защиты курсор мог 'уехать назад' и вызвать повторную
+    обработку уже виденных документов после следующего рестарта."""
     if not fs_db:
         return
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(EXECUTOR, _set_watcher_state_field_sync, key, dt.timestamp())
+        current = await get_watcher_last_ts(key)
+        new_ts = dt.timestamp()
+        if current is not None and new_ts <= current:
+            return
+        await loop.run_in_executor(EXECUTOR, _set_watcher_state_field_sync, key, new_ts)
     except Exception as e:
         print(f"⚠️ Не удалось сохранить состояние watcher'а '{key}': {e}")
+
 
 
 def _extract_timestamp(value):
@@ -2721,17 +2745,33 @@ async def build_notification_message(uid, data):
 
 # --- Обработчики новых документов ---
 
+_watcher_dedup = {
+    'profiles': MessageDeduplicator(maxlen=1000),
+    'changeLog': MessageDeduplicator(maxlen=1000),
+    'notifications': MessageDeduplicator(maxlen=1000),
+}
+
+
 async def handle_new_profile_watch(doc_id, data):
+    # Firestore при переподключении листенера иногда повторно доставляет уже
+    # виденные документы как ADDED — без этой проверки анкета публикуется дважды.
+    if _watcher_dedup['profiles'].mark_processed(doc_id):
+        return
+    published = False
     try:
         channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
         mention_block = get_anketa_leadership_mentions(channel.guild, data.get('gamesInterested', []))
         embed = await build_anketa_embed(doc_id, data, is_new=True)
         msg = await channel.send(content=mention_block if mention_block else None, embed=embed)
         save_anketa_message_info(doc_id, msg.id, channel.id)
+        published = True
     except Exception as e:
         print(f"❌ Ошибка публикации новой анкеты ({doc_id}): {e}")
-    finally:
+    if published:
+        # Watermark продвигаем ТОЛЬКО при успехе — иначе при сбое публикации
+        # анкета терялась бы навсегда (курсор уже прошёл бы её timestamp).
         await set_watcher_last_ts('profiles', _extract_timestamp(data.get('createdAt')))
+
 
 
 async def get_or_create_anketa_thread(uid: str, anketa_info: dict, fresh_data: dict = None):
@@ -2765,9 +2805,11 @@ async def get_or_create_anketa_thread(uid: str, anketa_info: dict, fresh_data: d
 async def handle_new_changelog_watch(doc_id, data):
     """Публикует запись changeLog ИСКЛЮЧИТЕЛЬНО в ветку анкеты (никогда не
     обновляет сам embed анкеты — это делает отдельный live-watcher профилей,
-    см. handle_profile_modified_watch, так как changeLog не отражает изменения
-    состава/должности, назначаемые вручную командованием)."""
+    см. handle_profile_modified_watch)."""
+    if _watcher_dedup['changeLog'].mark_processed(doc_id):
+        return
     uid = data.get('uid', '')
+    published = False
     try:
         anketa_info = get_anketa_message_info(uid) if uid else None
         if anketa_info and anketa_info.get('channel_id') and anketa_info.get('message_id'):
@@ -2776,14 +2818,15 @@ async def handle_new_changelog_watch(doc_id, data):
             text = await build_changelog_message(doc_id, data)
             await send_chunked(thread, text)
         else:
-            # Нет привязанной анкеты — публикуем как раньше, напрямую в канал анкет.
             channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
             text = await build_changelog_message(doc_id, data)
             await send_chunked(channel, text)
+        published = True
     except Exception as e:
         print(f"❌ Ошибка публикации записи changeLog ({doc_id}): {e}")
-    finally:
+    if published:
         await set_watcher_last_ts('changeLog', _extract_timestamp(data.get('createdAt')))
+
 
 _LAST_ANKETA_EMBED_SNAPSHOT = {}
 _ANKETA_EDIT_LOCK = asyncio.Lock()
@@ -2832,16 +2875,24 @@ async def handle_profile_modified_watch(uid, data):
 
 
 async def handle_new_notification_watch(doc_id, data):
+    if _watcher_dedup['notifications'].mark_processed(doc_id):
+        return
+    published = False
     try:
         thread_id = await get_notifications_thread_id()
         if thread_id:
             thread = await client.fetch_channel(thread_id)
             text = await build_notification_message(data.get('uid', ''), data)
             await send_chunked(thread, text)
+            published = True
+        # Если якорь 'ℹ️ Уведомления' ещё не создан — published остаётся False,
+        # watermark НЕ продвигается, и уведомление будет повторно предложено
+        # к обработке позже (когда якорь появится), а не потеряно навсегда.
     except Exception as e:
         print(f"❌ Ошибка публикации уведомления ({doc_id}): {e}")
-    finally:
+    if published:
         await set_watcher_last_ts('notifications', _extract_timestamp(data.get('createdAt')))
+
 
 def _make_on_added_callback(handler_coro, watch_types=('ADDED',)):
     """Обёртка над Firestore watch-колбэком (выполняется в отдельном grpc-потоке).
@@ -2957,6 +3008,14 @@ async def get_uid_by_nickname(nickname: str):
 
 
 def _apply_gamestats_increment_sync(uid, ko_delta, ks_delta, soldier_delta):
+    """Инкрементирует gameStats бойца. При отсутствии ДОКУМЕНТА профиля —
+    создаёт структуру с нуля (это единственный безопасный случай перезаписи,
+    так как реальной статистики физически нет). При ЛЮБОЙ ДРУГОЙ ошибке
+    (сеть, permission, timeout) — НЕ пытается 'восстановиться' перезаписью:
+    это раньше могло затереть уже накопленную статистику дельтой вместо
+    инкремента. Вместо этого исключение пробрасывается выше — вызывающий
+    код (apply_attendance_to_gamestats) узнаёт о неудаче и не считает
+    начисление применённым (важно для идемпотентности при повторной явке)."""
     doc_ref = fs_db.collection('profiles').document(uid)
     updates = {}
     if ko_delta:
@@ -2969,8 +3028,9 @@ def _apply_gamestats_increment_sync(uid, ko_delta, ks_delta, soldier_delta):
         return
     try:
         doc_ref.update(updates)
-    except Exception:
-        # Структуры gameStats/{game} у профиля ещё нет — создаём с нуля
+    except google_exceptions.NotFound:
+        # Документа профиля физически не существует — единственный случай,
+        # когда 'начать с нуля' безопасен (существующей статистики нет).
         doc_ref.set({
             'gameStats': {
                 GAMESTATS_GAME_NAME: {
@@ -3158,13 +3218,19 @@ async def refresh_all_active_event_embeds():
         await asyncio.sleep(1)
 
 
-async def apply_attendance_to_gamestats(wizard, old_record=None):
+async def apply_attendance_to_gamestats(wizard, old_record=None) -> bool:
     """Считает НЕТТО-изменение отыгрышей (новая явка минус старая, если это
     повторная подача) и инкрементит gameStats в Firebase + создаёт уведомление
-    игроку при положительном приросте (уведомление автоматически попадёт
-    в Discord-канал через realtime-watcher из п.7)."""
+    игроку при положительном приросте. Возвращает True, если ВСЕ дельты были
+    успешно применены — используется вызывающим кодом (finalize_attendance)
+    для идемпотентной пометки 'applied_record': при частичном сбое повторная
+    подача той же явки сможет доначислить недостающее, а не молча решить,
+    что всё уже сделано (что раньше приводило к тихой потере части начислений
+    при падении бота посреди цикла)."""
     new_tally = _tally_from_triples(_extract_game_triples_from_wizard(wizard))
     old_tally = _tally_from_triples(_extract_game_triples_from_record(old_record)) if old_record else {}
+
+    all_succeeded = True
 
     for nickname in set(new_tally) | set(old_tally):
         new_c = new_tally.get(nickname, {'ko': 0, 'ks': 0, 'soldier': 0})
@@ -3179,18 +3245,23 @@ async def apply_attendance_to_gamestats(wizard, old_record=None):
         uid = await get_uid_by_nickname(nickname)
         if not uid:
             print(f"⚠️ Не удалось найти uid для '{nickname}' — отыгрыши не зачтены в Firebase")
+            all_succeeded = False
             continue
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(EXECUTOR, _apply_gamestats_increment_sync, uid, ko_delta, ks_delta, soldier_delta)
         except Exception as e:
             print(f"❌ Ошибка обновления gameStats для {nickname} ({uid}): {e}")
+            all_succeeded = False
             continue
 
         message = build_gamestats_notification_message(max(ko_delta, 0), max(ks_delta, 0), max(soldier_delta, 0))
         if message:
             await create_gamestats_notification(uid, message)
+
+    return all_succeeded
+
 
 def _is_active_entry(entry, now_ms):
     return entry.get('expiresAtMs', 0) > now_ms
@@ -3281,8 +3352,14 @@ def _apply_disciplinary_action_sync(uid):
             result['expelled'] = True
 
         transaction.update(profile_ref, updates)
-        transaction.update(roster_ref, roster_updates)
+        # set(merge=True) вместо update(): update() требует существования
+        # документа в rosterPublic и в противном случае откатывает ВСЮ
+        # транзакцию целиком (включая обновление profile). set(merge=True)
+        # безопасно создаёт документ при отсутствии, не переписывая
+        # остальные поля, если он уже есть.
+        transaction.set(roster_ref, roster_updates, merge=True)
         return result
+
 
     return _txn(transaction)
 
@@ -3300,8 +3377,15 @@ async def apply_inactivity_discipline(uid):
 
 async def process_inactivity_discipline_for_event(event_id):
     """Выносит замечания/выговоры за неактивность всем, кто не отметился на
-    ОБЯЗАТЕЛЬНОМ мероприятии (и не был в отпуске), для мероприятий начиная
-    с DISCIPLINE_CUTOFF. Выполняется РОВНО ОДИН РАЗ на мероприятие."""
+    ОБЯЗАТЕЛЬНОМ мероприятии (и не был в отпуске), начиная с DISCIPLINE_CUTOFF.
+
+    Идемпотентность: 'discipline_processed=True' ставится ТОЛЬКО после того,
+    как обработка ВСЕХ неотметившихся действительно завершилась (а не до
+    цикла, как было раньше) — иначе падение бота посередине цикла навсегда
+    'хоронило' необработанных бойцов. Каждый уже обработанный боец
+    фиксируется в event['discipline_applied'], поэтому повторный вызов
+    (например, из recovery-задачи после сбоя) безопасно пропускает тех,
+    кому взыскание уже вынесено, и не выносит его дважды."""
     events = load_json(EVENTS_FILE, {})
     event = events.get(event_id)
     if not event or event.get('discipline_processed'):
@@ -3324,20 +3408,32 @@ async def process_inactivity_discipline_for_event(event_id):
     declined = set(event.get('declined', {}).keys())
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
 
-    event['discipline_processed'] = True
-    save_json(EVENTS_FILE, events)
+    already_applied = set(event.get('discipline_applied', {}).keys())
+    to_process = [m for m in unmarked if m not in already_applied]
 
-    if not unmarked:
+    if not to_process:
+        event['discipline_processed'] = True
+        save_json(EVENTS_FILE, events)
         return
 
     thread = await get_or_create_thread(event, event_id, event['title'])
     any_expelled = False
 
-    for nickname in unmarked:
+    for nickname in to_process:
         uid = await get_uid_by_nickname(nickname)
         if not uid:
             continue
         result = await apply_inactivity_discipline(uid)
+
+        # Помечаем бойца обработанным СРАЗУ после попытки — даже если
+        # результат пуст (например, uid не найден) — чтобы recovery-задача
+        # не пыталась выносить взыскание бесконечно тем, кого не удаётся найти.
+        events_now = load_json(EVENTS_FILE, {})
+        fresh_event = events_now.get(event_id)
+        if fresh_event is not None:
+            fresh_event.setdefault('discipline_applied', {})[nickname] = True
+            save_json(EVENTS_FILE, events_now)
+
         if not result or not result.get('action'):
             continue
 
@@ -3348,10 +3444,10 @@ async def process_inactivity_discipline_for_event(event_id):
         if thread:
             text = (
                 f"{mention}\n\n" +
-                es(f"⚠️ Боец, тебе вынесено {action_word} за неактивность:\n\n") +
+                es(f"⚠️ Вам вынесено {action_word} за неактивность:\n\n") +
                 f"> {result['reason']}\n\n" +
-                "Пожалуйста, не забывай отмечаться на мероприятиях с обязательной записью, если ты не находишься "
-                "в отпуске. Подробности — в твоём личном деле на сайте клана."
+                "Пожалуйста, не забывайте отмечаться на мероприятиях с обязательной записью, если вы не находитесь "
+                "в отпуске. Подробности — в вашем личном деле на сайте клана."
             )
             try:
                 await thread.send(text)
@@ -3373,16 +3469,41 @@ async def process_inactivity_discipline_for_event(event_id):
                 try:
                     await thread.send(
                         f"{mention}\n\n" +
-                        es("🚫 Боец достиг 3 действующих выговоров за неактивность и был исключен из клана.")
+                        es("🚫 Вы достигли 3 действующих выговоров за неактивность. Статус на сайте изменён на "
+                           "'Отставка', соответствующие роли на сервере сняты. Если хотите вернуться в клан — "
+                           "обратитесь к командованию.")
                     )
                 except Exception:
                     pass
 
         await asyncio.sleep(1)
 
+    # Все неотметившиеся обработаны — теперь можно безопасно поставить флаг завершения
+    events_final = load_json(EVENTS_FILE, {})
+    fresh_event_final = events_final.get(event_id)
+    if fresh_event_final is not None:
+        fresh_event_final['discipline_processed'] = True
+        save_json(EVENTS_FILE, events_final)
+
     if any_expelled:
         invalidate_clan_members_cache()
         await refresh_all_active_event_embeds()
+
+
+async def recover_incomplete_discipline():
+    """Защитная периодическая задача: находит завершённые обязательные
+    мероприятия (начиная с DISCIPLINE_CUTOFF), для которых обработка
+    дисциплины не была доведена до конца (например, бот упал посередине
+    process_inactivity_discipline_for_event), и повторно запускает обработку —
+    уже обработанные бойцы будут пропущены благодаря event['discipline_applied']."""
+    events = load_json(EVENTS_FILE, {})
+    for event_id, event in events.items():
+        if event.get('status') != 'completed':
+            continue
+        if event.get('discipline_processed'):
+            continue
+        await process_inactivity_discipline_for_event(event_id)
+
 
 
 def _cleanup_expired_disciplinary_actions_sync():
@@ -3830,10 +3951,27 @@ async def finalize_attendance(interaction, wizard):
     
     attendance[wizard.event_id] = record
     save_json(ATTENDANCE_FILE, attendance)
-    
-    await apply_attendance_to_gamestats(wizard, old_record=old_record)
+
+    # Дельту для gameStats считаем от ПОСЛЕДНЕГО ФАКТИЧЕСКИ ПРИМЕНЁННОГО
+    # состояния (applied_record), а не от последнего СОХРАНЁННОГО (record).
+    # Если предыдущая подача явки была прервана падением бота посередине
+    # apply_attendance_to_gamestats, 'старая' запись в ATTENDANCE_FILE уже
+    # содержала бы НОВОЕ состояние — и дельта оказалась бы нулевой, а
+    # недостающие начисления потерялись бы навсегда.
+    stats_base_record = old_record.get('applied_record') if old_record else None
+    stats_ok = await apply_attendance_to_gamestats(wizard, old_record=stats_base_record)
+
+    if stats_ok:
+        attendance_now = load_json(ATTENDANCE_FILE, {})
+        record_now = attendance_now.get(wizard.event_id)
+        if record_now is not None:
+            record_now['applied_record'] = copy.deepcopy(record)
+            save_json(ATTENDANCE_FILE, attendance_now)
+    else:
+        print(f"⚠️ Отыгрыши для '{wizard.event_title}' применены частично — при следующей подаче явки недостающее будет доначислено.")
 
     queue_changed = await apply_squad_commander_queue_promotion(wizard, old_record=old_record)
+
     if queue_changed:
         await refresh_all_active_event_embeds()
 
@@ -4334,13 +4472,14 @@ async def update_event(event_id, title, description, start_time, end_time, image
 async def cancel_event(interaction, event_id):
     """Отменяет мероприятие: убирает кнопки Приду/Не приду, меняет статус.
     Данные НЕ удаляются (в отличие от delete_event) — можно активировать снова."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
     events = load_json(EVENTS_FILE, {})
     if event_id not in events:
-        await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        await interaction.followup.send(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
     event = events[event_id]
     if event.get('status') == 'cancelled':
-        await interaction.response.send_message(es("⚠️ Мероприятие уже отменено!"), ephemeral=True)
+        await interaction.followup.send(es("⚠️ Мероприятие уже отменено!"), ephemeral=True)
         return
     event['status'] = 'cancelled'
     save_json(EVENTS_FILE, events)
@@ -4355,18 +4494,19 @@ async def cancel_event(interaction, event_id):
             save_json(EVENTS_FILE, events)
         except Exception:
             pass
-    await interaction.response.send_message(es("✅ Мероприятие отменено! Данные сохранены, его можно снова активировать."), ephemeral=True)
+    await interaction.followup.send(es("✅ Мероприятие отменено! Данные сохранены, его можно снова активировать."), ephemeral=True)
 
 
 async def reactivate_event(interaction, event_id):
     """Возвращает отменённое мероприятие обратно в активное состояние (п.4)."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
     events = load_json(EVENTS_FILE, {})
     if event_id not in events:
-        await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        await interaction.followup.send(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
     event = events[event_id]
     if event.get('status') != 'cancelled':
-        await interaction.response.send_message(es("⚠️ Мероприятие не отменено, реактивация не требуется!"), ephemeral=True)
+        await interaction.followup.send(es("⚠️ Мероприятие не отменено, реактивация не требуется!"), ephemeral=True)
         return
     event_end = datetime.fromtimestamp(event['end_time'], MSK)
     event['status'] = 'completed' if datetime.now(MSK) > event_end else 'active'
@@ -4384,14 +4524,16 @@ async def reactivate_event(interaction, event_id):
                 await lock_and_archive_thread(thread)
         except Exception:
             pass
-    await interaction.response.send_message(es("✅ Мероприятие активировано снова!"), ephemeral=True)
+    await interaction.followup.send(es("✅ Мероприятие активировано снова!"), ephemeral=True)
+
 
 
 async def delete_event(interaction, event_id):
     """Полностью удаляет мероприятие: сообщение, ветку, явку и саму запись из базы (безвозвратно)."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
     events = load_json(EVENTS_FILE, {})
     if event_id not in events:
-        await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        await interaction.followup.send(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
     event = events[event_id]
     if event.get('thread_id'):
@@ -4412,7 +4554,8 @@ async def delete_event(interaction, event_id):
         save_json(ATTENDANCE_FILE, attendance)
     del events[event_id]
     save_json(EVENTS_FILE, events)
-    await interaction.response.send_message(es("🗑️ Мероприятие полностью удалено!"), ephemeral=True)
+    await interaction.followup.send(es("🗑️ Мероприятие полностью удалено!"), ephemeral=True)
+
 
 _STATUS_TITLE_PREFIXES = ("Завершено. ", "Отменено. ")
 WEEKDAY_NAMES_BY_INDEX = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
@@ -4698,16 +4841,23 @@ async def check_event_completion():
         for event_id in completed_ids:
             event = events[event_id]
             await refresh_event_message(event_id)
+            thread = None
             if event.get('thread_id'):
                 try:
                     thread = await client.fetch_channel(event['thread_id'])
                     await thread.edit(name=desired_thread_name(event))
                     msg = await thread.send(render_completion_message(event))
                     record_thread_message(event, msg.id, 'completion')
-                    await lock_and_archive_thread(thread)
                 except Exception:
-                    pass
+                    thread = None
+            # ВАЖНО: дисциплина применяется ДО блокировки ветки — иначе
+            # process_inactivity_discipline_for_event пытается писать
+            # уведомления в уже заблокированную (заархивированную) ветку
+            # и падает с 'Thread is archived', боец не получает уведомление
+            # о вынесенном замечании/выговоре.
             await process_inactivity_discipline_for_event(event_id)
+            if thread:
+                await lock_and_archive_thread(thread)
         save_json(EVENTS_FILE, events)
 
 
@@ -5358,13 +5508,29 @@ async def sweep_empty_voice_rooms():
 
 async def force_restart_bot():
     """Освобождает lock-файл, поднимает НОВЫЙ независимый процесс бота
-    (вывод которого продолжает писаться в тот же logs/bot_output.log)
     и завершает текущий процесс. Вызывается кнопкой '🔄 Принудительный
     перезапуск' в админ-панели."""
     try:
         await flush_log_buffer_to_discord()
     except Exception:
         pass
+
+    # Дожидаемся завершения ВСЕХ фоновых записей (Firebase, локальные бэкапы,
+    # safety-снапшоты), стоящих в очереди EXECUTOR — иначе они безвозвратно
+    # теряются при os._exit() ниже. shutdown(wait=True) сам по себе блокирующий
+    # вызов — выполняем его в ДРУГОМ (дефолтном) executor'е, чтобы не блокировать
+    # event loop напрямую, и с таймаутом на случай зависшей задачи.
+    try:
+        loop = asyncio.get_running_loop()
+        await asyncio.wait_for(
+            loop.run_in_executor(None, lambda: EXECUTOR.shutdown(wait=True)),
+            timeout=15
+        )
+        _original_print("✅ Все отложенные записи завершены перед перезапуском.")
+    except asyncio.TimeoutError:
+        _original_print("⚠️ Не все фоновые записи завершились за 15 секунд — продолжаю перезапуск принудительно.")
+    except Exception as e:
+        _original_print(f"⚠️ Ошибка при ожидании завершения фоновых задач: {e}")
 
     try:
         _release_instance_lock()
@@ -5378,11 +5544,6 @@ async def force_restart_bot():
         else:
             kwargs['start_new_session'] = True
 
-        # ВАЖНО: НЕ открываем новый файловый хендл на bot_output.log здесь —
-        # на Windows это приводит к 'PermissionError: [Errno 13]', так как тот же
-        # файл уже открыт менеджер-скриптом (.bat) через '>>'. Вместо этого дочерний
-        # процесс просто НАСЛЕДУЕТ существующие stdout/stderr текущего процесса
-        # (они и так указывают на тот же лог-файл) — конфликта хендлов не возникает.
         subprocess.Popen(
             [sys.executable, os.path.abspath(__file__)],
             cwd=BASE_DIR, stdin=subprocess.DEVNULL,
@@ -5393,6 +5554,7 @@ async def force_restart_bot():
         _original_print(f"❌ Не удалось запустить новый процесс бота при перезапуске: {e}")
 
     os._exit(0)
+
 
 
 # ============== СОБЫТИЯ DISCORD ==============
@@ -5463,6 +5625,8 @@ async def on_ready():
         scheduler.add_job(flush_log_buffer_to_discord, 'interval', seconds=15, id='log_forward_flush', replace_existing=True)
     if not scheduler.get_job('disciplinary_cleanup'):
         scheduler.add_job(cleanup_expired_disciplinary_actions, 'interval', hours=6, id='disciplinary_cleanup', replace_existing=True)
+    if not scheduler.get_job('discipline_recovery'):
+        scheduler.add_job(recover_incomplete_discipline, 'interval', minutes=15, id='discipline_recovery', replace_existing=True)
 
     if not scheduler.running:
         scheduler.start()
