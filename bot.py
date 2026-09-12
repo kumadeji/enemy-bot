@@ -494,6 +494,7 @@ VOICE_ROOM_CATEGORY_PUBLIC = 1116656512677445693
 
 EVENTS_FILE = os.path.join(BASE_DIR, 'events_data.json')
 VACATIONS_FILE = os.path.join(BASE_DIR, 'vacations.json')
+VACATION_ARCHIVE_FILE = os.path.join(BASE_DIR, 'vacations_archive.json')
 ATTENDANCE_FILE = os.path.join(BASE_DIR, 'attendance_data.json')
 WEEKLY_EVENTS_FILE = os.path.join(BASE_DIR, 'weekly_events.json')
 LAST_SCHEDULED_CHECK_FILE = os.path.join(BASE_DIR, 'last_scheduled_check.json')
@@ -529,6 +530,7 @@ ACTIVE_CLAN_COMPOSITIONS = {"Личный состав", "Запас"}
 FIREBASE_DATA_MAP = {
     EVENTS_FILE: 'events',
     VACATIONS_FILE: 'vacations',
+    VACATION_ARCHIVE_FILE: 'vacations_archive',
     ATTENDANCE_FILE: 'attendance',
     WEEKLY_EVENTS_FILE: 'weeklyEvents',
     VOICE_ROOMS_FILE: 'voiceRooms',
@@ -1678,7 +1680,6 @@ def save_json(filename, data):
     except Exception as e:
         print(f"⚠️ Не удалось запланировать резервную запись '{filename}': {e}")
 
-
 def build_vacation_set_for_date(vacations: dict, target_date: datetime) -> set:
     """Множество ников (в нижнем регистре), которые находились/находятся
     в отпуске НА УКАЗАННУЮ ДАТУ. Строится ОДИН РАЗ за весь набор отпусков —
@@ -1691,6 +1692,10 @@ def build_vacation_set_for_date(vacations: dict, target_date: datetime) -> set:
     «Не отметились» — и, что гораздо хуже, получал дисциплинарное взыскание
     за мероприятие, на котором отсутствовал легитимно.
 
+    Помимо текущих записей перебирается АРХИВ: vacations[nickname] хранит
+    ровно один отпуск на бойца, и при оформлении нового старая запись
+    затиралась — история терялась безвозвратно.
+
     Для досрочно закрытых отпусков фактическим окончанием считается дата
     closed_at (включительно), а не изначально запланированный end.
 
@@ -1699,7 +1704,20 @@ def build_vacation_set_for_date(vacations: dict, target_date: datetime) -> set:
     """
     target_date_only = target_date.date() if hasattr(target_date, 'date') else target_date
     result = set()
-    for vac_name, data in (vacations or {}).items():
+
+    # Архив вынесен в ОТДЕЛЬНЫЙ файл, а не в ключ внутри vacations: иначе
+    # семь существующих циклов `for ... in vacations.items()` (включая два
+    # dict-comprehension с v.get('status') в show_vacation_list) падали бы
+    # на нём с AttributeError, так как значение оказалось бы списком.
+    entries = list((vacations or {}).items())
+    for archived in (load_json(VACATION_ARCHIVE_FILE, {}) or {}).values():
+        nick = archived.get('nickname')
+        if nick:
+            entries.append((nick, archived))
+
+    for vac_name, data in entries:
+        if not vac_name or not isinstance(data, dict):
+            continue
         if data.get('status') not in ('active', 'ended_early', 'ended_scheduled'):
             continue
         try:
@@ -1713,14 +1731,15 @@ def build_vacation_set_for_date(vacations: dict, target_date: datetime) -> set:
         if data.get('status') == 'ended_early' and data.get('closed_at'):
             try:
                 closed = datetime.fromisoformat(data['closed_at']).date()
-                if closed < end:
+                # Защита от битых данных: если closed_at раньше начала отпуска,
+                # период схлопнулся бы в ноль и боец «никогда не был в отпуске».
+                if start <= closed < end:
                     end = closed
             except Exception:
                 pass
         if start <= target_date_only <= end:
             result.add(vac_name.strip().lower())
     return result
-
 
 def build_active_vacation_set(vacations: dict, current_date: datetime) -> set:
     """Обратно совместимая обёртка — чтобы не менять все места вызова разом.
@@ -4845,12 +4864,31 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
             if nickname in vacations and vacations[nickname].get('status') in ['active', 'pending']:
                 duplicate = True
             else:
+                # Прежняя запись этого бойца не удаляется, а переносится в
+                # отдельный файл-архив — иначе история отпусков теряется
+                # безвозвратно, и прошедшие мероприятия начинают показывать
+                # бойца как «не отметившегося» (см. build_vacation_set_for_date).
+                old_entry = vacations.get(nickname)
+                if old_entry and old_entry.get('status') in ('ended_early', 'ended_scheduled', 'rejected'):
+                    archive = load_json(VACATION_ARCHIVE_FILE, {})
+                    # Ключ "ник|дата_начала" сам защищает от повторной архивации.
+                    archive_key = f"{nickname}|{old_entry.get('start', '')}"
+                    if archive_key not in archive:
+                        archived = dict(old_entry)
+                        archived['nickname'] = nickname
+                        archived['archived_at'] = datetime.now(MSK).isoformat()
+                        archive[archive_key] = archived
+                        save_json(VACATION_ARCHIVE_FILE, archive)
+                        print(f"📦 Прошлый отпуск {nickname} "
+                              f"({old_entry.get('start', '?')[:10]}..{old_entry.get('end', '?')[:10]}, "
+                              f"{old_entry.get('status')}) перенесён в архив.")
                 vacations[nickname] = new_vacation_entry
                 save_json(VACATIONS_FILE, vacations)
         # Ответ — ВНЕ лока: иначе он удерживается всё время сетевого вызова
         if duplicate:
             await interaction.followup.send(f"⚠️ У {nickname} уже есть отпуск!", ephemeral=True)
             return
+
 
         channel = await client.fetch_channel(VACATION_CHANNEL_ID)
 
@@ -6174,6 +6212,51 @@ FIELD_REQUESTED_BY = es("👤 Запросил")
 FIELD_APPROVED_BY = es("✅ Утвердил")
 FIELD_REJECTED_BY = es("❌ Отклонил")
 
+async def recover_thread_messages_from_history(thread, event) -> list:
+    """Восстанавливает список thread_messages, просканировав историю ветки.
+
+    Старая версия check_event_completion выполняла
+    fresh.pop('thread_messages', None) при завершении мероприятия — ID анонса
+    и всех напоминаний терялись, и update_all_templates (секция 1.5) больше
+    не могла переформатировать эти сообщения при смене шаблонов.
+
+    'mods' и 'cancelled' НЕ восстанавливаем: у них в extra лежат данные
+    (сервер, IP, пароль, кто отменил), которых в тексте может не оказаться —
+    перерисовка по пустому extra затёрла бы их.
+    """
+    recovered = []
+    try:
+        async for msg in thread.history(limit=100, oldest_first=True):
+            if msg.author.id != client.user.id:
+                continue
+            body = msg.content or ''
+            if not body:
+                continue
+
+            parts = body.split('\n\n', 1)
+            mention_block = parts[0] if len(parts) > 1 and '<@' in parts[0] else ''
+
+            kind = None
+            if 'запланировано мероприятие' in body:
+                kind = 'announcement'
+            elif 'осталось 2 суток' in body:
+                kind = 'reminder_2days'
+            elif 'остались одни сутки' in body:
+                kind = 'reminder_1day'
+            elif 'Ждем вас на сборах' in body:
+                kind = 'reminder_15min'
+            elif 'автоматически помечено как завершённое' in body:
+                kind = 'completion'
+            elif 'завершено досрочно после публикации' in body:
+                kind = 'early_completion'
+            elif 'снова активно' in body:
+                kind = 'reactivated'
+
+            if kind:
+                recovered.append({'id': msg.id, 'kind': kind, 'mention_block': mention_block})
+    except Exception as e:
+        print(f"⚠️ Не удалось просканировать историю ветки {getattr(thread, 'id', '?')}: {e}")
+    return recovered
 
 async def update_all_templates():
     """Обновляет шаблоны всех сообщений бота:
@@ -6217,7 +6300,9 @@ async def update_all_templates():
     vacations = load_json(VACATIONS_FILE, {})
     
     ev_updated = 0
+    ev_unchanged = 0
     ev_errors = 0
+
     vac_updated = 0
     vac_errors = 0
 
@@ -6286,11 +6371,7 @@ async def update_all_templates():
             old_embed_dict = message.embeds[0].to_dict() if message.embeds else None
 
             if old_embed_dict == new_embed_dict:
-                # Содержимое не изменилось — редактирование и пауза не нужны.
-                # Раньше sleep(4) выполнялся БЕЗУСЛОВНО на каждое из 14+
-                # мероприятий, что давало минуты простоя даже когда реально
-                # менять было нечего.
-                ev_updated += 1
+                ev_unchanged += 1
                 continue
 
             last_image_key = event.get('_last_rendered_image_key')
@@ -6383,7 +6464,32 @@ async def update_all_templates():
             except Exception as e:
                 print(f"⚠️ Не удалось обновить название ветки {thread_id}: {e}")
 
-        for msg_record in event.get('thread_messages', []):
+        # У каждого мероприятия при создании записывается 'announcement'.
+        # Если его нет — значит историю стёрла старая версия
+        # check_event_completion (pop('thread_messages')), и переформатировать
+        # нечего. Восстанавливаем ID сообщений, просканировав саму ветку.
+        # Флаг _thread_messages_recovered не даёт сканировать историю повторно
+        # при каждой последующей синхронизации (100 сообщений на ветку —
+        # дорогая операция, и она нужна ровно один раз).
+        thread_messages = event.get('thread_messages', [])
+        has_announcement = any(m.get('kind') == 'announcement' for m in thread_messages)
+        if not has_announcement and not event.get('_thread_messages_recovered'):
+            known_ids = {m.get('id') for m in thread_messages}
+            recovered = await recover_thread_messages_from_history(thread, event)
+            new_ones = [r for r in recovered if r['id'] not in known_ids]
+            if new_ones:
+                thread_messages = list(thread_messages) + new_ones
+                print(f"🔧 Восстановлено {len(new_ones)} сообщений в ветке "
+                      f"«{event.get('title', '?')[:40]}»")
+            async with _events_write_lock:
+                ev_now = load_json(EVENTS_FILE, {})
+                target = ev_now.get(event_id)
+                if target is not None:
+                    target['thread_messages'] = thread_messages
+                    target['_thread_messages_recovered'] = True
+                    save_json(EVENTS_FILE, ev_now)
+
+        for msg_record in thread_messages:
             try:
                 msg = await thread.fetch_message(msg_record['id'])
             except Exception:
@@ -6588,7 +6694,7 @@ async def update_all_templates():
                 await lock_and_archive_thread(thread)
 
     print(f"🔄 Итог обновления шаблонов:")
-    print(f"   📅 Мероприятий: обновлено {ev_updated}, ошибок {ev_errors}")
+    print(f"   📅 Мероприятий: изменено {ev_updated}, без изменений {ev_unchanged}, ошибок {ev_errors}")
     print(f"   🏖️ Отпусков: обновлено {vac_updated}, ошибок {vac_errors}")
     print(f"   🏆 Отчётов о явке: обновлено {att_updated}, ошибок {att_errors}")
     print(f"   💬 Названий веток исправлено: {thread_names_fixed}, сообщений в ветках обновлено: {thread_messages_fixed}, блокировок исправлено: {thread_locks_fixed}")
