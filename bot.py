@@ -571,9 +571,18 @@ DEFAULT_WEEKLY_EVENTS = {
 
 
 def ensure_weekly_events_file():
+    """Инициализирует дефолтные еженедельные шаблоны ТОЛЬКО при самом первом
+    запуске бота — раньше пустой словарь (например, если админ намеренно
+    удалил ВСЕ шаблоны через панель управления) был неотличим от 'файл ещё
+    не создавался', из-за чего дефолтные шаблоны воскресали заново при
+    каждом рестарте/понедельнике."""
     existing = load_json(WEEKLY_EVENTS_FILE, {})
-    if not existing:
-        save_json(WEEKLY_EVENTS_FILE, DEFAULT_WEEKLY_EVENTS)
+    if existing.get('_seeded'):
+        return
+    if not existing or (len(existing) == 1 and '_seeded' in existing):
+        seeded = dict(DEFAULT_WEEKLY_EVENTS)
+        seeded['_seeded'] = True
+        save_json(WEEKLY_EVENTS_FILE, seeded)
 
 
 def get_next_weekday_datetime(day_key: str, hour: int, minute: int, from_time: datetime = None) -> datetime:
@@ -1155,36 +1164,32 @@ def build_user_message(discord_user, issues: list) -> str:
         parts.append("")
     return "\n".join(parts).strip("\n")
 
-
-async def check_spreadsheet():
+async def check_spreadsheet() -> bool:
+    """Возвращает True при успешном завершении (независимо от того,
+    нашлись проблемы или нет), False — при сбое (используется вызывающим
+    кодом scheduled_check_spreadsheet для корректной пометки слота)."""
     if check_lock.locked():
-        return
+        return False
     async with check_lock:
         try:
             if not gc:
-                return
+                return False
 
             thread = await client.fetch_channel(THREAD_ID)
 
-            # Удаляем сообщения ПРЕДЫДУЩЕЙ проверки перед публикацией новой —
-            # иначе в ветке копятся устаревшие отчёты о проблемах, которые
-            # бойцы могли уже исправить. Проверка gc выше гарантирует, что
-            # мы не сотрём старый отчёт, если сама проверка всё равно не
-            # сможет выполниться из-за неинициализированного Google-клиента.
-            prev = load_json(CHECK_MESSAGES_FILE, {})
-            for msg_id in prev.get('message_ids', []):
-                try:
-                    old_msg = await thread.fetch_message(msg_id)
-                    await old_msg.delete()
-                except Exception:
-                    pass
-            save_json(CHECK_MESSAGES_FILE, {'message_ids': [], 'thread_id': THREAD_ID})
-
+            # ВАЖНО: сначала получаем и полностью готовим новые данные,
+            # и ТОЛЬКО ПОСЛЕ этого удаляем старый отчёт. Раньше порядок был
+            # обратным: старый отчёт стирался ДО обращения к Google Sheets,
+            # и если API оказывалось временно недоступно (или вернуло
+            # неполные/пустые данные) — ветка оставалась ПУСТОЙ: ни старого
+            # отчёта, ни нового.
             loop = asyncio.get_running_loop()
             sheet = await loop.run_in_executor(EXECUTOR, _open_worksheet_sync, SPREADSHEET_URL, SHEET_NAME)
             data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J35')
             if not data_with_colors or len(data_with_colors) < 2:
-                return
+                print("⚠️ Проверка бойцов: Google Sheets вернул пустые/неполные данные — публикация отменена, старый отчёт сохранён.")
+                return False
+
             headers = [cell['value'] for cell in data_with_colors[0]]
             rows = data_with_colors[1:]
             current_time = datetime.now(MSK)
@@ -1217,6 +1222,16 @@ async def check_spreadsheet():
                     else:
                         users_not_found.append(nickname)
 
+            # Данные готовы и корректны — теперь можно безопасно удалить
+            # старый отчёт (мы точно знаем, что новый будет опубликован).
+            prev = load_json(CHECK_MESSAGES_FILE, {})
+            for msg_id in prev.get('message_ids', []):
+                try:
+                    old_msg = await thread.fetch_message(msg_id)
+                    await old_msg.delete()
+                except Exception:
+                    pass
+
             new_message_ids = []
             if user_issues or users_not_found:
                 intro = build_intro_message(current_time)
@@ -1234,21 +1249,42 @@ async def check_spreadsheet():
                 print("✅ Проверка бойцов выполнена: проблем не обнаружено, публикация не потребовалась.")
 
             save_json(CHECK_MESSAGES_FILE, {'message_ids': new_message_ids, 'thread_id': THREAD_ID})
+            return True
         except Exception as e:
             print(f"Ошибка при проверке: {e}")
+            return False
 
 async def scheduled_check_spreadsheet():
     """Обёртка над check_spreadsheet исключительно для планировщика.
     Защищает от повторного постинга, если по какой-то причине окажется
-    запущено больше одного процесса бота одновременно."""
+    запущено больше одного процесса бота одновременно.
+
+    ВАЖНО: слот помечается выполненным ТОЛЬКО ПОСЛЕ успешного завершения
+    check_spreadsheet(). Раньше слот помечался ДО вызова — если проверка
+    падала (например, Google API был временно недоступен), следующая
+    попытка была возможна только через 2 суток (следующий плановый запуск),
+    а не при ближайшей возможности."""
     now = datetime.now(MSK)
     slot_key = now.strftime('%Y-%m-%d %H:%M')
     last = load_json(LAST_SCHEDULED_CHECK_FILE, {})
-    if last.get('slot') == slot_key:
+    if last.get('slot') == slot_key and last.get('status') == 'completed':
         print(f"⚠️ Плановая проверка для {slot_key} уже выполнена (PID {last.get('pid')}), пропускаю дубль.")
         return
-    save_json(LAST_SCHEDULED_CHECK_FILE, {'slot': slot_key, 'pid': os.getpid(), 'at': now.isoformat()})
-    await check_spreadsheet()
+
+    success = await check_spreadsheet()
+
+    if success:
+        save_json(LAST_SCHEDULED_CHECK_FILE, {
+            'slot': slot_key, 'pid': os.getpid(), 'at': now.isoformat(), 'status': 'completed'
+        })
+    else:
+        # Не помечаем слот как 'completed' — при следующем срабатывании
+        # (например, ручном или через APScheduler misfire) попытка
+        # повторится, а не будет отложена на 2 суток.
+        print(f"⚠️ Плановая проверка для {slot_key} завершилась неуспехом, слот НЕ помечен выполненным — будет предпринята повторная попытка.")
+        save_json(LAST_SCHEDULED_CHECK_FILE, {
+            'slot': slot_key, 'pid': os.getpid(), 'at': now.isoformat(), 'status': 'failed'
+        })
 
 # ============== РАБОТА С ДАННЫМИ ==============
 
@@ -1694,10 +1730,35 @@ def build_logging_anchor_embed():
                           description=LOGGING_ANCHOR_DESCRIPTION, color=ANCHOR_EMBED_COLOR)
 
 
-async def _find_or_create_anchor(channel, title: str, embed_builder, thread_name: str = None, view=None):
-    """Ищет среди последних сообщений бота в канале embed с данным title.
-    Если не находит — создаёт новое сообщение (+ ветку, если thread_name задан).
+async def _find_or_create_anchor(channel, title: str, embed_builder, thread_name: str = None, view=None, saved_message_id: int = None):
+    """Ищет якорное сообщение с данным title. Порядок поиска:
+    1) По сохранённому ID (saved_message_id) — самый дешёвый и надёжный
+       способ, добавлен вместо того, чтобы ВСЕГДА сканировать последние
+       50 сообщений канала. Раньше сохранённые ID из ADMIN_ANCHORS_FILE
+       вообще не использовались как первичный путь поиска — при активном
+       админ-канале (50+ сообщений после якоря) скан истории мог не найти
+       старый якорь и создать ДУБЛИКАТ панели/анкоры при каждом рестарте.
+    2) Скан последних 50 сообщений по title — fallback, если сохранённого
+       ID нет или сообщение по нему не найдено (удалено).
+    3) Создание нового сообщения — если не нашли ни первым, ни вторым
+       способом.
     Возвращает (message, thread_or_None)."""
+    if saved_message_id:
+        try:
+            message = await channel.fetch_message(saved_message_id)
+            if message.embeds and message.embeds[0].title == title:
+                thread = None
+                if thread_name and message.thread:
+                    thread = message.thread
+                elif thread_name:
+                    try:
+                        thread = await message.create_thread(name=thread_name)
+                    except Exception:
+                        thread = None
+                return message, thread
+        except Exception:
+            pass  # сообщение удалено/недоступно — переходим к скану истории
+
     async for message in channel.history(limit=50):
         if message.author.id != client.user.id:
             continue
@@ -1726,26 +1787,43 @@ async def ensure_admin_channel_anchors():
     """Находит (или создаёт при самом первом запуске) три якорных сообщения
     в ADMIN_CHANNEL_ID. Панель управления ОБНОВЛЯЕТСЯ при каждом старте бота
     (актуализация embed+view); уведомления/логирование — только создаются
-    один раз, их оформление актуализируется через синхронизацию шаблонов."""
+    один раз, их оформление актуализируется через синхронизацию шаблонов.
+
+    ВАЖНО: теперь передаём уже сохранённые message_id из ADMIN_ANCHORS_FILE
+    в _find_or_create_anchor как saved_message_id — раньше поиск ВСЕГДА
+    шёл сканом последних 50 сообщений канала, игнорируя эти сохранённые ID.
+    При активном админ-канале (много сообщений после якоря, например от
+    команды 'Список мероприятий' или уведомлений) скан истории мог не
+    найти старый якорь за пределами 50 последних сообщений и создать
+    ДУБЛИКАТ панели/анкоры при каждом рестарте бота."""
     channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
 
-    panel_msg, _ = await _find_or_create_anchor(channel, es("🛠️ Панель управления комбата и заместителей"),
-                                                 build_admin_panel_embed, thread_name=None, view=AdminMainMenuView())
+    panel_msg, _ = await _find_or_create_anchor(
+        channel, es("🛠️ Панель управления комбата и заместителей"),
+        build_admin_panel_embed, thread_name=None, view=AdminMainMenuView(),
+        saved_message_id=anchors.get('panel_message_id')
+    )
     try:
         await panel_msg.edit(embed=build_admin_panel_embed(), view=AdminMainMenuView())
     except Exception as e:
         print(f"⚠️ Не удалось обновить панель управления: {e}")
     anchors['panel_message_id'] = panel_msg.id
 
-    notif_msg, notif_thread = await _find_or_create_anchor(channel, es("ℹ️ Уведомления"),
-                                                            build_notifications_anchor_embed, thread_name="ℹ️ Уведомления")
+    notif_msg, notif_thread = await _find_or_create_anchor(
+        channel, es("ℹ️ Уведомления"),
+        build_notifications_anchor_embed, thread_name="ℹ️ Уведомления",
+        saved_message_id=anchors.get('notifications_message_id')
+    )
     anchors['notifications_message_id'] = notif_msg.id
     if notif_thread:
         anchors['notifications_thread_id'] = notif_thread.id
 
-    log_msg, log_thread = await _find_or_create_anchor(channel, es("🔧 Логирование"),
-                                                         build_logging_anchor_embed, thread_name="🔧 Логирование")
+    log_msg, log_thread = await _find_or_create_anchor(
+        channel, es("🔧 Логирование"),
+        build_logging_anchor_embed, thread_name="🔧 Логирование",
+        saved_message_id=anchors.get('logging_message_id')
+    )
     anchors['logging_message_id'] = log_msg.id
     if log_thread:
         anchors['logging_thread_id'] = log_thread.id
@@ -2102,8 +2180,13 @@ class WeeklyEventsManageSelectView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=180)
         weekly_events = load_json(WEEKLY_EVENTS_FILE, {})
+        # Пропускаем служебный ключ '_seeded' (флаг однократной инициализации
+        # дефолтных шаблонов, см. ensure_weekly_events_file) — без этой
+        # проверки он попадал бы в список выбора как мусорная "запись
+        # мероприятия" и ронял бы .get('name', wid) с AttributeError,
+        # так как значение '_seeded' — булево True, а не словарь.
         options = [discord.SelectOption(label=entry.get('name', wid)[:100], value=wid)
-                   for wid, entry in weekly_events.items()]
+                   for wid, entry in weekly_events.items() if wid != '_seeded']
         if options:
             self.select = discord.ui.Select(placeholder="🔁 Выберите мероприятие для управления...", options=options[:MAX_SELECT_OPTIONS], row=0)
             self.select.callback = self._select_callback
@@ -3131,7 +3214,12 @@ async def handle_profile_modified_watch(uid, data):
     raw_fp = _anketa_raw_fingerprint(data)
     if _LAST_ANKETA_RAW_FINGERPRINT.get(uid) == raw_fp:
         return
-    _LAST_ANKETA_RAW_FINGERPRINT[uid] = raw_fp
+    # ВАЖНО: запись fingerprint'а перенесена НИЖЕ, после успешного edit.
+    # Раньше отпечаток фиксировался ЗДЕСЬ, ДО сетевых вызовов — если
+    # fetch_channel/fetch_message/edit падали из-за транзиентного сбоя сети,
+    # отпечаток уже считался "актуальным", и анкета оставалась устаревшей
+    # до СЛЕДУЮЩЕГО реального изменения данных профиля (что могло не
+    # произойти долго).
 
     try:
         channel = await client.fetch_channel(anketa_info['channel_id'])
@@ -3144,12 +3232,14 @@ async def handle_profile_modified_watch(uid, data):
 
     snapshot_key = json.dumps(embed.to_dict(), sort_keys=True, default=str)
     if _LAST_ANKETA_EMBED_SNAPSHOT.get(uid) == snapshot_key:
+        _LAST_ANKETA_RAW_FINGERPRINT[uid] = raw_fp
         return
 
     async with _ANKETA_EDIT_LOCK:
         try:
             await message.edit(embed=embed)
             _LAST_ANKETA_EMBED_SNAPSHOT[uid] = snapshot_key
+            _LAST_ANKETA_RAW_FINGERPRINT[uid] = raw_fp
         except Exception as e:
             print(f"⚠️ Не удалось live-обновить анкету для uid={uid}: {e}")
         finally:
@@ -3501,20 +3591,28 @@ async def refresh_all_active_event_embeds():
         await refresh_event_message(event_id)
         await asyncio.sleep(1)
 
+async def apply_attendance_to_gamestats(wizard, old_tally: dict = None):
+    """Считает НЕТТО-изменение отыгрышей (новая явка минус старая) и
+    инкрементит gameStats в Firebase + создаёт уведомление игроку при
+    положительном приросте.
 
-async def apply_attendance_to_gamestats(wizard, old_record=None) -> bool:
-    """Считает НЕТТО-изменение отыгрышей (новая явка минус старая, если это
-    повторная подача) и инкрементит gameStats в Firebase + создаёт уведомление
-    игроку при положительном приросте. Возвращает True, если ВСЕ дельты были
-    успешно применены — используется вызывающим кодом (finalize_attendance)
-    для идемпотентной пометки 'applied_record': при частичном сбое повторная
-    подача той же явки сможет доначислить недостающее, а не молча решить,
-    что всё уже сделано (что раньше приводило к тихой потере части начислений
-    при падении бота посреди цикла)."""
+    old_tally — словарь {nickname: {'ko':x,'ks':y,'soldier':z}}, отражающий
+    статистику, УЖЕ ПРИМЕНЁННУЮ к Firebase на момент предыдущей подачи явки
+    (а не весь старый снимок отчёта, как было раньше) — это позволяет точно
+    посчитать дельту по каждому бойцу отдельно.
+
+    Возвращает dict {nickname: new_tally_value} ТОЛЬКО для тех бойцов, чья
+    дельта была успешно применена (или была нулевой). Раньше при частичном
+    сбое (например, 1 из 26 бойцов не прошёл) весь батч считался либо
+    полностью успешным, либо полностью неуспешным — и при повторной подаче
+    той же явки ВСЕ 25 успешных бойцов получали ПОВТОРНОЕ начисление,
+    потому что базой для дельты оставался старый, полностью неприменённый
+    снимок. Теперь вызывающий код (finalize_attendance) мержит успешные
+    результаты точечно, оставляя неуспешных на следующую попытку."""
+    old_tally = old_tally or {}
     new_tally = _tally_from_triples(_extract_game_triples_from_wizard(wizard))
-    old_tally = _tally_from_triples(_extract_game_triples_from_record(old_record)) if old_record else {}
 
-    all_succeeded = True
+    succeeded = {}
 
     for nickname in set(new_tally) | set(old_tally):
         new_c = new_tally.get(nickname, {'ko': 0, 'ks': 0, 'soldier': 0})
@@ -3524,12 +3622,14 @@ async def apply_attendance_to_gamestats(wizard, old_record=None) -> bool:
         soldier_delta = new_c['soldier'] - old_c['soldier']
 
         if ko_delta == 0 and ks_delta == 0 and soldier_delta == 0:
+            # Уже в синхронизированном состоянии — применять нечего,
+            # но фиксируем как "успешно обработанного" для merge.
+            succeeded[nickname] = new_c
             continue
 
         uid = await get_uid_by_nickname(nickname)
         if not uid:
             print(f"⚠️ Не удалось найти uid для '{nickname}' — отыгрыши не зачтены в Firebase")
-            all_succeeded = False
             continue
 
         loop = asyncio.get_running_loop()
@@ -3537,15 +3637,15 @@ async def apply_attendance_to_gamestats(wizard, old_record=None) -> bool:
             await loop.run_in_executor(EXECUTOR, _apply_gamestats_increment_sync, uid, ko_delta, ks_delta, soldier_delta)
         except Exception as e:
             print(f"❌ Ошибка обновления gameStats для {nickname} ({uid}): {e}")
-            all_succeeded = False
             continue
+
+        succeeded[nickname] = new_c
 
         message = build_gamestats_notification_message(max(ko_delta, 0), max(ks_delta, 0), max(soldier_delta, 0))
         if message:
             await create_gamestats_notification(uid, message)
 
-    return all_succeeded
-
+    return succeeded
 
 def _is_active_entry(entry, now_ms):
     return entry.get('expiresAtMs', 0) > now_ms
@@ -3591,7 +3691,9 @@ def _apply_disciplinary_action_sync(uid):
     def _txn(transaction):
         snap = profile_ref.get(transaction=transaction)
         if not snap.exists:
-            return {'action': None}
+            # Профиль физически не существует — это ПОСТОЯННАЯ причина
+            # (не временный сбой сети), повторные попытки её не исправят.
+            return {'action': None, 'status': 'profile_not_found'}
         data = snap.to_dict() or {}
         game_da = data.get('gameDisciplinaryActions', {}) or {}
         actions = list(game_da.get(GAMESTATS_GAME_NAME, []) or [])
@@ -3635,6 +3737,7 @@ def _apply_disciplinary_action_sync(uid):
             roster_updates[f'gameRoles.{GAMESTATS_GAME_NAME}.position'] = 'Дезертир'
             result['expelled'] = True
 
+        result['status'] = 'success'
         transaction.update(profile_ref, updates)
         # set(merge=True) вместо update(): update() требует существования
         # документа в rosterPublic и в противном случае откатывает ВСЮ
@@ -3649,14 +3752,30 @@ def _apply_disciplinary_action_sync(uid):
 
 
 async def apply_inactivity_discipline(uid):
+    """Возвращает dict с ключом 'status':
+      'success'           — взыскание реально применено (или явно не
+                             требовалось при уже существующем max) —
+                             ВСЕГДА безопасно помечать боевого как обработанного.
+      'profile_not_found' — постоянная причина, профиля не существует —
+                             тоже безопасно помечать (retry не поможет).
+      'retryable_error'   — ВРЕМЕННЫЙ сбой (сеть/Firestore) — боец НЕ должен
+                             помечаться обработанным, чтобы recovery-задача
+                             попыталась снова позже. Раньше оба случая
+                             (нет профиля / временный сбой сети) возвращали
+                             одинаковый None и помечались одинаково, из-за
+                             чего транзиентная ошибка Firebase могла
+                             НАВСЕГДА лишить бойца заслуженного взыскания."""
     if not fs_db:
-        return None
-    loop = asyncio.get_event_loop()
+        return {'action': None, 'status': 'retryable_error'}
+    loop = asyncio.get_running_loop()
     try:
-        return await loop.run_in_executor(EXECUTOR, _apply_disciplinary_action_sync, uid)
+        result = await loop.run_in_executor(EXECUTOR, _apply_disciplinary_action_sync, uid)
+        if 'status' not in result:
+            result['status'] = 'success'
+        return result
     except Exception as e:
         print(f"❌ Ошибка применения дисциплинарного взыскания (uid={uid}): {e}")
-        return None
+        return {'action': None, 'status': 'retryable_error'}
 
 
 async def process_inactivity_discipline_for_event(event_id):
@@ -3706,12 +3825,26 @@ async def process_inactivity_discipline_for_event(event_id):
     for nickname in to_process:
         uid = await get_uid_by_nickname(nickname)
         if not uid:
+            # Позывной не резолвится в uid — это может быть временной
+            # ситуацией (callsign ещё не проиндексирован в Firebase),
+            # поэтому НЕ помечаем — recover_incomplete_discipline попробует
+            # снова через 15 минут.
             continue
-        result = await apply_inactivity_discipline(uid)
 
-        # Помечаем бойца обработанным СРАЗУ после попытки — даже если
-        # результат пуст (например, uid не найден) — чтобы recovery-задача
-        # не пыталась выносить взыскание бесконечно тем, кого не удаётся найти.
+        result = await apply_inactivity_discipline(uid)
+        status = result.get('status') if result else 'retryable_error'
+
+        if status == 'retryable_error':
+            # Временный сбой (сеть/Firestore) — НЕ помечаем обработанным,
+            # чтобы recovery-задача повторила попытку позже. Раньше боец
+            # помечался в любом случае, из-за чего транзиентная ошибка
+            # безвозвратно "прощала" взыскание.
+            print(f"⚠️ Временный сбой при вынесении взыскания '{nickname}' — попытка будет повторена позже.")
+            continue
+
+        # status == 'success' или 'profile_not_found' — оба случая означают,
+        # что дальнейшие попытки либо не нужны, либо бессмысленны, поэтому
+        # помечаем бойца обработанным.
         events_now = load_json(EVENTS_FILE, {})
         fresh_event = events_now.get(event_id)
         if fresh_event is not None:
@@ -3762,12 +3895,22 @@ async def process_inactivity_discipline_for_event(event_id):
 
         await asyncio.sleep(1)
 
-    # Все неотметившиеся обработаны — теперь можно безопасно поставить флаг завершения
+    # Проверяем, действительно ли ВСЕ неотметившиеся оказались обработаны
+    # (учитывая, что часть могла быть пропущена из-за retryable_error выше) —
+    # ставим 'discipline_processed' только если очередь пуста. Иначе
+    # recover_incomplete_discipline (каждые 15 минут) не увидит смысла
+    # повторить попытку для оставшихся, так как флаг уже сказал бы "готово".
     events_final = load_json(EVENTS_FILE, {})
     fresh_event_final = events_final.get(event_id)
     if fresh_event_final is not None:
-        fresh_event_final['discipline_processed'] = True
-        save_json(EVENTS_FILE, events_final)
+        applied_now = set(fresh_event_final.get('discipline_applied', {}).keys())
+        still_unprocessed = [m for m in to_process if m not in applied_now]
+        if not still_unprocessed:
+            fresh_event_final['discipline_processed'] = True
+            save_json(EVENTS_FILE, events_final)
+        else:
+            print(f"ℹ️ Дисциплина для мероприятия {event_id}: {len(still_unprocessed)} боец(цов) "
+                  f"не обработаны из-за временных сбоев, будут повторены recovery-задачей.")
 
     if any_expelled:
         invalidate_clan_members_cache()
@@ -3797,6 +3940,7 @@ def _cleanup_expired_disciplinary_actions_sync():
     now_ms = int(datetime.now(MSK).timestamp() * 1000)
     docs = fs_db.collection('profiles').stream()
     cleaned = 0
+    errors = 0
     for doc in docs:
         data = doc.to_dict() or {}
         game_da = (data.get('gameDisciplinaryActions') or {}).get(GAMESTATS_GAME_NAME, [])
@@ -3805,9 +3949,24 @@ def _cleanup_expired_disciplinary_actions_sync():
         filtered = [a for a in game_da if a.get('expiresAtMs', 0) > now_ms]
         if len(filtered) != len(game_da):
             uid = doc.id
-            fs_db.collection('profiles').document(uid).update({f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': filtered})
-            fs_db.collection('rosterPublic').document(uid).update({f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': filtered})
-            cleaned += 1
+            update_payload = {f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': filtered}
+            try:
+                fs_db.collection('profiles').document(uid).update(update_payload)
+                # set(merge=True) вместо update(): если документа в rosterPublic
+                # нет (например, боец ещё не синхронизирован туда), update()
+                # бросил бы NotFound и ОБРЫВАЛ БЫ ВЕСЬ ЦИКЛ ПО КОЛЛЕКЦИИ —
+                # то есть один "плохой" боец останавливал очистку для ВСЕХ
+                # остальных на все следующие 6 часов, пока цикл не дойдёт
+                # до этого же документа снова.
+                fs_db.collection('rosterPublic').document(uid).set(update_payload, merge=True)
+                cleaned += 1
+            except Exception as e:
+                # Изолируем ошибку одного документа — остальные бойцы должны
+                # быть очищены независимо от того, что случилось с этим.
+                print(f"⚠️ Не удалось очистить просроченные взыскания для uid={uid}: {e}")
+                errors += 1
+    if errors:
+        print(f"⚠️ Очистка взысканий завершена с ошибками: {errors} документ(ов) пропущено.")
     return cleaned
 
 
@@ -4320,23 +4479,39 @@ async def finalize_attendance(interaction, wizard):
         attendance = fresh_attendance
 
     # Дельту для gameStats считаем от ПОСЛЕДНЕГО ФАКТИЧЕСКИ ПРИМЕНЁННОГО
-    # состояния (applied_record), а не от последнего СОХРАНЁННОГО (record).
-    # Если предыдущая подача явки была прервана падением бота посередине
-    # apply_attendance_to_gamestats, 'старая' запись в ATTENDANCE_FILE уже
-    # содержала бы НОВОЕ состояние — и дельта оказалась бы нулевой, а
-    # недостающие начисления потерялись бы навсегда.
-    stats_base_record = old_record.get('applied_record') if old_record else None
-    stats_ok = await apply_attendance_to_gamestats(wizard, old_record=stats_base_record)
+    # состояния — теперь это applied_tally (словарь {ник: {ko,ks,soldier}}),
+    # а не целый снимок явки (как было раньше в applied_record). Хранение
+    # именно по нику позволяет корректно мержить ЧАСТИЧНЫЙ успех: если из
+    # 26 бойцов не удалось применить только одному, остальные 25 не получат
+    # повторное начисление при следующей подаче той же явки.
+    if old_record and 'applied_tally' in old_record:
+        old_tally = old_record['applied_tally']
+    elif old_record and 'applied_record' in old_record:
+        # Обратная совместимость: если у отчёта ещё старый формат (был
+        # сохранён до этого обновления) — конвертируем его в tally один раз,
+        # чтобы не задвоить статистику, уже начисленную по старой схеме.
+        old_tally = _tally_from_triples(_extract_game_triples_from_record(old_record['applied_record']))
+    else:
+        old_tally = {}
 
-    if stats_ok:
+    succeeded_tally = await apply_attendance_to_gamestats(wizard, old_tally=old_tally)
+
+    if succeeded_tally:
         async with _attendance_write_lock:
             attendance_now = load_json(ATTENDANCE_FILE, {})
             record_now = attendance_now.get(wizard.event_id)
             if record_now is not None:
-                record_now['applied_record'] = copy.deepcopy(record)
+                merged_tally = dict(old_tally)
+                merged_tally.update(succeeded_tally)
+                record_now['applied_tally'] = merged_tally
+                record_now.pop('applied_record', None)  # старый формат больше не нужен
                 save_json(ATTENDANCE_FILE, attendance_now)
-    else:
-        print(f"⚠️ Отыгрыши для '{wizard.event_title}' применены частично — при следующей подаче явки недостающее будет доначислено.")
+
+    new_full_tally = _tally_from_triples(_extract_game_triples_from_wizard(wizard))
+    missing_nicknames = set(new_full_tally.keys()) - set(succeeded_tally.keys())
+    if missing_nicknames:
+        print(f"⚠️ Отыгрыши для '{wizard.event_title}' применены частично "
+              f"(не применено: {len(missing_nicknames)} чел.) — при следующей подаче явки недостающее будет доначислено.")
 
     queue_changed = await apply_squad_commander_queue_promotion(wizard, old_record=old_record)
 
@@ -4532,11 +4707,21 @@ async def approve_vacation(interaction, nickname):
     if vacation.get('status') != 'pending':
         await interaction.followup.send(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
         return
-    vacation['status'] = 'active'
-    vacation['approved_at'] = datetime.now(MSK).isoformat()
-    vacation['approved_by'] = interaction.user.display_name
+    # Между первым load_json() в начале функции и этим моментом не было
+    # await'ов, но параллельный approve/reject того же отпуска ДВУМЯ
+    # администраторами одновременно возможен — перечитываем свежий снимок
+    # под локом и повторно проверяем статус ПРЯМО ПЕРЕД записью.
     async with _vacations_write_lock:
-        save_json(VACATIONS_FILE, vacations)
+        fresh_vacations = load_json(VACATIONS_FILE, {})
+        fresh_vacation = fresh_vacations.get(nickname)
+        if fresh_vacation is None or fresh_vacation.get('status') != 'pending':
+            await interaction.followup.send(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
+            return
+        fresh_vacation['status'] = 'active'
+        fresh_vacation['approved_at'] = datetime.now(MSK).isoformat()
+        fresh_vacation['approved_by'] = interaction.user.display_name
+        save_json(VACATIONS_FILE, fresh_vacations)
+        vacation = fresh_vacation
     member = await find_member_by_nickname(nickname)
     if member:
         await update_vacation_role(member, True)
@@ -4572,11 +4757,18 @@ async def reject_vacation(interaction, nickname):
     if vacation.get('status') != 'pending':
         await interaction.followup.send(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
         return
-    vacation['status'] = 'rejected'
-    vacation['rejected_at'] = datetime.now(MSK).isoformat()
-    vacation['rejected_by'] = interaction.user.display_name
+    # Та же защита от одновременного approve/reject двумя администраторами.
     async with _vacations_write_lock:
-        save_json(VACATIONS_FILE, vacations)
+        fresh_vacations = load_json(VACATIONS_FILE, {})
+        fresh_vacation = fresh_vacations.get(nickname)
+        if fresh_vacation is None or fresh_vacation.get('status') != 'pending':
+            await interaction.followup.send(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
+            return
+        fresh_vacation['status'] = 'rejected'
+        fresh_vacation['rejected_at'] = datetime.now(MSK).isoformat()
+        fresh_vacation['rejected_by'] = interaction.user.display_name
+        save_json(VACATIONS_FILE, fresh_vacations)
+        vacation = fresh_vacation
     try:
         channel = await client.fetch_channel(vacation['channel_id'])
         message = await channel.fetch_message(vacation['message_id'])
@@ -4613,11 +4805,21 @@ async def close_vacation(interaction, nickname, early=False, by_admin=False):
     # за 3 секунды и финальный ответ падает с 10062 Unknown interaction.
     await interaction.response.defer(ephemeral=True, thinking=True)
 
-    vacation['status'] = 'ended_early' if early else 'ended_scheduled'
-    vacation['closed_at'] = datetime.now(MSK).isoformat()
-    vacation['closed_by'] = interaction.user.display_name
+    # Между первым load_json() выше (до defer) и этим моментом уже был
+    # один await (defer) — перечитываем свежий снимок под локом на случай
+    # параллельного закрытия того же отпуска (например, боец и админ
+    # одновременно нажали "Завершить отпуск").
     async with _vacations_write_lock:
-        save_json(VACATIONS_FILE, vacations)
+        fresh_vacations = load_json(VACATIONS_FILE, {})
+        fresh_vacation = fresh_vacations.get(nickname)
+        if fresh_vacation is None or fresh_vacation.get('status') != 'active':
+            await interaction.followup.send(es("⚠️ Отпуск уже закрыт!"), ephemeral=True)
+            return
+        fresh_vacation['status'] = 'ended_early' if early else 'ended_scheduled'
+        fresh_vacation['closed_at'] = datetime.now(MSK).isoformat()
+        fresh_vacation['closed_by'] = interaction.user.display_name
+        save_json(VACATIONS_FILE, fresh_vacations)
+        vacation = fresh_vacation
     member = await find_member_by_nickname(nickname)
     if member:
         await update_vacation_role(member, False)
@@ -4775,52 +4977,72 @@ async def send_vacation_return_message(nickname):
 # ============== ФУНКЦИИ МЕРОПРИЯТИЙ ==============
 
 async def handle_event_response(interaction, event_id, response_type):
+    # defer() в самом начале — до чтения roster из Firebase (может быть
+    # медленным при холодном кэше) и до любых других сетевых операций,
+    # чтобы не рисковать 3-секундным лимитом Discord на первый ответ.
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
     events = load_json(EVENTS_FILE, {})
     if event_id not in events:
-        await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        await interaction.followup.send(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
     event = events[event_id]
     if event.get('status', 'active') != 'active':
-        await interaction.response.send_message(es("⛔ Мероприятие отменено или уже завершено. Отметки не принимаются!"), ephemeral=True)
+        await interaction.followup.send(es("⛔ Мероприятие отменено или уже завершено. Отметки не принимаются!"), ephemeral=True)
         return
     nickname = interaction.user.display_name
     current_date = datetime.now(MSK)
     event_end = datetime.fromtimestamp(event['end_time'], MSK)
     if current_date > event_end:
-        await interaction.response.send_message(es("⛔ Мероприятие уже завершено. Отметки больше не принимаются!"), ephemeral=True)
+        await interaction.followup.send(es("⛔ Мероприятие уже завершено. Отметки больше не принимаются!"), ephemeral=True)
         return
 
-    # === Запрет на участие, если бойца нет в списке клана (только в режиме Firebase) (п.9) ===
-    # В аварийном режиме DATA_BACKEND='json' проверка членства недоступна —
-    # список бойцов физически хранится в Firebase, а не в наших JSON-файлах,
-    # поэтому гейт сознательно отключается, чтобы не заблокировать ВСЕХ бойцов
-    # подряд из-за отсутствия данных.
+    # === Запрет на участие, если бойца нет в списке клана (только в режиме Firebase) ===
     if USE_FIREBASE_BACKEND:
         clan_members = await load_clan_members_from_firebase()
         if nickname not in clan_members:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 es("⛔ Вы не найдены в списке клана. Обратитесь к командованию, чтобы отметиться."),
                 ephemeral=True
             )
             return
 
     if is_on_vacation_dynamic(nickname, current_date):
-        await interaction.response.send_message(es("🏖️ Вы сейчас в отпуске."), ephemeral=True)
+        await interaction.followup.send(es("🏖️ Вы сейчас в отпуске."), ephemeral=True)
         return
-    if response_type == "accept":
-        event['accepted'][nickname] = True
-        event['declined'].pop(nickname, None)
-        await interaction.response.send_message(es("✅ Вы записаны на мероприятие!"), ephemeral=True)
-    else:
-        event['declined'][nickname] = True
-        event['accepted'].pop(nickname, None)
-        await interaction.response.send_message(es("❌ Вы отказались от участия!"), ephemeral=True)
-    # Блокировка нужна, потому что фоновые задачи (check_event_reminders,
-    # check_event_completion) держат СВОЙ снимок events в памяти дольше,
-    # чем занимает это присвоение — без лока их save_json мог бы перезаписать
-    # только что сохранённую здесь отметку бойца устаревшим снимком.
+
+    # ВАЖНО: между первым load_json() выше и этим моментом были await'ы
+    # (роскейт клана, проверка отпуска) — за это время параллельный клик
+    # другого бойца или фоновая задача (check_event_reminders/completion)
+    # могли уже изменить этот же файл. Перечитываем СВЕЖИЙ снимок ПОД ЛОКОМ
+    # и вносим мутацию туда — а не в устаревший 'events'/'event' сверху,
+    # который иначе полностью затёр бы чужие изменения при save_json.
     async with _events_write_lock:
-        save_json(EVENTS_FILE, events)
+        fresh_events = load_json(EVENTS_FILE, {})
+        fresh_event = fresh_events.get(event_id)
+        if fresh_event is None:
+            await interaction.followup.send(es("❌ Мероприятие не найдено!"), ephemeral=True)
+            return
+        # Повторная проверка статуса на свежих данных — мероприятие могло
+        # быть отменено/завершено ИМЕННО в это самое окно ожидания.
+        if fresh_event.get('status', 'active') != 'active':
+            await interaction.followup.send(es("⛔ Мероприятие отменено или уже завершено. Отметки не принимаются!"), ephemeral=True)
+            return
+        fresh_event.setdefault('accepted', {})
+        fresh_event.setdefault('declined', {})
+        if response_type == "accept":
+            fresh_event['accepted'][nickname] = True
+            fresh_event['declined'].pop(nickname, None)
+        else:
+            fresh_event['declined'][nickname] = True
+            fresh_event['accepted'].pop(nickname, None)
+        save_json(EVENTS_FILE, fresh_events)
+
+    if response_type == "accept":
+        await interaction.followup.send(es("✅ Вы записаны на мероприятие!"), ephemeral=True)
+    else:
+        await interaction.followup.send(es("❌ Вы отказались от участия!"), ephemeral=True)
+
     embed_refresher.schedule(event_id)
 
 
@@ -4895,7 +5117,9 @@ async def cancel_event(interaction, event_id):
         await interaction.followup.send(es("⚠️ Мероприятие уже отменено!"), ephemeral=True)
         return
     event['status'] = 'cancelled'
-    save_json(EVENTS_FILE, events)
+    async with _events_write_lock:
+        save_json(EVENTS_FILE, events)
+
     await refresh_event_message(event_id)
     if event.get('thread_id'):
         try:
@@ -4903,8 +5127,17 @@ async def cancel_event(interaction, event_id):
             await unlock_and_unarchive_thread(thread)
             await rename_thread_if_needed(thread, desired_thread_name(event))
             msg = await thread.send(render_cancel_message(event, interaction.user.display_name))
-            record_thread_message(event, msg.id, 'cancelled', extra={'by_user': interaction.user.display_name})
-            save_json(EVENTS_FILE, events)
+            # ВАЖНО: между первым save_json (статус) и этой точкой прошло
+            # время (несколько await: fetch_channel, unlock, rename, send) —
+            # за это время параллельный клик по другому мероприятию мог
+            # изменить events. Перечитываем свежий снимок под локом и
+            # добавляем в него ТОЛЬКО запись о новом сообщении.
+            async with _events_write_lock:
+                fresh_events = load_json(EVENTS_FILE, {})
+                fresh_event = fresh_events.get(event_id)
+                if fresh_event is not None:
+                    record_thread_message(fresh_event, msg.id, 'cancelled', extra={'by_user': interaction.user.display_name})
+                    save_json(EVENTS_FILE, fresh_events)
         except Exception:
             pass
     await interaction.followup.send(es("✅ Мероприятие отменено! Данные сохранены, его можно снова активировать."), ephemeral=True)
@@ -4923,7 +5156,9 @@ async def reactivate_event(interaction, event_id):
         return
     event_end = datetime.fromtimestamp(event['end_time'], MSK)
     event['status'] = 'completed' if datetime.now(MSK) > event_end else 'active'
-    save_json(EVENTS_FILE, events)
+    async with _events_write_lock:
+        save_json(EVENTS_FILE, events)
+
     await refresh_event_message(event_id)
     if event.get('thread_id'):
         try:
@@ -4931,14 +5166,21 @@ async def reactivate_event(interaction, event_id):
             await unlock_and_unarchive_thread(thread)
             await rename_thread_if_needed(thread, desired_thread_name(event))
             msg = await thread.send(render_reactivate_message(event))
-            record_thread_message(event, msg.id, 'reactivated')
-            save_json(EVENTS_FILE, events)
+            # То же самое: перечитываем свежий снимок под локом перед
+            # добавлением записи о сообщении — вместо записи устаревшего
+            # 'events' целиком, которая могла бы затереть параллельные
+            # изменения (клики, напоминания) на ДРУГИХ мероприятиях.
+            async with _events_write_lock:
+                fresh_events = load_json(EVENTS_FILE, {})
+                fresh_event = fresh_events.get(event_id)
+                if fresh_event is not None:
+                    record_thread_message(fresh_event, msg.id, 'reactivated')
+                    save_json(EVENTS_FILE, fresh_events)
             if event['status'] == 'completed':
                 await lock_and_archive_thread(thread)
         except Exception:
             pass
     await interaction.followup.send(es("✅ Мероприятие активировано снова!"), ephemeral=True)
-
 
 
 async def delete_event(interaction, event_id):
@@ -4961,12 +5203,22 @@ async def delete_event(interaction, event_id):
         await message.delete()
     except Exception:
         pass
-    attendance = load_json(ATTENDANCE_FILE, {})
-    if event_id in attendance:
-        del attendance[event_id]
-        save_json(ATTENDANCE_FILE, attendance)
-    del events[event_id]
-    save_json(EVENTS_FILE, events)
+    # Между первым load_json(EVENTS_FILE) в начале функции и этой точкой
+    # прошло время (удаление ветки, удаление сообщения — сетевые вызовы) —
+    # за это время могли произойти изменения других мероприятий. Удаляем
+    # запись ИЗ СВЕЖЕГО снимка под локом, а не сохраняем устаревший 'events'
+    # целиком (что затёрло бы чужие параллельные изменения).
+    async with _events_write_lock:
+        fresh_events = load_json(EVENTS_FILE, {})
+        fresh_events.pop(event_id, None)
+        save_json(EVENTS_FILE, fresh_events)
+
+    async with _attendance_write_lock:
+        attendance = load_json(ATTENDANCE_FILE, {})
+        if event_id in attendance:
+            del attendance[event_id]
+            save_json(ATTENDANCE_FILE, attendance)
+
     await interaction.followup.send(es("🗑️ Мероприятие полностью удалено!"), ephemeral=True)
 
 
@@ -5211,6 +5463,8 @@ async def post_weekly_events(week_key: str = None):
 
     prepared = []
     for weekly_id, entry in weekly_events.items():
+        if weekly_id == '_seeded':
+            continue
         if weekly_id in already_created_weekly_ids:
             continue  # уже создано для этой недели — пропускаем (идемпотентность)
         try:
@@ -6251,6 +6505,11 @@ async def on_ready():
         # какая-то отложенная запись.
         for guild in client.guilds:
             member_index.rebuild(guild)
+            if len(client.guilds) > 1:
+                print(f"⚠️ Бот состоит более чем в одной гильдии ({len(client.guilds)}) — "
+                      f"member_index поддерживает индекс только ПОСЛЕДНЕЙ гильдии из списка. "
+                      f"Если бот работает на нескольких серверах одновременно, поиск участников "
+                      f"может работать некорректно для других гильдий.")
         print("ℹ️ Повторный on_ready (восстановление соединения) — тяжёлая инициализация пропущена, обновлён только индекс участников.")
         return
 
@@ -6270,6 +6529,9 @@ async def on_ready():
             except Exception as e:
                 print(f"⚠️ Не удалось догрузить участников гильдии {guild.id}: {e}")
         member_index.rebuild(guild)
+        if len(client.guilds) > 1:
+            print(f"⚠️ Бот состоит более чем в одной гильдии ({len(client.guilds)}) — "
+                  f"member_index поддерживает индекс только ПОСЛЕДНЕЙ гильдии из списка.")
         await setup_voice_room_triggers(guild)
         await sync_voice_rooms_on_startup(guild)
 
