@@ -1257,14 +1257,29 @@ def _firestore_write_sync(doc_name, data):
 
 
 def _write_local_backup_sync(filename, data):
-    """Пишет резервную JSON-копию на диск. В режиме DATA_BACKEND='firebase'
-    вызывается при КАЖДОЙ записи (зеркалирование) — бэкапы всегда идентичны
-    тому, что лежит в Firebase, на случай аварийного переключения на них."""
+    """Пишет резервную JSON-копию на диск АТОМАРНО: сначала во временный
+    файл в той же папке, затем os.replace() — это операция файловой системы,
+    которая либо полностью применяется, либо не применяется вовсе. Раньше
+    прямая запись через open(filename, 'w') могла оставить файл наполовину
+    записанным (невалидный JSON), если процесс был убит посреди записи
+    (например, внешним Stop-Process -Force) — а именно этот файл служит
+    аварийным бэкапом на случай недоступности Firebase, повреждённым он
+    быть не должен."""
+    tmp_path = f"{filename}.tmp_{os.getpid()}"
     try:
-        with open(filename, 'w', encoding='utf-8') as f:
+        with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, filename)
     except Exception as e:
         print(f"⚠️ Не удалось записать резервную копию '{filename}': {e}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
 
 
 def _read_local_backup_sync(filename, default):
@@ -1393,11 +1408,7 @@ def load_json(filename, default=None):
 
 def save_json(filename, data):
     if filename not in FIREBASE_DATA_MAP:
-        try:
-            with open(filename, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"Ошибка сохранения {filename}: {e}")
+        _write_local_backup_sync(filename, data)  # теперь тоже атомарная запись
         return
 
     if not USE_FIREBASE_BACKEND:
@@ -2191,17 +2202,13 @@ class AdminMainMenuView(discord.ui.View):
 
     @discord.ui.button(label=es("🔧 Принудительный перезапуск бота"), style=discord.ButtonStyle.danger, custom_id="admin_force_restart", row=4)
     async def force_restart_button(self, interaction, button):
-        _write_restart_log_sync("КЛИК: кнопка force_restart нажата")
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
-        try:
-            await interaction.response.send_message(es("🔧 Перезапускаю бота... Новый процесс запустится через несколько секунд."), ephemeral=True)
-            await asyncio.sleep(1)
-            await force_restart_bot()
-        except Exception as e:
-            _write_restart_log_sync(f"КРИТИЧЕСКАЯ ОШИБКА в обработчике кнопки: {e!r}")
-            raise
+        await interaction.response.send_message(es("🔧 Перезапускаю бота... Новый процесс запустится через несколько секунд."), ephemeral=True)
+        await asyncio.sleep(1)
+        await force_restart_bot()
+
 
 class VacationRequestView(discord.ui.View):
     def __init__(self):
@@ -3770,7 +3777,7 @@ def render_reactivate_message(event: dict) -> str:
 
 def render_reminder_2days_message(mention_block: str) -> str:
     return (mention_block + "\n\n" +
-        "Бойцы, ждём ваших отметок! До мероприятия осталось 2 суток, но вы пока ещё не отметились! " +
+        "📢 Бойцы, ждём ваших отметок! До мероприятия осталось 2 суток, но вы пока ещё не отметились! " +
         f"Пожалуйста, отметьтесь в основном посте в <#{EVENTS_CHANNEL_ID}>.")
 
 def render_reminder_15min_message(mention_block: str, event: dict) -> str:
@@ -5692,37 +5699,16 @@ async def sweep_empty_voice_rooms():
     for channel_id in list(VOICE_ROOMS.keys()):
         await cleanup_empty_temp_room(channel_id)
 
-
-def _write_restart_log_sync(message: str):
-    """Прямая, полностью синхронная запись в ОТДЕЛЬНЫЙ файл restart_log.txt —
-    жёстко независимая от буферизации stdout/stderr, от асинхронной очереди
-    _log_forward_buffer и от Discord API. Это последний рубеж диагностики:
-    если даже этот файл не появляется/не обновляется после нажатия кнопки —
-    значит кнопка физически не была обработана (интеракция не дошла,
-    исключение случилось раньше первой строки, или процесс был убит
-    извне — например, Stop-Process -Force из .bat-менеджера, который
-    не оставляет вообще никаких следов ни в одном логе по определению)."""
-    try:
-        path = os.path.join(BASE_DIR, 'restart_log.txt')
-        with open(path, 'a', encoding='utf-8') as f:
-            f.write(f"[{datetime.now(MSK).strftime('%Y-%m-%d %H:%M:%S')}] PID={os.getpid()} {message}\n")
-            f.flush()
-            os.fsync(f.fileno())
-    except Exception:
-        pass
-
-
 async def force_restart_bot():
     """Освобождает lock-файл, поднимает НОВЫЙ независимый процесс бота
     и завершает текущий процесс. Вызывается кнопкой '🔄 Принудительный
-    перезапуск' в админ-панели."""
-    _write_restart_log_sync("ШАГ 1: force_restart_bot() вызвана")
-
+    перезапуск' в админ-панели. Специального логирования самого факта
+    перезапуска не ведётся — единственный лог о готовности бота
+    печатается новым процессом при его старте (см. on_ready)."""
     try:
         await flush_log_buffer_to_discord()
     except Exception:
         pass
-    _write_restart_log_sync("ШАГ 2: первый flush логов выполнен")
 
     try:
         loop = asyncio.get_running_loop()
@@ -5730,27 +5716,13 @@ async def force_restart_bot():
             loop.run_in_executor(None, lambda: EXECUTOR.shutdown(wait=True)),
             timeout=15
         )
-        _original_print("✅ Все отложенные записи завершены перед перезапуском.")
-        _write_restart_log_sync("ШАГ 3: EXECUTOR.shutdown завершён успешно")
-    except asyncio.TimeoutError:
-        _original_print("⚠️ Не все фоновые записи завершились за 15 секунд — продолжаю перезапуск принудительно.")
-        _write_restart_log_sync("ШАГ 3: EXECUTOR.shutdown TIMEOUT")
-    except Exception as e:
-        _original_print(f"⚠️ Ошибка при ожидании завершения фоновых задач: {e}")
-        _write_restart_log_sync(f"ШАГ 3: EXECUTOR.shutdown ОШИБКА: {e}")
-
-    try:
-        await flush_log_buffer_to_discord()
     except Exception:
         pass
-    _write_restart_log_sync("ШАГ 4: второй flush логов выполнен")
 
     try:
         _release_instance_lock()
-        _write_restart_log_sync("ШАГ 5: lock-файл освобождён")
-    except Exception as e:
-        _original_print(f"⚠️ Ошибка при освобождении lock-файла перед перезапуском: {e}")
-        _write_restart_log_sync(f"ШАГ 5: ОШИБКА освобождения lock-файла: {e}")
+    except Exception:
+        pass
 
     try:
         kwargs = {}
@@ -5759,22 +5731,13 @@ async def force_restart_bot():
         else:
             kwargs['start_new_session'] = True
 
-        new_proc = subprocess.Popen(
+        subprocess.Popen(
             [sys.executable, os.path.abspath(__file__)],
             cwd=BASE_DIR, stdin=subprocess.DEVNULL,
             **kwargs
         )
-        _original_print("🔄 Новый процесс бота запущен, завершаю текущий...")
-        _write_restart_log_sync(f"ШАГ 6: новый процесс запущен, новый PID={new_proc.pid}")
-    except Exception as e:
-        _original_print(f"❌ Не удалось запустить новый процесс бота при перезапуске: {e}")
-        _write_restart_log_sync(f"ШАГ 6: ОШИБКА запуска нового процесса: {e}")
-
-    try:
-        await flush_log_buffer_to_discord()
     except Exception:
         pass
-    _write_restart_log_sync("ШАГ 7: финальный flush выполнен, вызываю os._exit(0)")
 
     try:
         sys.stdout.flush()
@@ -5783,8 +5746,6 @@ async def force_restart_bot():
         pass
 
     os._exit(0)
-
-
 
 
 
@@ -5898,6 +5859,18 @@ async def on_ready():
         await ensure_admin_channel_anchors()
     except Exception as e:
         print(f"⚠️ Не удалось инициализировать якорные сообщения админ-канала: {e}")
+
+    # Печатаем ЭТОТ лог последним — только после того, как ветка "🔧 Логирование"
+    # уже гарантированно найдена/создана (ensure_admin_channel_anchors выше)
+    # и watcher'ы запущены (setup_firestore_watchers выше). Явный flush сразу
+    # после print — чтобы не ждать планового цикла раз в 15 секунд, и лог
+    # о готовности бота появился в Discord-ветке немедленно.
+    print(f"✅ Бот полностью загружен и готов к работе (PID {os.getpid()}).")
+    try:
+        await flush_log_buffer_to_discord()
+    except Exception:
+        pass
+
 
 
 @client.event
