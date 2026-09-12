@@ -55,30 +55,10 @@ def print(*args, **kwargs):
     _original_print(*args, **kwargs)
 
 
-_FLUSHING_LOG_BUFFER = False  # анти-реентрантный флаг: не форвардить логи, порождённые самой отправкой логов
-
-
-class _NoSelfLoopLogFilter(logging.Filter):
-    """Защита форвардера от зацикливания на самом себе:
-    - discord.http часто пишет WARNING 'We are being rate limited' именно
-      В МОМЕНТ, когда сам форвардер шлёт накопленные логи в Discord — без
-      фильтра это создаёт петлю (лог о рейтлимите -> он же уходит в буфер ->
-      следующая отправка -> снова рейтлимит);
-    - пока идёт flush_log_buffer_to_discord(), любые логи discord.* уровня
-      ниже WARNING подавляются, чтобы сам процесс отправки не порождал
-      новые записи для следующей отправки."""
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.name == 'discord.http' and 'rate limited' in record.getMessage().lower():
-            return False
-        if _FLUSHING_LOG_BUFFER and record.name.startswith('discord') and record.levelno < logging.WARNING:
-            return False
-        return True
-
-
 class _DiscordLogHandler(logging.Handler):
-    """Перехватывает системные логи discord.py и apscheduler (подключения,
-    rate limit, необработанные ошибки во view/modal, падения фоновых задач),
-    которые НЕ идут через наш print()."""
+    """Перехватывает системные логи discord.py (discord.client, discord.gateway,
+    discord.http, discord.ui.view и т.д.) — то есть подключения, rate limit
+    и необработанные ошибки во view/modal, которые НЕ идут через наш print()."""
     def emit(self, record):
         try:
             _enqueue_log_line(self.format(record))
@@ -89,43 +69,24 @@ class _DiscordLogHandler(logging.Handler):
 def _setup_discord_log_forwarding():
     handler = _DiscordLogHandler()
     handler.setLevel(LOG_FORWARD_LEVEL)
-    handler.addFilter(_NoSelfLoopLogFilter())
     handler.setFormatter(logging.Formatter(
         '[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
     ))
-    # 'discord' — подключения, rate limit, ошибки во View/Modal.
-    # 'apscheduler' — ВАЖНО: без этой строки падения фоновых задач
-    # (check_event_reminders, check_event_completion, post_weekly_events и т.д.)
-    # были НЕВИДИМЫ в Discord-логах — они уходят в отдельный логгер,
-    # на который handler раньше не был подписан.
     logging.getLogger('discord').addHandler(handler)
-    logging.getLogger('apscheduler').addHandler(handler)
 
 
 _setup_discord_log_forwarding()
 
-
 _log_forward_thread_cache = None
 
 
-def _requeue_unsent_log_text(full_text: str, sent_chars: int):
-    """Возвращает неотправленный хвост текста обратно в буфер логов.
-    Раньше это работало ТОЛЬКО для случая 'ветка ещё не создана' — при
-    любой другой ошибке (rate limit, сеть, удалённая ветка) неотправленные
-    строки терялись безвозвратно. Теперь — при ЛЮБОЙ ошибке."""
-    unsent = full_text[sent_chars:]
-    if not unsent:
-        return
-    with _log_forward_lock:
-        _log_forward_buffer.appendleft(unsent)
-
-
 async def flush_log_buffer_to_discord():
-    """Периодически отправляет накопленные строки логов пачками в ветку
-    якорного сообщения '🔧 Логирование'. До того, как якорь создан — строки
-    копятся в буфере. При ЛЮБОЙ ошибке отправки неотправленный хвост
-    возвращается в буфер, а не теряется."""
-    global _log_forward_thread_cache, _FLUSHING_LOG_BUFFER
+    """Периодически (см. job в on_ready) отправляет накопленные строки логов
+    пачками в ветку якорного сообщения '🔧 Логирование' (ADMIN_CHANNEL_ID).
+    До того, как якорь создан (самое начало запуска бота), строки просто
+    копятся в буфере — ничего не теряется, они улетят при первом же
+    успешном определении ветки."""
+    global _log_forward_thread_cache
     with _log_forward_lock:
         if not _log_forward_buffer:
             return
@@ -133,40 +94,26 @@ async def flush_log_buffer_to_discord():
         _log_forward_buffer.clear()
     if not lines:
         return
-
-    _FLUSHING_LOG_BUFFER = True
-    text = "\n".join(lines)
-    chunk_size = 1900
-    sent_chars = 0
     try:
         if _log_forward_thread_cache is None:
             thread_id = await get_logging_thread_id()
             if not thread_id:
+                # Якорь ещё не создан (например, это самое начало запуска) —
+                # возвращаем строки обратно в буфер, попробуем в следующий раз.
                 with _log_forward_lock:
                     for line in reversed(lines):
                         _log_forward_buffer.appendleft(line)
                 return
             _log_forward_thread_cache = await client.fetch_channel(thread_id)
-
         thread = _log_forward_thread_cache
+        text = "\n".join(lines)
+        chunk_size = 1900
         for i in range(0, len(text), chunk_size):
             chunk = text[i:i + chunk_size]
             await thread.send(f"```\n{chunk}\n```")
-            sent_chars = i + len(chunk)
             await asyncio.sleep(0.5)
-    except (discord.NotFound, discord.Forbidden) as e:
-        # Ветка удалена/заархивирована без прав на снятие блокировки, либо
-        # у бота отозван доступ — сбрасываем кэш, иначе логи в Discord
-        # перестанут идти ВООБЩЕ до следующего перезапуска процесса.
-        _log_forward_thread_cache = None
-        _original_print(f"⚠️ Ветка логирования недоступна ({e}), кэш сброшен — будет переискана.")
-        _requeue_unsent_log_text(text, sent_chars)
     except Exception as e:
         _original_print(f"⚠️ Не удалось отправить логи в Discord-ветку: {e}")
-        _requeue_unsent_log_text(text, sent_chars)
-    finally:
-        _FLUSHING_LOG_BUFFER = False
-
 
 import gspread
 
@@ -712,12 +659,7 @@ intents.members = True
 intents.voice_states = True
 
 client = discord.Client(intents=intents)
-scheduler = AsyncIOScheduler(timezone=MSK, job_defaults={
-    'coalesce': True,           # если задача пропустила несколько срабатываний подряд — выполнить только последнее
-    'max_instances': 1,         # запрет на параллельное выполнение двух экземпляров одной и той же задачи
-    'misfire_grace_time': 300,  # 5 минут "запаса" перед тем, как считать срабатывание пропущенным
-})
-
+scheduler = AsyncIOScheduler(timezone=MSK)
 
 check_lock = asyncio.Lock()
 
