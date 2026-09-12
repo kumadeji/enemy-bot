@@ -5294,6 +5294,7 @@ async def check_event_reminders():
                 if fresh is None:
                     continue
                 fresh['reminder_2days_sent'] = event.get('reminder_2days_sent', fresh.get('reminder_2days_sent'))
+                fresh['reminder_1day_sent'] = event.get('reminder_1day_sent', fresh.get('reminder_1day_sent'))
                 fresh['reminder_15min_sent'] = event.get('reminder_15min_sent', fresh.get('reminder_15min_sent'))
             save_json(EVENTS_FILE, fresh_events)
 
