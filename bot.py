@@ -5387,7 +5387,7 @@ async def on_ready():
             max_instances=1, coalesce=True, misfire_grace_time=1800
         )
     if not scheduler.get_job('weekly_events'):
-        scheduler.add_job(post_weekly_events, 'cron', day_of_week='mon', hour=12, minute=0, id='weekly_events', replace_existing=True)
+        scheduler.add_job(post_weekly_events, 'cron', day_of_week='mon', hour=8, minute=0, id='weekly_events', replace_existing=True)
     if not scheduler.get_job('vacation_check'):
         scheduler.add_job(check_expired_vacations, 'interval', hours=1, id='vacation_check', replace_existing=True)
     if not scheduler.get_job('vacation_ending_reminder'):
