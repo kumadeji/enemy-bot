@@ -2727,34 +2727,49 @@ async def handle_new_changelog_watch(doc_id, data):
         await set_watcher_last_ts('changeLog', _extract_timestamp(data.get('createdAt')))
 
 _LAST_ANKETA_EMBED_SNAPSHOT = {}
+_ANKETA_EDIT_LOCK = asyncio.Lock()
+_ANKETA_EDIT_MIN_INTERVAL = 1.5  # секунд между последовательными правками анкет
 
 
 async def handle_profile_modified_watch(uid, data):
-    """Реагирует на MODIFIED-события коллекции 'profiles' — то есть на ЛЮБОЕ
-    изменение профиля бойца, включая состав/должность (которые назначаются
-    вручную командованием и НЕ проходят через changeLog). Если у этого uid
-    есть опубликованная анкета — embed обновляется live, без задержки.
-    Защита от дублирующих правок: пропускает, если снапшот данных не изменился
-    (Firestore иногда шлёт MODIFIED без реального изменения содержимого)."""
+    """Реагирует на MODIFIED-события коллекции 'profiles'. Если у этого uid
+    есть опубликованная анкета — embed обновляется live.
+
+    ВАЖНО: сравниваем именно РЕНДЕР embed'а, а не сырые данные профиля —
+    многие поля (например gameStats.koCount/ksCount, которые массово меняются
+    сразу у нескольких игроков после подачи отчёта о явке) НЕ отображаются
+    в анкете вообще. Без этой проверки любое начисление отыгрышей вызывало
+    лавину бессмысленных правок анкет ОДНОВРЕМЕННО — что приводило к
+    массовому rate limit (429) и ошибке Discord 30046 (превышен лимит
+    правок сообщений старше 1 часа)."""
     anketa_info = get_anketa_message_info(uid)
     if not anketa_info or not anketa_info.get('channel_id') or not anketa_info.get('message_id'):
         return
 
-    snapshot_key = json.dumps(data, sort_keys=True, default=str)
-    if _LAST_ANKETA_EMBED_SNAPSHOT.get(uid) == snapshot_key:
-        return
-    _LAST_ANKETA_EMBED_SNAPSHOT[uid] = snapshot_key
-
     try:
         channel = await client.fetch_channel(anketa_info['channel_id'])
         message = await channel.fetch_message(anketa_info['message_id'])
-        # Заголовок ('Новая анкета'/'Имеющаяся анкета') не должен слетать при
-        # live-обновлении — сохраняем ровно то, что уже было в сообщении.
         was_new = bool(message.embeds and message.embeds[0].title and message.embeds[0].title.startswith("Новая анкета"))
         embed = await build_anketa_embed(uid, data, is_new=was_new)
-        await message.edit(embed=embed)
     except Exception as e:
-        print(f"⚠️ Не удалось live-обновить анкету для uid={uid}: {e}")
+        print(f"⚠️ Не удалось подготовить обновление анкеты для uid={uid}: {e}")
+        return
+
+    snapshot_key = json.dumps(embed.to_dict(), sort_keys=True, default=str)
+    if _LAST_ANKETA_EMBED_SNAPSHOT.get(uid) == snapshot_key:
+        return
+
+    async with _ANKETA_EDIT_LOCK:
+        try:
+            await message.edit(embed=embed)
+            _LAST_ANKETA_EMBED_SNAPSHOT[uid] = snapshot_key
+        except Exception as e:
+            print(f"⚠️ Не удалось live-обновить анкету для uid={uid}: {e}")
+        finally:
+            # Пауза ПОКА лок ещё удержан — гарантирует, что следующая правка
+            # (для другого бойца) не полетит через доли секунды, даже если
+            # события MODIFIED пришли пачкой одновременно.
+            await asyncio.sleep(_ANKETA_EDIT_MIN_INTERVAL)
 
 
 async def handle_new_notification_watch(doc_id, data):
@@ -3807,26 +3822,30 @@ async def publish_vacation_info(interaction):
 
 
 async def handle_vacation_request(interaction, nickname, start_str, end_str, reason, by_admin):
+    # Сразу подтверждаем interaction, ДО любых сетевых вызовов (поиск участника,
+    # отправка embed, создание ветки) — иначе при их суммарной задержке свыше
+    # 3 секунд исходная interaction "протухает" даже до финального ответа.
+    await interaction.response.defer(ephemeral=True, thinking=True)
     try:
         start_date = datetime.strptime(start_str, "%d.%m.%Y")
         end_date = datetime.strptime(end_str, "%d.%m.%Y")
         duration = (end_date - start_date).days
         if duration < 7:
-            await interaction.response.send_message(es("❌ Отпуск должен быть не менее 7 дней!"), ephemeral=True)
+            await interaction.followup.send(es("❌ Отпуск должен быть не менее 7 дней!"), ephemeral=True)
             return
         if duration > 31:
-            await interaction.response.send_message(es("❌ Отпуск не может быть дольше 31 дня!"), ephemeral=True)
+            await interaction.followup.send(es("❌ Отпуск не может быть дольше 31 дня!"), ephemeral=True)
             return
         if not by_admin and start_date.date() < datetime.now(MSK).date():
-            await interaction.response.send_message(es("❌ Дата начала должна быть в будущем!"), ephemeral=True)
+            await interaction.followup.send(es("❌ Дата начала должна быть в будущем!"), ephemeral=True)
             return
         member = await find_member_by_nickname(nickname)
         if not member:
-            await interaction.response.send_message(f"❌ Боец {nickname} не найден!", ephemeral=True)
+            await interaction.followup.send(f"❌ Боец {nickname} не найден!", ephemeral=True)
             return
         vacations = load_json(VACATIONS_FILE, {})
         if nickname in vacations and vacations[nickname].get('status') in ['active', 'pending']:
-            await interaction.response.send_message(f"⚠️ У {nickname} уже есть отпуск!", ephemeral=True)
+            await interaction.followup.send(f"⚠️ У {nickname} уже есть отпуск!", ephemeral=True)
             return
         initial_status = 'active' if by_admin else 'pending'
         vacations[nickname] = {
@@ -3866,7 +3885,7 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
             if member:
                 await update_vacation_role(member, True)
 
-            await interaction.response.send_message(es(f"✅ Отпуск для {nickname} оформлен и сразу активирован!"), ephemeral=True)
+            await interaction.followup.send(es(f"✅ Отпуск для {nickname} оформлен и сразу активирован!"), ephemeral=True)
             return
 
         embed_description = f"**{nickname}** запросил(а) отпуск"
@@ -3896,19 +3915,23 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
         except Exception:
             pass
         save_json(VACATIONS_FILE, vacations)
-        await interaction.response.send_message(es("✅ Запрос на отпуск отправлен!"), ephemeral=True)
+        await interaction.followup.send(es("✅ Запрос на отпуск отправлен!"), ephemeral=True)
     except Exception as e:
-        await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+        try:
+            await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
+        except Exception:
+            pass  # интеракция уже недоступна — избегаем повторного необработанного исключения
 
 
 async def approve_vacation(interaction, nickname):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     vacations = load_json(VACATIONS_FILE, {})
     if nickname not in vacations:
-        await interaction.response.send_message(es("❌ Отпуск не найден!"), ephemeral=True)
+        await interaction.followup.send(es("❌ Отпуск не найден!"), ephemeral=True)
         return
     vacation = vacations[nickname]
     if vacation.get('status') != 'pending':
-        await interaction.response.send_message(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
+        await interaction.followup.send(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
         return
     vacation['status'] = 'active'
     vacation['approved_at'] = datetime.now(MSK).isoformat()
@@ -3936,17 +3959,18 @@ async def approve_vacation(interaction, nickname):
             await message.edit(embed=embed, view=VacationMessageView())
     except Exception:
         pass
-    await interaction.response.send_message(f"✅ Отпуск {nickname} утверждён!", ephemeral=True)
+    await interaction.followup.send(f"✅ Отпуск {nickname} утверждён!", ephemeral=True)
 
 
 async def reject_vacation(interaction, nickname):
+    await interaction.response.defer(ephemeral=True, thinking=True)
     vacations = load_json(VACATIONS_FILE, {})
     if nickname not in vacations:
-        await interaction.response.send_message(es("❌ Отпуск не найден!"), ephemeral=True)
+        await interaction.followup.send(es("❌ Отпуск не найден!"), ephemeral=True)
         return
     vacation = vacations[nickname]
     if vacation.get('status') != 'pending':
-        await interaction.response.send_message(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
+        await interaction.followup.send(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
         return
     vacation['status'] = 'rejected'
     vacation['rejected_at'] = datetime.now(MSK).isoformat()
@@ -3969,7 +3993,7 @@ async def reject_vacation(interaction, nickname):
             await message.edit(embed=embed, view=None)
     except Exception:
         pass
-    await interaction.response.send_message(f"❌ Отпуск {nickname} отклонён.", ephemeral=True)
+    await interaction.followup.send(f"❌ Отпуск {nickname} отклонён.", ephemeral=True)
 
 
 async def close_vacation(interaction, nickname, early=False, by_admin=False):
@@ -4503,6 +4527,8 @@ async def post_weekly_events():
     ensure_weekly_events_file()
     weekly_events = load_json(WEEKLY_EVENTS_FILE, {})
     now = datetime.now(MSK)
+
+    prepared = []
     for weekly_id, entry in weekly_events.items():
         try:
             start_h, start_m = map(int, entry['start_time'].split(':'))
@@ -4511,6 +4537,17 @@ async def post_weekly_events():
             event_end = event_start.replace(hour=end_h, minute=end_m)
             if event_end <= event_start:
                 event_end += timedelta(days=1)
+            prepared.append((event_start, event_end, weekly_id, entry))
+        except Exception as e:
+            print(f"❌ Ошибка подготовки еженедельного мероприятия '{entry.get('name', '?')}': {e}")
+
+    # Публикуем СТРОГО в хронологическом порядке дат (например, сначала
+    # пятничное мероприятие, затем субботнее, затем воскресное) — а не
+    # в произвольном порядке хранения записей в базе данных.
+    prepared.sort(key=lambda item: item[0])
+
+    for event_start, event_end, weekly_id, entry in prepared:
+        try:
             await create_event(
                 clean_event_title(entry['name']), entry['description'], event_start, event_end,
                 image_key=entry.get('image_key', 'none'),
@@ -4520,6 +4557,7 @@ async def post_weekly_events():
             await asyncio.sleep(2)
         except Exception as e:
             print(f"❌ Ошибка публикации еженедельного мероприятия '{entry.get('name', '?')}': {e}")
+
 
 async def check_event_reminders():
     events = load_json(EVENTS_FILE, {})
@@ -4739,15 +4777,18 @@ async def update_all_templates():
         except Exception:
             continue
 
+        # Разблокируем ОДИН РАЗ перед ЛЮБЫМИ правками (и переименованием,
+        # и редактированием сообщений) — раньше разблокировка происходила
+        # только внутри блока переименования, из-за чего правка сообщений
+        # в уже закрытой ветке падала с 'Thread is archived'.
+        was_locked = getattr(thread, 'locked', False) or getattr(thread, 'archived', False)
+        if was_locked:
+            await unlock_and_unarchive_thread(thread)
+
         desired_name = desired_thread_name(event)
         if thread.name != desired_name:
             try:
-                was_locked = getattr(thread, 'locked', False)
-                if was_locked:
-                    await unlock_and_unarchive_thread(thread)
                 await thread.edit(name=desired_name)
-                if was_locked:
-                    await lock_and_archive_thread(thread)
                 thread_names_fixed += 1
             except Exception as e:
                 print(f"⚠️ Не удалось обновить название ветки {thread_id}: {e}")
@@ -4786,10 +4827,15 @@ async def update_all_templates():
                 except Exception as e:
                     print(f"⚠️ Не удалось обновить сообщение {msg_record.get('id')} в ветке {thread_id}: {e}")
 
-        if event.get('status') == 'completed' and event_id in attendance_for_sync:
-            if not getattr(thread, 'locked', False) or not getattr(thread, 'archived', False):
-                await lock_and_archive_thread(thread)
+        # Восстанавливаем блокировку ОДИН РАЗ в конце — если ветка была
+        # заблокирована ДО правок, либо мероприятие завершено и по нему уже
+        # есть отчёт о явке (должно оставаться заблокированным по правилам п.1/п.2).
+        should_be_locked = was_locked or (event.get('status') == 'completed' and event_id in attendance_for_sync)
+        if should_be_locked:
+            await lock_and_archive_thread(thread)
+            if not was_locked:
                 thread_locks_fixed += 1
+
 
     # === 2. ОБНОВЛЕНИЕ СООБЩЕНИЙ ОТПУСКОВ ===
     for nickname, data in vacations.items():
@@ -5267,18 +5313,20 @@ async def force_restart_bot():
         _original_print(f"⚠️ Ошибка при освобождении lock-файла перед перезапуском: {e}")
 
     try:
-        log_dir = os.path.join(BASE_DIR, 'logs')
-        os.makedirs(log_dir, exist_ok=True)
-        log_path = os.path.join(log_dir, 'bot_output.log')
-        log_file = open(log_path, 'a', encoding='utf-8')
         kwargs = {}
         if os.name == 'nt':
             kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
         else:
             kwargs['start_new_session'] = True
+
+        # ВАЖНО: НЕ открываем новый файловый хендл на bot_output.log здесь —
+        # на Windows это приводит к 'PermissionError: [Errno 13]', так как тот же
+        # файл уже открыт менеджер-скриптом (.bat) через '>>'. Вместо этого дочерний
+        # процесс просто НАСЛЕДУЕТ существующие stdout/stderr текущего процесса
+        # (они и так указывают на тот же лог-файл) — конфликта хендлов не возникает.
         subprocess.Popen(
             [sys.executable, os.path.abspath(__file__)],
-            cwd=BASE_DIR, stdout=log_file, stderr=log_file, stdin=subprocess.DEVNULL,
+            cwd=BASE_DIR, stdin=subprocess.DEVNULL,
             **kwargs
         )
         _original_print("🔄 Новый процесс бота запущен, завершаю текущий...")
