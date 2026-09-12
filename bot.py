@@ -737,6 +737,8 @@ scheduler = AsyncIOScheduler(timezone=MSK, job_defaults={
 
 check_lock = asyncio.Lock()
 _events_write_lock = asyncio.Lock()
+_attendance_write_lock = asyncio.Lock()
+_vacations_write_lock = asyncio.Lock()
 
 
 
@@ -1212,6 +1214,10 @@ async def check_spreadsheet():
                 if users_not_found:
                     not_found_msg = ("\n\n" + es("⚠️ **Не удалось найти в Discord:**\n") + ", ".join(users_not_found))
                     new_message_ids += await send_chunked(thread, not_found_msg, "список ненайденных")
+                print(f"✅ Проверка бойцов опубликована: {len(user_issues)} с проблемами, "
+                      f"{len(users_not_found)} не найдено в Discord, {len(new_message_ids)} сообщений отправлено.")
+            else:
+                print("✅ Проверка бойцов выполнена: проблем не обнаружено, публикация не потребовалась.")
 
             save_json(CHECK_MESSAGES_FILE, {'message_ids': new_message_ids, 'thread_id': THREAD_ID})
         except Exception as e:
@@ -1261,6 +1267,39 @@ def _firestore_write_sync(doc_name, data):
     except Exception as e:
         print(f"❌ Ошибка записи в Firebase ({doc_name}): {e}")
 
+class OrderedFirestoreWriter:
+    """Гарантирует ПОРЯДОК записи для каждого документа отдельно и
+    схлопывает (coalesce) быстро следующие друг за другом изменения одного
+    и того же doc_name — если за короткое окно submit() вызван несколько
+    раз для одного документа, реальная запись в Firestore произойдёт
+    только ОДИН РАЗ с последним переданным состоянием, а не несколько раз
+    подряд в непредсказуемом порядке через пул потоков."""
+    def __init__(self, debounce: float = 0.5):
+        self._debounce = debounce
+        self._pending: dict[str, any] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
+        self._tasks: dict[str, asyncio.Task] = {}
+
+    def submit(self, doc_name: str, data):
+        self._pending[doc_name] = data
+        if doc_name not in self._tasks or self._tasks[doc_name].done():
+            self._tasks[doc_name] = asyncio.create_task(self._flush_one(doc_name))
+
+    async def _flush_one(self, doc_name: str):
+        await asyncio.sleep(self._debounce)
+        data = self._pending.pop(doc_name, None)
+        if data is None:
+            return
+        lock = self._locks.setdefault(doc_name, asyncio.Lock())
+        async with lock:
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(EXECUTOR, _firestore_write_sync, doc_name, data)
+            except Exception as e:
+                print(f"❌ Ошибка записи в Firebase ({doc_name}): {e}")
+
+
+firestore_writer = OrderedFirestoreWriter(debounce=0.5)
 
 def _write_local_backup_sync(filename, data):
     """Пишет резервную JSON-копию на диск АТОМАРНО: сначала во временный
@@ -1387,6 +1426,9 @@ async def load_all_firebase_data():
 
 
 def load_json(filename, default=None):
+    """Читает данные С ГАРАНТИЕЙ безопасности мутации — возвращает
+    ГЛУБОКУЮ КОПИЮ. Используй эту функцию, если собираешься менять
+    результат и сохранять его обратно через save_json()."""
     if default is None:
         default = {}
     if filename not in FIREBASE_DATA_MAP:
@@ -1399,17 +1441,33 @@ def load_json(filename, default=None):
             return default
 
     if not USE_FIREBASE_BACKEND:
-        # РЕЖИМ JSON: читаем напрямую с диска при каждом вызове, без кэша.
-        # Firebase не используется вообще.
         return _read_local_backup_sync(filename, default)
 
-    # РЕЖИМ FIREBASE: читаем ТОЛЬКО из памяти (кэш, загруженный из Firebase
-    # при старте и обновляемый при каждой записи) — на диск даже не смотрим.
     with _FIRESTORE_CACHE_LOCK:
         cached = _FIRESTORE_CACHE.get(filename)
     if cached is None:
         return default
     return copy.deepcopy(cached)
+
+
+def read_json(filename, default=None):
+    """Читает данные БЕЗ глубокого копирования — быстрее load_json(), но
+    вызывающий код НЕ ДОЛЖЕН мутировать результат (и тем более передавать
+    его в save_json()). Предназначена для чисто читающих путей, которые
+    вызываются очень часто (например, поиск мероприятия по message_id на
+    каждый клик кнопки) — там deepcopy всего словаря событий на каждый
+    вызов был измеримо лишней нагрузкой при отсутствии реальной мутации."""
+    if default is None:
+        default = {}
+    if filename not in FIREBASE_DATA_MAP or not USE_FIREBASE_BACKEND:
+        # Для JSON-режима/локальных файлов гарантий по неизменности объекта
+        # в памяти всё равно нет (каждый вызов читает диск заново) — просто
+        # делегируем в load_json().
+        return load_json(filename, default)
+
+    with _FIRESTORE_CACHE_LOCK:
+        cached = _FIRESTORE_CACHE.get(filename)
+    return cached if cached is not None else default
 
 
 def save_json(filename, data):
@@ -1437,10 +1495,14 @@ def save_json(filename, data):
             print(f"❌ Не удалось запланировать защитный снапшот для '{doc_name}': {e}")
 
     if fs_db:
-        try:
-            EXECUTOR.submit(_firestore_write_sync, doc_name, data)
-        except Exception as e:
-            print(f"❌ Не удалось запланировать запись в Firebase ({doc_name}): {e}")
+        # Раньше запись шла напрямую через EXECUTOR.submit(...) — при частых
+        # последовательных изменениях ОДНОГО И ТОГО ЖЕ документа порядок
+        # выполнения в пуле потоков не гарантирован, и более старая запись
+        # теоретически могла завершиться позже новой, перезаписав в облаке
+        # актуальное состояние устаревшим. firestore_writer гарантирует
+        # порядок и схлопывает промежуточные версии одного документа
+        # (пишется только САМОЕ ПОСЛЕДНЕЕ состояние на момент реальной записи).
+        firestore_writer.submit(doc_name, data)
 
     try:
         EXECUTOR.submit(_write_local_backup_sync, filename, data)
@@ -2228,7 +2290,7 @@ class VacationApprovalView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
     def get_nickname_by_message(self, interaction):
-        vacations = load_json(VACATIONS_FILE, {})
+        vacations = read_json(VACATIONS_FILE, {})
         for nickname, data in vacations.items():
             if data.get('message_id') == interaction.message.id:
                 return nickname
@@ -2259,7 +2321,7 @@ class VacationMessageView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
     def get_nickname_by_message(self, interaction):
-        vacations = load_json(VACATIONS_FILE, {})
+        vacations = read_json(VACATIONS_FILE, {})
         for nickname, data in vacations.items():
             if data.get('message_id') == interaction.message.id:
                 return nickname
@@ -2289,7 +2351,9 @@ class VacationMessageView(discord.ui.View):
 # ============== ДИНАМИЧЕСКИЕ КНОПКИ МЕРОПРИЯТИЙ ==============
 
 def get_event_id_by_message_id(message_id):
-    events = load_json(EVENTS_FILE, {})
+    # read_json — без deepcopy: вызывается на КАЖДЫЙ клик любой кнопки
+    # мероприятия, а результат здесь только читается, не мутируется.
+    events = read_json(EVENTS_FILE, {})
     for event_id, event in events.items():
         if event.get('message_id') == message_id:
             return event_id
@@ -3802,6 +3866,11 @@ def render_reminder_2days_message(mention_block: str) -> str:
         "📢 Бойцы, ждём ваших отметок! До мероприятия осталось 2 суток, но вы пока ещё не отметились! " +
         f"Пожалуйста, отметьтесь в основном посте в <#{EVENTS_CHANNEL_ID}>.")
 
+def render_reminder_1day_message(mention_block: str) -> str:
+    return (mention_block + "\n\n" +
+        "Бойцы, ждём ваших отметок! До мероприятия остались одни сутки, но вы пока ещё не отметились! " +
+        f"Пожалуйста, отметьтесь в основном посте в <#{EVENTS_CHANNEL_ID}>.")
+
 def render_reminder_15min_message(mention_block: str, event: dict) -> str:
     start_ts = int(event['start_time'])
     return (mention_block + "\n\n" +
@@ -3910,30 +3979,75 @@ class CommandersSelectView(discord.ui.View):
         await interaction.response.defer()
         await proceed_to_next_step(interaction, self.wizard)
 
+MAX_ATTENDANCE_SELECTS_PER_VIEW = 3  # оставляем 2 строки под кнопки (Пропустить/Далее)
+
+
 class AttendanceStepView(discord.ui.View):
-    def __init__(self, wizard, step, clan_members):
+    """При росте клана свыше ~75 человек (3 select'а по 25) список бойцов
+    разбивается на СТРАНИЦЫ — переключение между страницами не сбрасывает
+    уже выбранных на предыдущих страницах бойцов (накапливаются в
+    wizard.data через partial-выбор, см. _collect_all_selected)."""
+    def __init__(self, wizard, step, clan_members, page: int = 0, accumulated: list = None):
         super().__init__(timeout=300)
         self.wizard = wizard
         self.step = step
+        self.page = page
         self.selects = []
-        
+        # Ранее выбранные на ДРУГИХ страницах бойцы — нужно сохранить их
+        # при переключении между страницами.
+        self.accumulated = list(accumulated) if accumulated else []
+
+        per_page = MAX_ATTENDANCE_SELECTS_PER_VIEW * MAX_SELECT_OPTIONS
+        total_pages = max(1, (len(clan_members) + per_page - 1) // per_page)
+        page_members = clan_members[page * per_page: (page + 1) * per_page]
+
         parts = []
-        for i in range(0, len(clan_members), MAX_SELECT_OPTIONS):
-            parts.append(clan_members[i:i+MAX_SELECT_OPTIONS])
-        
+        for i in range(0, len(page_members), MAX_SELECT_OPTIONS):
+            parts.append(page_members[i:i + MAX_SELECT_OPTIONS])
+
         for idx, part in enumerate(parts):
             label_suffix = f" (ч. {idx+1}/{len(parts)})" if len(parts) > 1 else ""
-            options = [discord.SelectOption(label=nick, value=nick) for nick in part]
+            page_suffix = f" [стр. {page+1}/{total_pages}]" if total_pages > 1 else ""
+            options = [
+                discord.SelectOption(label=nick, value=nick, default=(nick in self.accumulated))
+                for nick in part
+            ]
             select = discord.ui.Select(
-                placeholder=f"👥 Выберите явившихся бойцов{label_suffix}...",
+                placeholder=f"👥 Выберите явившихся бойцов{label_suffix}{page_suffix}...",
                 options=options,
                 min_values=0,
                 max_values=len(part),
-                custom_id=f"attendance_select_{step}_{idx}"
+                custom_id=f"attendance_select_{step}_{page}_{idx}"
             )
             select.callback = self._make_select_callback(select)
             self.add_item(select)
             self.selects.append(select)
+
+        self._total_pages = total_pages
+        self._clan_members = clan_members
+
+        if total_pages > 1:
+            if page > 0:
+                prev_btn = discord.ui.Button(label=es("⬅️ Пред. страница"), style=discord.ButtonStyle.secondary, row=3)
+                prev_btn.callback = self._make_page_callback(page - 1)
+                self.add_item(prev_btn)
+            if page < total_pages - 1:
+                next_page_btn = discord.ui.Button(label=es("➡️ След. страница"), style=discord.ButtonStyle.secondary, row=3)
+                next_page_btn.callback = self._make_page_callback(page + 1)
+                self.add_item(next_page_btn)
+
+    def _make_page_callback(self, target_page: int):
+        async def callback(interaction):
+            if interaction.user.id not in ADMIN_USER_IDS:
+                await interaction.response.send_message(es("⛔ Только комбат или заместитель!"), ephemeral=True)
+                return
+            # Сохраняем то, что успели выбрать на ТЕКУЩЕЙ странице, прежде
+            # чем перейти на другую — иначе выбор терялся бы при листании.
+            current_selected = self._collect_all_selected()
+            merged = list(dict.fromkeys(self.accumulated + current_selected))
+            new_view = AttendanceStepView(self.wizard, self.step, self._clan_members, page=target_page, accumulated=merged)
+            await interaction.response.edit_message(view=new_view)
+        return callback
         
         if step == 0 and wizard.num_games == 0:
             finish_btn = discord.ui.Button(label=es("➡️ Далее (командир отделения)"), style=discord.ButtonStyle.primary, custom_id=f"attendance_to_commander_{step}", row=4)
@@ -3984,7 +4098,10 @@ class AttendanceStepView(discord.ui.View):
     async def to_commander_callback(self, interaction):
         if interaction.user.id not in ADMIN_USER_IDS:
             return
-        selected = self._collect_all_selected()
+        # Учитываем выбор со ВСЕХ страниц (накопленный + текущая страница),
+        # а не только с той, что видна на экране в момент нажатия кнопки.
+        current_selected = self._collect_all_selected()
+        selected = list(dict.fromkeys(self.accumulated + current_selected))
         if self.wizard.num_games == 0:
             self.wizard.data["overall"] = selected
         else:
@@ -4115,8 +4232,17 @@ async def finalize_attendance(interaction, wizard):
     new_msg = await thread.send(report_text)
     record['attendance_message_id'] = new_msg.id
     
-    attendance[wizard.event_id] = record
-    save_json(ATTENDANCE_FILE, attendance)
+    # Между началом функции (attendance = load_json(...) в начале) и этой
+    # строкой прошло время с несколькими await (получение/разблокировка
+    # ветки, удаление старого сообщения) — за это время параллельная подача
+    # явки по ДРУГОМУ мероприятию могла сохранить свою запись в тот же файл.
+    # Перечитываем актуальный снимок под локом и переносим в него только
+    # запись ЭТОГО мероприятия, не затирая чужую.
+    async with _attendance_write_lock:
+        fresh_attendance = load_json(ATTENDANCE_FILE, {})
+        fresh_attendance[wizard.event_id] = record
+        save_json(ATTENDANCE_FILE, fresh_attendance)
+        attendance = fresh_attendance
 
     # Дельту для gameStats считаем от ПОСЛЕДНЕГО ФАКТИЧЕСКИ ПРИМЕНЁННОГО
     # состояния (applied_record), а не от последнего СОХРАНЁННОГО (record).
@@ -4128,11 +4254,12 @@ async def finalize_attendance(interaction, wizard):
     stats_ok = await apply_attendance_to_gamestats(wizard, old_record=stats_base_record)
 
     if stats_ok:
-        attendance_now = load_json(ATTENDANCE_FILE, {})
-        record_now = attendance_now.get(wizard.event_id)
-        if record_now is not None:
-            record_now['applied_record'] = copy.deepcopy(record)
-            save_json(ATTENDANCE_FILE, attendance_now)
+        async with _attendance_write_lock:
+            attendance_now = load_json(ATTENDANCE_FILE, {})
+            record_now = attendance_now.get(wizard.event_id)
+            if record_now is not None:
+                record_now['applied_record'] = copy.deepcopy(record)
+                save_json(ATTENDANCE_FILE, attendance_now)
     else:
         print(f"⚠️ Отыгрыши для '{wizard.event_title}' применены частично — при следующей подаче явки недостающее будет доначислено.")
 
@@ -4211,7 +4338,7 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
             await interaction.followup.send(f"⚠️ У {nickname} уже есть отпуск!", ephemeral=True)
             return
         initial_status = 'active' if by_admin else 'pending'
-        vacations[nickname] = {
+        new_vacation_entry = {
             'start': start_date.isoformat(),
             'end': end_date.isoformat(),
             'reason': reason,
@@ -4224,9 +4351,21 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
             'by_admin': by_admin
         }
         if by_admin:
-            vacations[nickname]['approved_at'] = datetime.now(MSK).isoformat()
-            vacations[nickname]['approved_by'] = interaction.user.display_name
-        save_json(VACATIONS_FILE, vacations)
+            new_vacation_entry['approved_at'] = datetime.now(MSK).isoformat()
+            new_vacation_entry['approved_by'] = interaction.user.display_name
+
+        # Между чтением vacations в начале функции и этой строкой прошло
+        # время (валидация дат, поиск участника) — под локом перечитываем
+        # актуальный снимок и вносим только НАШУ запись, не затирая чужую
+        # (например, параллельно поданный запрос другого бойца).
+        async with _vacations_write_lock:
+            vacations = load_json(VACATIONS_FILE, {})
+            if nickname in vacations and vacations[nickname].get('status') in ['active', 'pending']:
+                await interaction.followup.send(f"⚠️ У {nickname} уже есть отпуск!", ephemeral=True)
+                return
+            vacations[nickname] = new_vacation_entry
+            save_json(VACATIONS_FILE, vacations)
+
         channel = await client.fetch_channel(VACATION_CHANNEL_ID)
 
         if by_admin:
@@ -4235,14 +4374,18 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
                                    description=f"Отпуск для **{nickname}**", color=discord.Color.green())
             embed.add_field(name=es("📅 Период"),
                              value=format_vacation_period(start_date.isoformat(), end_date.isoformat()), inline=False)
-            embed.add_field(name=es("📝 Причина"), value=reason, inline=False)
+            embed.add_field(name=es("📝 Причина"), value=discord.utils.escape_markdown(reason), inline=False)
             embed.add_field(name=es("👤 Оформил"), value=f"Комбат или заместитель: {interaction.user.display_name}", inline=False)
             embed.add_field(name=es("ℹ️ Статус"), value="Утверждён и активен", inline=False)
             embed.set_footer(text="Во время отпуска вам не нужно отмечаться в расписании мероприятий")
             message = await channel.send(embed=embed, view=VacationMessageView())
-            vacations[nickname]['message_id'] = message.id
-            vacations[nickname]['channel_id'] = channel.id
-            save_json(VACATIONS_FILE, vacations)
+            async with _vacations_write_lock:
+                fresh_vacations = load_json(VACATIONS_FILE, {})
+                if nickname in fresh_vacations:
+                    fresh_vacations[nickname]['message_id'] = message.id
+                    fresh_vacations[nickname]['channel_id'] = channel.id
+                    save_json(VACATIONS_FILE, fresh_vacations)
+                    vacations = fresh_vacations
 
             member = await find_member_by_nickname(nickname)
             if member:
@@ -4258,13 +4401,17 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
             value=format_vacation_period(start_date.isoformat(), end_date.isoformat()),
             inline=False
         )
-        embed.add_field(name=es("📝 Причина"), value=reason, inline=False)
+        embed.add_field(name=es("📝 Причина"), value=discord.utils.escape_markdown(reason), inline=False)
         embed.add_field(name=es("👤 Запросил"), value=interaction.user.display_name, inline=False)
         embed.add_field(name=es("ℹ️ Статус"), value="Ожидает утверждения комбатом", inline=False)
         embed.set_footer(text="Комбат или заместитель: утвердите или отклоните отпуск")
         message = await channel.send(embed=embed, view=VacationApprovalView())
-        vacations[nickname]['message_id'] = message.id
-        vacations[nickname]['channel_id'] = channel.id
+        async with _vacations_write_lock:
+            vacations = load_json(VACATIONS_FILE, {})
+            if nickname in vacations:
+                vacations[nickname]['message_id'] = message.id
+                vacations[nickname]['channel_id'] = channel.id
+                save_json(VACATIONS_FILE, vacations)
         try:
             thread = await message.create_thread(name=f"💬 Утверждение отпуска - {nickname}")
             guild = channel.guild
@@ -4274,10 +4421,13 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
                 await thread.send(f"{mention_block}\n\n" + es(f"Новый запрос на отпуск от **{nickname}**! Перейдите в канал {vacation_mention} и рассмотрите рапорт."))
             else:
                 await thread.send(es(f"Новый запрос на отпуск от **{nickname}**! Перейдите в канал {vacation_mention}."))
-            vacations[nickname]['thread_id'] = thread.id
+            async with _vacations_write_lock:
+                fresh_vacations = load_json(VACATIONS_FILE, {})
+                if nickname in fresh_vacations:
+                    fresh_vacations[nickname]['thread_id'] = thread.id
+                    save_json(VACATIONS_FILE, fresh_vacations)
         except Exception:
             pass
-        save_json(VACATIONS_FILE, vacations)
         await interaction.followup.send(es("✅ Запрос на отпуск отправлен!"), ephemeral=True)
     except Exception as e:
         try:
@@ -4299,7 +4449,8 @@ async def approve_vacation(interaction, nickname):
     vacation['status'] = 'active'
     vacation['approved_at'] = datetime.now(MSK).isoformat()
     vacation['approved_by'] = interaction.user.display_name
-    save_json(VACATIONS_FILE, vacations)
+    async with _vacations_write_lock:
+        save_json(VACATIONS_FILE, vacations)
     member = await find_member_by_nickname(nickname)
     if member:
         await update_vacation_role(member, True)
@@ -4338,7 +4489,8 @@ async def reject_vacation(interaction, nickname):
     vacation['status'] = 'rejected'
     vacation['rejected_at'] = datetime.now(MSK).isoformat()
     vacation['rejected_by'] = interaction.user.display_name
-    save_json(VACATIONS_FILE, vacations)
+    async with _vacations_write_lock:
+        save_json(VACATIONS_FILE, vacations)
     try:
         channel = await client.fetch_channel(vacation['channel_id'])
         message = await channel.fetch_message(vacation['message_id'])
@@ -4378,7 +4530,8 @@ async def close_vacation(interaction, nickname, early=False, by_admin=False):
     vacation['status'] = 'ended_early' if early else 'ended_scheduled'
     vacation['closed_at'] = datetime.now(MSK).isoformat()
     vacation['closed_by'] = interaction.user.display_name
-    save_json(VACATIONS_FILE, vacations)
+    async with _vacations_write_lock:
+        save_json(VACATIONS_FILE, vacations)
     member = await find_member_by_nickname(nickname)
     if member:
         await update_vacation_role(member, False)
@@ -4464,7 +4617,8 @@ async def check_expired_vacations():
         except Exception:
             pass
     if changed:
-        save_json(VACATIONS_FILE, vacations)
+        async with _vacations_write_lock:
+            save_json(VACATIONS_FILE, vacations)
         
 async def check_vacation_ending_soon():
     """Отправляет напоминание бойцу за сутки до окончания его отпуска (один раз)."""
@@ -4506,7 +4660,8 @@ async def check_vacation_ending_soon():
         except Exception:
             continue
     if changed:
-        save_json(VACATIONS_FILE, vacations)
+        async with _vacations_write_lock:
+            save_json(VACATIONS_FILE, vacations)
 
 
 async def send_vacation_return_message(nickname):
@@ -4629,6 +4784,7 @@ async def update_event(event_id, title, description, start_time, end_time, image
     if mandatory is not None:
         event['mandatory'] = mandatory
     event['reminder_2days_sent'] = False
+    event['reminder_1day_sent'] = False
     event['reminder_15min_sent'] = False
     save_json(EVENTS_FILE, events)
     await refresh_event_message(event_id)
@@ -4790,7 +4946,11 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     elif status == 'completed':
         embed_color = discord.Color.greyple().value
 
-    embed = discord.Embed(title=build_display_title(event), description=event['description'], color=embed_color)
+    embed = discord.Embed(
+        title=build_display_title(event),
+        description=discord.utils.escape_markdown(event['description']),
+        color=embed_color
+    )
 
     # === ЧИСЛО МАТЧЕЙ (строка сверху, п.7) ===
     num_games = event.get('num_games', 0)
@@ -4827,17 +4987,55 @@ async def build_event_embed(event_id: str) -> discord.Embed:
 
     embed.add_field(name=es("⏰ Время"), value=time_value, inline=False)
 
-    if accepted:
-        embed.add_field(name=es(f"✅ Придут ({len(accepted)})"), value=">>> " + "\n".join(accepted), inline=True)
-    if declined:
-        embed.add_field(name=es(f"❌ Не придут ({len(declined)})"), value=">>> " + "\n".join(declined), inline=True)
-    if unmarked:
-        embed.add_field(name=es(f"❓ Не отметились ({len(unmarked)})"), value=">>> " + "\n".join(unmarked), inline=False)
+    def add_names_field(name_prefix: str, names: list, inline: bool):
+        """Добавляет поле со списком имён, разбивая на несколько полей
+        (…(1/2), (2/2)…), если общая длина превышает лимит Discord в 1024
+        символа на value — без этого рост клана рано или поздно приводил бы
+        к 400 Bad Request и полному отказу обновления embed'а мероприятия."""
+        if not names:
+            return
+        chunks = []
+        current_chunk = []
+        current_len = 0
+        for name in names:
+            line_len = len(name) + 1  # +1 на перевод строки
+            if current_chunk and current_len + line_len > 1000:  # запас от лимита 1024
+                chunks.append(current_chunk)
+                current_chunk = []
+                current_len = 0
+            current_chunk.append(name)
+            current_len += line_len
+        if current_chunk:
+            chunks.append(current_chunk)
+
+        total_parts = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
+            suffix = f" ({idx}/{total_parts})" if total_parts > 1 else ""
+            field_name = es(f"{name_prefix} ({len(names)}){suffix}")
+            embed.add_field(name=field_name, value=">>> " + "\n".join(chunk), inline=inline)
+
+    add_names_field("✅ Придут", accepted, inline=True)
+    add_names_field("❌ Не придут", declined, inline=True)
+    add_names_field("❓ Не отметились", unmarked, inline=False)
 
     image_key = event.get('image_key', 'none')
     if image_key != 'none' and image_key in EVENT_IMAGES:
         filename = EVENT_IMAGES[image_key]['file']
         embed.set_image(url=f'attachment://{filename}')
+
+    # Предохранитель на случай экстремального роста клана: Discord отклоняет
+    # embed с более чем 25 полями. Если после разбивки на части полей вышло
+    # больше 24 (оставляем запас на возможные будущие поля) — заменяем
+    # избыточные списки на компактные счётчики, чтобы не сломать отправку
+    # вообще.
+    if len(embed.fields) > 24:
+        while len(embed.fields) > 24:
+            embed.remove_field(len(embed.fields) - 1)
+        embed.add_field(
+            name=es("⚠️ Внимание"),
+            value="Список участников слишком велик для отображения полностью. Обратитесь к администрации.",
+            inline=False
+        )
 
     return embed
 
@@ -4870,7 +5068,7 @@ async def create_event(title, description, start_time, end_time, image_key='none
         'accepted': {}, 'declined': {},
         'image_key': image_key, 'num_games': num_games, 'color': color,
         'channel_id': EVENTS_CHANNEL_ID, 'message_id': None, 'thread_id': None,
-        'reminder_2days_sent': False, 'reminder_15min_sent': False,
+        'reminder_2days_sent': False, 'reminder_1day_sent': False, 'reminder_15min_sent': False,
         'status': 'active',
         'mandatory': mandatory,
         'created_at': int(datetime.now(MSK).timestamp()),
@@ -4999,11 +5197,10 @@ async def check_event_reminders():
             start_ts = int(event_start.timestamp())
             time_until_start = event_start - current_time
 
-            # === Напоминание за 2 суток — только для ОБЯЗАТЕЛЬНЫХ мероприятий (п.11) ===
-            # Окно расширено с узкого [47ч;48ч] до [0;48ч] — если бот был выключен
-            # именно в тот час, когда должно было уйти напоминание, оно теперь
-            # наверстается при следующем запуске (флаг reminder_2days_sent
-            # уже гарантирует, что оно не отправится дважды).
+            # === Напоминание за 2 суток — только для ОБЯЗАТЕЛЬНЫХ мероприятий ===
+            # Окно [0;48ч] — если бот был выключен именно в тот момент, когда
+            # должно было уйти напоминание, оно наверстается при следующем
+            # запуске (флаг reminder_2days_sent гарантирует отсутствие дублей).
             if event.get('mandatory', True) and not event.get('reminder_2days_sent', False):
                 if timedelta(0) <= time_until_start <= timedelta(hours=48):
                     active_members = await get_active_members(current_time)
@@ -5017,6 +5214,25 @@ async def check_event_reminders():
                             msg = await thread.send(render_reminder_2days_message(mention_block))
                             record_thread_message(event, msg.id, 'reminder_2days', mention_block=mention_block)
                     event['reminder_2days_sent'] = True
+                    changed = True
+
+            # === Напоминание за 1 сутки — только для ОБЯЗАТЕЛЬНЫХ мероприятий ===
+            # Отдельный флаг reminder_1day_sent — независим от 2-суточного:
+            # если 2-суточное окно было пропущено (например, мероприятие
+            # создано позже, чем за 48ч до старта), суточное всё равно сработает.
+            if event.get('mandatory', True) and not event.get('reminder_1day_sent', False):
+                if timedelta(0) <= time_until_start <= timedelta(hours=24):
+                    active_members = await get_active_members(current_time)
+                    accepted = list(event.get('accepted', {}).keys())
+                    declined = list(event.get('declined', {}).keys())
+                    unmarked = [m for m in active_members if m not in accepted and m not in declined]
+                    if unmarked:
+                        thread = await get_or_create_thread(event, event_id, event['title'])
+                        if thread:
+                            mention_block = await build_mentions_for_nicknames(unmarked)
+                            msg = await thread.send(render_reminder_1day_message(mention_block))
+                            record_thread_message(event, msg.id, 'reminder_1day', mention_block=mention_block)
+                    event['reminder_1day_sent'] = True
                     changed = True
 
             # === Напоминание за 15 минут (п.12, п.15) ===
@@ -5086,15 +5302,18 @@ async def check_event_completion():
             changed = True
             completed_ids.append(event_id)
     if changed:
-        # Аналогично check_event_reminders: переносим только смену статуса
-        # на completed в актуальный снимок под локом, не затирая отметки,
-        # которые могли прийти параллельно через handle_event_response.
         async with _events_write_lock:
             fresh_events = load_json(EVENTS_FILE, {})
             for event_id in completed_ids:
                 fresh = fresh_events.get(event_id)
                 if fresh is not None:
                     fresh['status'] = 'completed'
+                    # Список сохранённых ID сообщений в ветке больше не
+                    # нужен после завершения мероприятия: ветка блокируется
+                    # ниже и повторно синхронизироваться через
+                    # update_all_templates не будет. Без очистки этот список
+                    # рос бы бесконечно на каждое напоминание/объявление.
+                    fresh.pop('thread_messages', None)
             save_json(EVENTS_FILE, fresh_events)
             events = fresh_events
         for event_id in completed_ids:
@@ -5300,6 +5519,8 @@ async def update_all_templates():
                 new_text = render_reactivate_message(event)
             elif kind == 'reminder_2days':
                 new_text = render_reminder_2days_message(mention_block)
+            elif kind == 'reminder_1day':
+                new_text = render_reminder_1day_message(mention_block)
             elif kind == 'reminder_15min':
                 new_text = render_reminder_15min_message(mention_block, event)
             elif kind == 'mods':
@@ -5914,6 +6135,16 @@ async def on_ready():
     await load_clan_members_from_firebase()
     
     for guild in client.guilds:
+        # guild.chunk() гарантированно догружает ПОЛНЫЙ список участников
+        # перед построением индекса — без этого на больших серверах
+        # discord.py иногда кэширует состав частями (chunk loading) уже
+        # ПОСЛЕ on_ready, и member_index.rebuild() мог бы построиться
+        # по неполному списку guild.members.
+        if not guild.chunked:
+            try:
+                await guild.chunk()
+            except Exception as e:
+                print(f"⚠️ Не удалось догрузить участников гильдии {guild.id}: {e}")
         member_index.rebuild(guild)
         await setup_voice_room_triggers(guild)
         await sync_voice_rooms_on_startup(guild)
