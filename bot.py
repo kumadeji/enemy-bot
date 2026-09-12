@@ -3882,7 +3882,7 @@ def render_reminder_2days_message(mention_block: str) -> str:
 
 def render_reminder_1day_message(mention_block: str) -> str:
     return (mention_block + "\n\n" +
-        "Бойцы, ждём ваших отметок! До мероприятия остались одни сутки, но вы пока ещё не отметились! " +
+        "📢 Бойцы, ждём ваших отметок! До мероприятия остались одни сутки, но вы пока ещё не отметились! " +
         f"Пожалуйста, отметьтесь в основном посте в <#{EVENTS_CHANNEL_ID}>.")
 
 def render_reminder_15min_message(mention_block: str, event: dict) -> str:
