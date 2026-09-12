@@ -805,9 +805,6 @@ def _open_worksheet_sync(url, sheet_name):
 
 
 def get_sheet_data_with_colors_sync(sheet, range_name):
-
-
-def get_sheet_data_with_colors_sync(sheet, range_name):
     """Синхронная версия для выполнения в executor. Выбрасывает исключения при ошибках."""
     base_url = 'https://sheets.googleapis.com/v4/spreadsheets'
     full_url = f'{base_url}/{sheet.spreadsheet.id}'
