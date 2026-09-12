@@ -67,12 +67,12 @@ _FLUSHING_LOG_BUFFER = False  # анти-реентрантный флаг: не
 # Строки, которые повторяются при КАЖДОМ запуске/переподключении и не несут
 # полезной информации для мониторинга — подавляем их на уровне фильтра логов.
 _NOISY_LOG_SUBSTRINGS = (
-    'pynacl is not installed',       # голосовая связь боту не нужна вообще
-    'davey is not installed',        # то же самое (альтернативная voice-библиотека)
-    'logging in using static token', # ожидаемый штатный шаг при каждом старте
-    'has connected to gateway',      # дублирует наш собственный лог о готовности бота
+    'pynacl is not installed',          # голосовая связь боту не нужна вообще
+    'davey is not installed',           # то же самое (альтернативная voice-библиотека)
+    'logging in using static token',    # ожидаемый штатный шаг при каждом старте
+    'has connected to gateway',         # дублирует наш собственный лог о готовности бота
+    'has successfully resumed session', # очередной мусор
 )
-
 
 class _NoSelfLoopLogFilter(logging.Filter):
     """Защита форвардера от зацикливания на самом себе + подавление
@@ -3010,8 +3010,9 @@ def get_anketa_message_info(uid: str):
     return mapping.get(uid)
 
 
-def save_anketa_message_info(uid: str, message_id: int, channel_id: int, thread_id: int = None):
-    mapping = load_json(ANKETA_MESSAGES_FILE, {})
+async def save_anketa_message_info(uid: str, message_id: int, channel_id: int, thread_id: int = None):
+    async with _anketa_write_lock:
+        mapping = load_json(ANKETA_MESSAGES_FILE, {})
     entry = mapping.get(uid, {})
     entry['message_id'] = message_id
     entry['channel_id'] = channel_id
@@ -3859,14 +3860,20 @@ def _apply_disciplinary_action_sync(uid):
         final_active_reprimands = [a for a in actions if active(a, 'Выговор')]
         should_expel = len(final_active_reprimands) >= MAX_ACTIVE_REPRIMANDS and current_composition != 'Отставка'
 
+        # profiles — через update(): здесь точечные пути КОРРЕКТНЫ.
         updates = {f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': actions}
-        roster_updates = {f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': actions}
+        # rosterPublic — через set(merge=True): в Python-SDK Firestore этот метод
+        # НЕ раскрывает точки как вложенность (в отличие от update()), поэтому
+        # структуру нужно передавать ВЛОЖЕННЫМИ СЛОВАРЯМИ — иначе создалось бы
+        # мусорное поле с буквальным именем "gameDisciplinaryActions.Arma Reforger".
+        roster_updates = {'gameDisciplinaryActions': {GAMESTATS_GAME_NAME: actions}}
 
         if should_expel:
             updates[f'gameRoles.{GAMESTATS_GAME_NAME}.composition'] = 'Отставка'
             updates[f'gameRoles.{GAMESTATS_GAME_NAME}.position'] = 'Дезертир'
-            roster_updates[f'gameRoles.{GAMESTATS_GAME_NAME}.composition'] = 'Отставка'
-            roster_updates[f'gameRoles.{GAMESTATS_GAME_NAME}.position'] = 'Дезертир'
+            roster_updates['gameRoles'] = {
+                GAMESTATS_GAME_NAME: {'composition': 'Отставка', 'position': 'Дезертир'}
+            }
             result['expelled'] = True
 
         result['status'] = 'success'
@@ -4092,6 +4099,8 @@ def _cleanup_expired_disciplinary_actions_sync():
         if len(filtered) != len(game_da):
             uid = doc.id
             update_payload = {f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': filtered}
+            # Для set(merge=True) — только вложенный словарь (см. коммент выше).
+            roster_payload = {'gameDisciplinaryActions': {GAMESTATS_GAME_NAME: filtered}}
             try:
                 fs_db.collection('profiles').document(uid).update(update_payload)
                 # set(merge=True) вместо update(): если документа в rosterPublic
@@ -4100,7 +4109,7 @@ def _cleanup_expired_disciplinary_actions_sync():
                 # то есть один "плохой" боец останавливал очистку для ВСЕХ
                 # остальных на все следующие 6 часов, пока цикл не дойдёт
                 # до этого же документа снова.
-                fs_db.collection('rosterPublic').document(uid).set(update_payload, merge=True)
+                fs_db.collection('rosterPublic').document(uid).set(roster_payload, merge=True)
                 cleaned += 1
             except Exception as e:
                 # Изолируем ошибку одного документа — остальные бойцы должны
@@ -4628,11 +4637,13 @@ async def finalize_attendance(interaction, wizard):
     # повторное начисление при следующей подаче той же явки.
     if old_record and 'applied_tally' in old_record:
         old_tally = old_record['applied_tally']
-    elif old_record and 'applied_record' in old_record:
-        # Обратная совместимость: если у отчёта ещё старый формат (был
-        # сохранён до этого обновления) — конвертируем его в tally один раз,
-        # чтобы не задвоить статистику, уже начисленную по старой схеме.
-        old_tally = _tally_from_triples(_extract_game_triples_from_record(old_record['applied_record']))
+    elif old_record:
+        # Обратная совместимость: у отчётов, поданных ДО появления applied_tally,
+        # этого поля нет вообще (поля 'applied_record' тоже никогда не было —
+        # раньше дельта считалась напрямую от самого отчёта). Без этой ветки
+        # old_tally оказывался пустым, и при повторной подаче явки бойцам
+        # начислялся ВЕСЬ объём отыгрышей ПОВЕРХ уже зачтённого ранее.
+        old_tally = _tally_from_triples(_extract_game_triples_from_record(old_record))
     else:
         old_tally = {}
 
@@ -4663,13 +4674,24 @@ async def finalize_attendance(interaction, wizard):
     # === Завершение мероприятия при подаче явки (п.1, п.2) ===
     event_end_dt = datetime.fromtimestamp(event['end_time'], MSK)
     now = datetime.now(MSK)
-    events_fresh = load_json(EVENTS_FILE, {})
-    fresh_event = events_fresh.get(wizard.event_id)
-    if fresh_event and fresh_event.get('status') != 'completed':
-        was_early = now < event_end_dt
-        fresh_event['status'] = 'completed'
-        async with _events_write_lock:
+    # Читаем и пишем СТРОГО внутри лока: снимок, прочитанный до его захвата,
+    # успевает устареть, пока лок держит параллельный обработчик (клик "Приду"),
+    # и save_json затирал бы его отметку.
+    became_completed = False
+    was_early = False
+    fresh_event = None
+    async with _events_write_lock:
+        events_fresh = load_json(EVENTS_FILE, {})
+        fresh_event = events_fresh.get(wizard.event_id)
+        if fresh_event and fresh_event.get('status') != 'completed':
+            was_early = now < event_end_dt
+            fresh_event['status'] = 'completed'
             save_json(EVENTS_FILE, events_fresh)
+            became_completed = True
+    # ВАЖНО: всё, что ниже, выполняется ВНЕ лока. refresh_event_message и
+    # process_inactivity_discipline_for_event сами захватывают _events_write_lock,
+    # а asyncio.Lock не реентрантный — вызов их изнутри блока даст вечный deadlock.
+    if became_completed:
         await refresh_event_message(wizard.event_id)
         try:
             # rename_thread_if_needed вместо прямого thread.edit(name=...) —
@@ -4899,17 +4921,22 @@ async def approve_vacation(interaction, nickname):
     # await'ов, но параллельный approve/reject того же отпуска ДВУМЯ
     # администраторами одновременно возможен — перечитываем свежий снимок
     # под локом и повторно проверяем статус ПРЯМО ПЕРЕД записью.
+    already_handled = False
     async with _vacations_write_lock:
         fresh_vacations = load_json(VACATIONS_FILE, {})
         fresh_vacation = fresh_vacations.get(nickname)
         if fresh_vacation is None or fresh_vacation.get('status') != 'pending':
-            await interaction.followup.send(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
-            return
-        fresh_vacation['status'] = 'active'
-        fresh_vacation['approved_at'] = datetime.now(MSK).isoformat()
-        fresh_vacation['approved_by'] = interaction.user.display_name
-        save_json(VACATIONS_FILE, fresh_vacations)
-        vacation = fresh_vacation
+            already_handled = True
+        else:
+            fresh_vacation['status'] = 'active'
+            fresh_vacation['approved_at'] = datetime.now(MSK).isoformat()
+            fresh_vacation['approved_by'] = interaction.user.display_name
+            save_json(VACATIONS_FILE, fresh_vacations)
+            vacation = fresh_vacation
+    # Ответ — ВНЕ лока: иначе он удерживается всё время сетевого вызова
+    if already_handled:
+        await interaction.followup.send(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
+        return
     member = await find_member_by_nickname(nickname)
     if member:
         await update_vacation_role(member, True)
@@ -4946,17 +4973,24 @@ async def reject_vacation(interaction, nickname):
         await interaction.followup.send(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
         return
     # Та же защита от одновременного approve/reject двумя администраторами.
+    already_handled = False
     async with _vacations_write_lock:
         fresh_vacations = load_json(VACATIONS_FILE, {})
         fresh_vacation = fresh_vacations.get(nickname)
         if fresh_vacation is None or fresh_vacation.get('status') != 'pending':
-            await interaction.followup.send(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
-            return
-        fresh_vacation['status'] = 'rejected'
-        fresh_vacation['rejected_at'] = datetime.now(MSK).isoformat()
-        fresh_vacation['rejected_by'] = interaction.user.display_name
-        save_json(VACATIONS_FILE, fresh_vacations)
-        vacation = fresh_vacation
+            already_handled = True
+        else:
+            fresh_vacation['status'] = 'rejected'
+            fresh_vacation['rejected_at'] = datetime.now(MSK).isoformat()
+            fresh_vacation['rejected_by'] = interaction.user.display_name
+            save_json(VACATIONS_FILE, fresh_vacations)
+            vacation = fresh_vacation
+    # Ответ — ВНЕ лока: иначе _vacations_write_lock удерживается всё время
+    # сетевого вызова followup.send (100-300 мс), блокируя параллельные
+    # операции с отпусками (подача рапорта, авто-закрытие по расписанию).
+    if already_handled:
+        await interaction.followup.send(es("⚠️ Отпуск уже обработан!"), ephemeral=True)
+        return
     try:
         channel = await client.fetch_channel(vacation['channel_id'])
         message = await channel.fetch_message(vacation['message_id'])
@@ -4997,17 +5031,22 @@ async def close_vacation(interaction, nickname, early=False, by_admin=False):
     # один await (defer) — перечитываем свежий снимок под локом на случай
     # параллельного закрытия того же отпуска (например, боец и админ
     # одновременно нажали "Завершить отпуск").
+    already_closed = False
     async with _vacations_write_lock:
         fresh_vacations = load_json(VACATIONS_FILE, {})
         fresh_vacation = fresh_vacations.get(nickname)
         if fresh_vacation is None or fresh_vacation.get('status') != 'active':
-            await interaction.followup.send(es("⚠️ Отпуск уже закрыт!"), ephemeral=True)
-            return
-        fresh_vacation['status'] = 'ended_early' if early else 'ended_scheduled'
-        fresh_vacation['closed_at'] = datetime.now(MSK).isoformat()
-        fresh_vacation['closed_by'] = interaction.user.display_name
-        save_json(VACATIONS_FILE, fresh_vacations)
-        vacation = fresh_vacation
+            already_closed = True
+        else:
+            fresh_vacation['status'] = 'ended_early' if early else 'ended_scheduled'
+            fresh_vacation['closed_at'] = datetime.now(MSK).isoformat()
+            fresh_vacation['closed_by'] = interaction.user.display_name
+            save_json(VACATIONS_FILE, fresh_vacations)
+            vacation = fresh_vacation
+    # Ответ — ВНЕ лока (см. комментарий в approve_vacation).
+    if already_closed:
+        await interaction.followup.send(es("⚠️ Отпуск уже закрыт!"), ephemeral=True)
+        return
     member = await find_member_by_nickname(nickname)
     if member:
         await update_vacation_role(member, False)
@@ -5558,7 +5597,7 @@ async def build_event_embed(event_id: str) -> discord.Embed:
 
     embed = discord.Embed(
         title=build_display_title(event),
-        description=discord.utils.escape_markdown(event['description']),
+        description=event.get('description', ''),
         color=embed_color
     )
 
@@ -5826,8 +5865,9 @@ async def catch_up_weekly_events_on_startup():
     именно в это время) — публикует их немедленно вместо того, чтобы ждать
     следующего понедельника."""
     now = datetime.now(MSK)
-    if now.weekday() != 0:  # 0 = понедельник
-        return
+    # Раньше наверстывание работало только в понедельник — если бот пролежал
+    # Пн→Вт, вся неделя оставалась без мероприятий. Теперь проверяем любой день:
+    # создаём только те шаблоны, чьё время старта на этой неделе ЕЩЁ НЕ прошло.
     scheduled_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
     if now < scheduled_time:
         return  # ещё рано, штатный cron сам сработает вовремя
@@ -5843,9 +5883,25 @@ async def catch_up_weekly_events_on_startup():
         if e.get('week_key') == week_key and e.get('weekly_id')
     }
     missing = set(weekly_events.keys()) - {'_seeded'} - already_created
-    if missing:
-        print(f"🔁 Обнаружены несозданные еженедельные мероприятия за неделю {week_key} — наверстываю ({len(missing)} шт.).")
-        await post_weekly_events(week_key=week_key)
+    # Отбрасываем шаблоны, время которых на текущей неделе уже прошло:
+    # создавать мероприятие задним числом бессмысленно и породит спам напоминаний.
+    monday = (now - timedelta(days=now.weekday())).replace(hour=0, minute=0, second=0, microsecond=0)
+    still_relevant = set()
+    for weekly_id in missing:
+        tpl = weekly_events.get(weekly_id) or {}
+        try:
+            weekday = int(tpl.get('weekday', 0))
+            hh, mm = str(tpl.get('time', '20:00')).split(':')
+            slot = monday + timedelta(days=weekday, hours=int(hh), minutes=int(mm))
+        except Exception:
+            continue
+        if slot > now:
+            still_relevant.add(weekly_id)
+    if still_relevant:
+        print(f"⚠️ Несозданные еженедельные мероприятия на текущей неделе: {len(still_relevant)}. Запускаю наверстывание.")
+        await post_weekly_events()
+    elif missing:
+        print(f"ℹ️ Пропущено еженедельных мероприятий: {len(missing)} — их время на этой неделе уже прошло, наверстывание не требуется.")
 
 
 async def check_event_reminders():
@@ -6112,9 +6168,22 @@ async def update_all_templates():
     ev_errors = 0
     vac_updated = 0
     vac_errors = 0
+
+    # Поля, которые эта функция может менять (миграция старых записей + эвристики).
+    MIGRATED_EVENT_FIELDS = ('status', 'mandatory', 'created_at', 'title',
+                             'image_key', 'num_games', '_last_rendered_image_key')
+    _FIELD_MISSING = object()  # маркер "поля не было вообще"
+    # Снимок значений ДО наших правок — нужен для трёхстороннего мержа в конце.
+    originals_by_event = {}
+
     
     # === 1. ОБНОВЛЕНИЕ СООБЩЕНИЙ МЕРОПРИЯТИЙ ===
     for event_id, event in events.items():
+        # Фиксируем исходные значения ДО миграции: в конце функции по ним
+        # определим, какие поля изменили МЫ, а какие — параллельный обработчик.
+        originals_by_event[event_id] = {
+            k: event.get(k, _FIELD_MISSING) for k in MIGRATED_EVENT_FIELDS
+        }
         if 'status' not in event:
             event['status'] = 'active'
         if 'mandatory' not in event:
@@ -6201,19 +6270,35 @@ async def update_all_templates():
     # изменялись в этом цикле (status, mandatory, created_at, title,
     # image_key, num_games, _last_rendered_image_key) — под локом, в
     # актуальный на данный момент снимок.
-    MIGRATED_EVENT_FIELDS = ('status', 'mandatory', 'created_at', 'title',
-                             'image_key', 'num_games', '_last_rendered_image_key')
+    # Трёхсторонний мерж: сравниваем ИСХОДНОЕ значение (до наших правок),
+    # НАШЕ значение и ТЕКУЩЕЕ в файле. Поле переносится, только если мы его
+    # действительно изменили И никто другой его параллельно не трогал.
+    # Без этой проверки условие `if key in event` срабатывало для 'status',
+    # 'title', 'image_key', 'num_games' ВСЕГДА (они присутствуют/присваиваются
+    # безусловно) и откатывало чужие изменения, сделанные за 10-20 секунд
+    # работы цикла: завершение мероприятия, отмену, правку названия. Откат
+    # статуса приводил к ПОВТОРНОМУ сообщению "мероприятие завершено"
+    # от check_event_completion через 5 минут.
     async with _events_write_lock:
         fresh_events_after_sync = load_json(EVENTS_FILE, {})
         for event_id, event in events.items():
             fresh = fresh_events_after_sync.get(event_id)
             if fresh is None:
                 continue
+            originals = originals_by_event.get(event_id, {})
             for key in MIGRATED_EVENT_FIELDS:
-                if key in event:
-                    fresh[key] = event[key]
+                if key not in event:
+                    continue
+                original = originals.get(key, _FIELD_MISSING)
+                if event[key] == original:
+                    continue  # мы это поле не меняли — переносить нечего
+                current = fresh.get(key, _FIELD_MISSING)
+                if current != original:
+                    continue  # изменено параллельно — чужое значение приоритетнее
+                fresh[key] = event[key]
         save_json(EVENTS_FILE, fresh_events_after_sync)
         events = fresh_events_after_sync
+
 
     # === 1.5. РЕСИНХРОНИЗАЦИЯ НАЗВАНИЙ ВЕТОК, ВСЕХ СООБЩЕНИЙ БОТА В НИХ, БЛОКИРОВКИ (п.3, п.4) ===
 
@@ -6293,6 +6378,12 @@ async def update_all_templates():
 
 
     # === 2. ОБНОВЛЕНИЕ СООБЩЕНИЙ ОТПУСКОВ ===
+    # Перечитываем: снимок vacations был взят в начале функции, а до этой
+    # точки прошли секции 1 и 1.5 (десятки секунд, иногда минуты). За это
+    # время админ мог утвердить/отклонить отпуск — по устаревшему снимку
+    # мы перерисовали бы embed обратно в 'pending' и вернули кнопки
+    # утверждения на уже активный отпуск.
+    vacations = load_json(VACATIONS_FILE, {})
     for nickname, data in vacations.items():
         if not data.get('message_id') or not data.get('channel_id'):
             continue
