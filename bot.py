@@ -181,6 +181,7 @@ import uuid
 import copy
 import threading
 import subprocess
+import hashlib
 from datetime import datetime, timedelta
 from collections import deque
 import pytz
@@ -337,7 +338,7 @@ _ES_REPLACEMENTS = {
     '🕹️ ': '🕹️ㅤ', '🏆 ': '🏆ㅤ', '🪖 ': '🪖ㅤ', '🔵 ': '🔵ㅤ',
     '🍻 ': '🍻ㅤ', '🚪 ': '🚪ㅤ', '➡️ ': '➡️ㅤ', '⏭️ ': '⏭️ㅤ',
     '🖼️ ': '🖼️ㅤ', '🚫 ': '🚫ㅤ', '🎖️ ': '🎖️ㅤ', '🧩 ': '🧩ㅤ',
-    '🏁 ': '🏁ㅤ', '🚀 ': '🚀ㅤ', '🔁 ': '🔁ㅤ',
+    '🏁 ': '🏁ㅤ', '🚀 ': '🚀ㅤ', '🔁 ': '🔁ㅤ', '🧹 ': '🧹ㅤ',
 }
 # Один скомпилированный regex вместо 64 последовательных str.replace()
 # на каждый вызов (раньше es() создавала словарь заново и делала 64 прохода
@@ -2190,12 +2191,17 @@ class AdminMainMenuView(discord.ui.View):
 
     @discord.ui.button(label=es("🔧 Принудительный перезапуск бота"), style=discord.ButtonStyle.danger, custom_id="admin_force_restart", row=4)
     async def force_restart_button(self, interaction, button):
+        _write_restart_log_sync("КЛИК: кнопка force_restart нажата")
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
-        await interaction.response.send_message(es("🔧 Перезапускаю бота... Новый процесс запустится через несколько секунд."), ephemeral=True)
-        await asyncio.sleep(1)
-        await force_restart_bot()
+        try:
+            await interaction.response.send_message(es("🔧 Перезапускаю бота... Новый процесс запустится через несколько секунд."), ephemeral=True)
+            await asyncio.sleep(1)
+            await force_restart_bot()
+        except Exception as e:
+            _write_restart_log_sync(f"КРИТИЧЕСКАЯ ОШИБКА в обработчике кнопки: {e!r}")
+            raise
 
 class VacationRequestView(discord.ui.View):
     def __init__(self):
@@ -2938,21 +2944,49 @@ _LAST_ANKETA_EMBED_SNAPSHOT = {}
 _ANKETA_EDIT_LOCK = asyncio.Lock()
 _ANKETA_EDIT_MIN_INTERVAL = 1.5  # секунд между последовательными правками анкет
 
+# Только эти поля реально попадают в отображаемую анкету (build_anketa_embed).
+# gameStats, disciplinaryActions и прочие поля меняются НАМНОГО чаще (при
+# каждом отыгрыше/взыскании), но никак не влияют на текст анкеты — сравнение
+# именно по этому короткому списку ДО построения embed'а позволяет пропускать
+# 'пустые' MODIFIED-события без единого сетевого вызова (fetch_channel,
+# fetch_message, поиск участника гильдии, запрос 'кого пригласил').
+_ANKETA_RELEVANT_FIELDS = (
+    'callsign', 'email', 'fullName', 'age', 'timezone', 'birthDate',
+    'discordId', 'steamId', 'steamProfileUrl', 'armaId', 'extraContacts',
+    'telegramUrl', 'vkUrl', 'referrerCallsign', 'referredByText',
+    'availability', 'howFound', 'gamesInterested', 'gameRoles',
+    'experienceByGame', 'hoursByGame',
+)
+_LAST_ANKETA_RAW_FINGERPRINT: dict[str, str] = {}
+
+
+def _anketa_raw_fingerprint(data: dict) -> str:
+    relevant = {k: data.get(k) for k in _ANKETA_RELEVANT_FIELDS}
+    raw = json.dumps(relevant, sort_keys=True, default=str)
+    return hashlib.sha1(raw.encode('utf-8')).hexdigest()
+
 
 async def handle_profile_modified_watch(uid, data):
     """Реагирует на MODIFIED-события коллекции 'profiles'. Если у этого uid
     есть опубликованная анкета — embed обновляется live.
 
-    ВАЖНО: сравниваем именно РЕНДЕР embed'а, а не сырые данные профиля —
-    многие поля (например gameStats.koCount/ksCount, которые массово меняются
-    сразу у нескольких игроков после подачи отчёта о явке) НЕ отображаются
-    в анкете вообще. Без этой проверки любое начисление отыгрышей вызывало
-    лавину бессмысленных правок анкет ОДНОВРЕМЕННО — что приводило к
-    массовому rate limit (429) и ошибке Discord 30046 (превышен лимит
-    правок сообщений старше 1 часа)."""
+    Двухуровневая защита от лишней работы:
+    1) ДЕШЁВЫЙ fingerprint по сырым полям анкеты — считается ДО любых сетевых
+       вызовов. Если ни одно отображаемое поле не изменилось (например,
+       событие вызвано инкрементом gameStats после явки), выходим
+       НЕМЕДЛЕННО — без fetch_channel, fetch_message, поиска участника
+       гильдии и запроса 'кого пригласил'.
+    2) Финальное сравнение уже построенного embed'а — страхует от редких
+       случаев, когда сырые поля совпали, но итоговый рендер всё равно
+       отличается (например, изменилось состояние поиска Discord-профиля)."""
     anketa_info = get_anketa_message_info(uid)
     if not anketa_info or not anketa_info.get('channel_id') or not anketa_info.get('message_id'):
         return
+
+    raw_fp = _anketa_raw_fingerprint(data)
+    if _LAST_ANKETA_RAW_FINGERPRINT.get(uid) == raw_fp:
+        return
+    _LAST_ANKETA_RAW_FINGERPRINT[uid] = raw_fp
 
     try:
         channel = await client.fetch_channel(anketa_info['channel_id'])
@@ -2974,9 +3008,6 @@ async def handle_profile_modified_watch(uid, data):
         except Exception as e:
             print(f"⚠️ Не удалось live-обновить анкету для uid={uid}: {e}")
         finally:
-            # Пауза ПОКА лок ещё удержан — гарантирует, что следующая правка
-            # (для другого бойца) не полетит через доли секунды, даже если
-            # события MODIFIED пришли пачкой одновременно.
             await asyncio.sleep(_ANKETA_EDIT_MIN_INTERVAL)
 
 
@@ -5092,18 +5123,36 @@ async def update_all_templates():
             channel = await client.fetch_channel(event['channel_id'])
             message = await channel.fetch_message(event['message_id'])
             embed = await build_event_embed(event_id)
-            filename, path = get_image_info(image_key)
-            if filename and path:
-                await message.edit(embed=embed, attachments=[discord.File(path, filename=filename)], view=build_event_view(event, event_id))
+            new_embed_dict = embed.to_dict()
+            old_embed_dict = message.embeds[0].to_dict() if message.embeds else None
+
+            if old_embed_dict == new_embed_dict:
+                # Содержимое не изменилось — редактирование и пауза не нужны.
+                # Раньше sleep(4) выполнялся БЕЗУСЛОВНО на каждое из 14+
+                # мероприятий, что давало минуты простоя даже когда реально
+                # менять было нечего.
+                ev_updated += 1
+                continue
+
+            last_image_key = event.get('_last_rendered_image_key')
+            if image_key != last_image_key:
+                filename, path = get_image_info(image_key)
+                if filename and path:
+                    await message.edit(embed=embed, attachments=[discord.File(path, filename=filename)], view=build_event_view(event, event_id))
+                else:
+                    await message.edit(embed=embed, attachments=[], view=build_event_view(event, event_id))
+                event['_last_rendered_image_key'] = image_key
             else:
-                await message.edit(embed=embed, attachments=[], view=build_event_view(event, event_id))
+                await message.edit(embed=embed, view=build_event_view(event, event_id))
+
             ev_updated += 1
-            await asyncio.sleep(4)  # Защита от rate limit
+            await asyncio.sleep(0.4)  # discord.py сам обработает 429 при необходимости
         except discord.NotFound:
             ev_errors += 1
         except Exception as e:
             print(f"❌ Ошибка обновления мероприятия '{event.get('title', '?')}': {e}")
             ev_errors += 1
+
     
     save_json(EVENTS_FILE, events)
 
@@ -5266,7 +5315,7 @@ async def update_all_templates():
                 await message.edit(embed=embed, view=None)
             
             vac_updated += 1
-            await asyncio.sleep(4)  # Защита от rate limit
+            await asyncio.sleep(0.4)
         except discord.NotFound:
             vac_errors += 1
         except Exception as e:
@@ -5317,9 +5366,11 @@ async def update_all_templates():
                 await unlock_and_unarchive_thread(thread)
 
             message = await thread.fetch_message(record['attendance_message_id'])
-            await message.edit(content=build_attendance_report_text(record))
+            new_text = build_attendance_report_text(record)
+            if message.content != new_text:
+                await message.edit(content=new_text)
             att_updated += 1
-            await asyncio.sleep(2)
+            await asyncio.sleep(0.4)
         except discord.NotFound:
             att_errors += 1
         except Exception as e:
@@ -5641,25 +5692,38 @@ async def sweep_empty_voice_rooms():
     for channel_id in list(VOICE_ROOMS.keys()):
         await cleanup_empty_temp_room(channel_id)
 
+
+def _write_restart_log_sync(message: str):
+    """Прямая, полностью синхронная запись в ОТДЕЛЬНЫЙ файл restart_log.txt —
+    жёстко независимая от буферизации stdout/stderr, от асинхронной очереди
+    _log_forward_buffer и от Discord API. Это последний рубеж диагностики:
+    если даже этот файл не появляется/не обновляется после нажатия кнопки —
+    значит кнопка физически не была обработана (интеракция не дошла,
+    исключение случилось раньше первой строки, или процесс был убит
+    извне — например, Stop-Process -Force из .bat-менеджера, который
+    не оставляет вообще никаких следов ни в одном логе по определению)."""
+    try:
+        path = os.path.join(BASE_DIR, 'restart_log.txt')
+        with open(path, 'a', encoding='utf-8') as f:
+            f.write(f"[{datetime.now(MSK).strftime('%Y-%m-%d %H:%M:%S')}] PID={os.getpid()} {message}\n")
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        pass
+
+
 async def force_restart_bot():
     """Освобождает lock-файл, поднимает НОВЫЙ независимый процесс бота
     и завершает текущий процесс. Вызывается кнопкой '🔄 Принудительный
-    перезапуск' в админ-панели.
+    перезапуск' в админ-панели."""
+    _write_restart_log_sync("ШАГ 1: force_restart_bot() вызвана")
 
-    ВАЖНО: flush_log_buffer_to_discord() вызывается ПОСЛЕ каждого этапа,
-    а не один раз в начале — иначе все print(), написанные уже ПОСЛЕ
-    первого flush (включая сам факт успешного перезапуска), оставались
-    в локальном буфере и никогда не попадали в Discord-ветку логов,
-    потому что процесс завершался (os._exit) раньше следующего
-    планового flush (который происходит раз в 15 секунд)."""
     try:
         await flush_log_buffer_to_discord()
     except Exception:
         pass
+    _write_restart_log_sync("ШАГ 2: первый flush логов выполнен")
 
-    # Дожидаемся завершения ВСЕХ фоновых записей (Firebase, локальные бэкапы,
-    # safety-снапшоты), стоящих в очереди EXECUTOR — иначе они безвозвратно
-    # теряются при os._exit() ниже.
     try:
         loop = asyncio.get_running_loop()
         await asyncio.wait_for(
@@ -5667,20 +5731,26 @@ async def force_restart_bot():
             timeout=15
         )
         _original_print("✅ Все отложенные записи завершены перед перезапуском.")
+        _write_restart_log_sync("ШАГ 3: EXECUTOR.shutdown завершён успешно")
     except asyncio.TimeoutError:
         _original_print("⚠️ Не все фоновые записи завершились за 15 секунд — продолжаю перезапуск принудительно.")
+        _write_restart_log_sync("ШАГ 3: EXECUTOR.shutdown TIMEOUT")
     except Exception as e:
         _original_print(f"⚠️ Ошибка при ожидании завершения фоновых задач: {e}")
+        _write_restart_log_sync(f"ШАГ 3: EXECUTOR.shutdown ОШИБКА: {e}")
 
     try:
         await flush_log_buffer_to_discord()
     except Exception:
         pass
+    _write_restart_log_sync("ШАГ 4: второй flush логов выполнен")
 
     try:
         _release_instance_lock()
+        _write_restart_log_sync("ШАГ 5: lock-файл освобождён")
     except Exception as e:
         _original_print(f"⚠️ Ошибка при освобождении lock-файла перед перезапуском: {e}")
+        _write_restart_log_sync(f"ШАГ 5: ОШИБКА освобождения lock-файла: {e}")
 
     try:
         kwargs = {}
@@ -5689,28 +5759,23 @@ async def force_restart_bot():
         else:
             kwargs['start_new_session'] = True
 
-        subprocess.Popen(
+        new_proc = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__)],
             cwd=BASE_DIR, stdin=subprocess.DEVNULL,
             **kwargs
         )
         _original_print("🔄 Новый процесс бота запущен, завершаю текущий...")
+        _write_restart_log_sync(f"ШАГ 6: новый процесс запущен, новый PID={new_proc.pid}")
     except Exception as e:
         _original_print(f"❌ Не удалось запустить новый процесс бота при перезапуске: {e}")
+        _write_restart_log_sync(f"ШАГ 6: ОШИБКА запуска нового процесса: {e}")
 
-    # Финальный flush — гарантированно отправляет ВСЕ логи, накопленные
-    # на предыдущих шагах (включая сообщение о запуске нового процесса),
-    # прежде чем текущий процесс будет убит.
     try:
         await flush_log_buffer_to_discord()
     except Exception:
         pass
+    _write_restart_log_sync("ШАГ 7: финальный flush выполнен, вызываю os._exit(0)")
 
-    # os._exit() НЕ сбрасывает буферы stdout/stderr на диск (в отличие от
-    # sys.exit()) — если вывод перенаправлен в файл (а не в интерактивный
-    # терминал), Python использует блочную буферизацию, и все print() из
-    # этой функции могли остаться только во внутреннем буфере интерпретатора,
-    # физически не попав в bot_output.log до убийства процесса.
     try:
         sys.stdout.flush()
         sys.stderr.flush()
