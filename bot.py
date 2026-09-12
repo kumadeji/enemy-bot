@@ -63,8 +63,19 @@ def print(*args, **kwargs):
 _FLUSHING_LOG_BUFFER = False  # анти-реентрантный флаг: не форвардить логи, порождённые самой отправкой логов
 
 
+# Строки, которые повторяются при КАЖДОМ запуске/переподключении и не несут
+# полезной информации для мониторинга — подавляем их на уровне фильтра логов.
+_NOISY_LOG_SUBSTRINGS = (
+    'pynacl is not installed',       # голосовая связь боту не нужна вообще
+    'davey is not installed',        # то же самое (альтернативная voice-библиотека)
+    'logging in using static token', # ожидаемый штатный шаг при каждом старте
+    'has connected to gateway',      # дублирует наш собственный лог о готовности бота
+)
+
+
 class _NoSelfLoopLogFilter(logging.Filter):
-    """Защита форвардера от зацикливания на самом себе:
+    """Защита форвардера от зацикливания на самом себе + подавление
+    технического шума (см. _NOISY_LOG_SUBSTRINGS):
     - discord.http часто пишет WARNING 'We are being rate limited' именно
       В МОМЕНТ, когда сам форвардер шлёт накопленные логи в Discord — без
       фильтра это создаёт петлю (лог о рейтлимите -> он же уходит в буфер ->
@@ -73,7 +84,10 @@ class _NoSelfLoopLogFilter(logging.Filter):
       ниже WARNING подавляются, чтобы сам процесс отправки не порождал
       новые записи для следующей отправки."""
     def filter(self, record: logging.LogRecord) -> bool:
-        if record.name == 'discord.http' and 'rate limited' in record.getMessage().lower():
+        message_lower = record.getMessage().lower()
+        if any(noisy in message_lower for noisy in _NOISY_LOG_SUBSTRINGS):
+            return False
+        if record.name == 'discord.http' and 'rate limited' in message_lower:
             return False
         if _FLUSHING_LOG_BUFFER and record.name.startswith('discord') and record.levelno < logging.WARNING:
             return False
