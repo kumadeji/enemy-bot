@@ -226,6 +226,7 @@ _disable_windows_quick_edit_mode()
 
 # Глобальный executor для синхронных операций (gspread использует requests)
 EXECUTOR = ThreadPoolExecutor(max_workers=5)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # ============== МОДУЛЬНОСТЬ ХРАНИЛИЩА ДАННЫХ (Firebase / локальный JSON) ==============
 # Переключатель режима хранения СОБСТВЕННЫХ данных бота (мероприятия, отпуска,
@@ -366,7 +367,7 @@ ADMIN_USER_IDS = [
     895734676864507955
 ]
 
-GOOGLE_CREDENTIALS_FILE = 'credentials.json'
+GOOGLE_CREDENTIALS_FILE = os.path.join(BASE_DIR, 'credentials.json')
 SPREADSHEET_URL = 'https://docs.google.com/spreadsheets/d/1QGc-SRkWnFCaSx56_46UJPRK0XOe33KPou7yJznbQBM'
 
 MSK = pytz.timezone('Europe/Moscow')
@@ -476,19 +477,19 @@ VOICE_CHANNEL_ID = 1284893513921728582
 VOICE_ROOM_CATEGORY_ARMY = 1284893244878098464
 VOICE_ROOM_CATEGORY_PUBLIC = 1116656512677445693
 
-EVENTS_FILE = 'events_data.json'
-VACATIONS_FILE = 'vacations.json'
-ATTENDANCE_FILE = 'attendance_data.json'
-WEEKLY_EVENTS_FILE = 'weekly_events.json'
-LAST_SCHEDULED_CHECK_FILE = 'last_scheduled_check.json'
-VOICE_ROOMS_FILE = 'voice_rooms.json'
-CHECK_MESSAGES_FILE = 'check_messages.json'
-ADMIN_ANCHORS_FILE = 'admin_anchors.json'
-ANKETA_MESSAGES_FILE = 'anketa_messages.json'
+EVENTS_FILE = os.path.join(BASE_DIR, 'events_data.json')
+VACATIONS_FILE = os.path.join(BASE_DIR, 'vacations.json')
+ATTENDANCE_FILE = os.path.join(BASE_DIR, 'attendance_data.json')
+WEEKLY_EVENTS_FILE = os.path.join(BASE_DIR, 'weekly_events.json')
+LAST_SCHEDULED_CHECK_FILE = os.path.join(BASE_DIR, 'last_scheduled_check.json')
+VOICE_ROOMS_FILE = os.path.join(BASE_DIR, 'voice_rooms.json')
+CHECK_MESSAGES_FILE = os.path.join(BASE_DIR, 'check_messages.json')
+ADMIN_ANCHORS_FILE = os.path.join(BASE_DIR, 'admin_anchors.json')
+ANKETA_MESSAGES_FILE = os.path.join(BASE_DIR, 'anketa_messages.json')
 
 # ============== FIREBASE ==============
 
-FIREBASE_CREDENTIALS_FILE = 'credentials_firebase.json'
+FIREBASE_CREDENTIALS_FILE = os.path.join(BASE_DIR, 'credentials_firebase.json')
 FIREBASE_PROJECT_ID = 'enemy-firebase'
 FIREBASE_ROSTER_COLLECTION = 'rosterPublic'
 
@@ -575,7 +576,6 @@ def get_next_weekday_datetime(day_key: str, hour: int, minute: int, from_time: d
 MAX_GAMES = 10
 MAX_SELECT_OPTIONS = 25
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMAGES_DIR = os.path.join(BASE_DIR, 'images')
 
 EVENT_IMAGES = {
@@ -723,7 +723,11 @@ intents.message_content = True
 intents.members = True
 intents.voice_states = True
 
-client = discord.Client(intents=intents)
+client = discord.Client(
+    intents=intents,
+    allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=False)
+)
+
 scheduler = AsyncIOScheduler(timezone=MSK, job_defaults={
     'coalesce': True,           # если задача пропустила несколько срабатываний подряд — выполнить только последнее
     'max_instances': 1,         # запрет на параллельное выполнение двух экземпляров одной и той же задачи
@@ -929,7 +933,7 @@ QUEUE_CACHE_TTL = 300
 UID_CALLSIGN_CACHE = {}
 UID_CALLSIGN_CACHE_TIME = {}
 UID_CALLSIGN_CACHE_TTL = 3600
-
+UID_CALLSIGN_NEGATIVE_TTL = 60  # для None-результатов — короткий TTL, чтобы не "хоронить" свежие профили на час
 
 def _firebase_read_queue_sync():
     doc = fs_db.collection('queue').document('state').get()
@@ -948,8 +952,10 @@ def _firebase_read_profile_callsign_sync(uid):
 async def get_uid_callsign(uid: str):
     now = datetime.now().timestamp()
     cached_time = UID_CALLSIGN_CACHE_TIME.get(uid, 0)
-    if uid in UID_CALLSIGN_CACHE and (now - cached_time) < UID_CALLSIGN_CACHE_TTL:
-        return UID_CALLSIGN_CACHE[uid]
+    cached_value = UID_CALLSIGN_CACHE.get(uid)
+    ttl = UID_CALLSIGN_NEGATIVE_TTL if (uid in UID_CALLSIGN_CACHE and cached_value is None) else UID_CALLSIGN_CACHE_TTL
+    if uid in UID_CALLSIGN_CACHE and (now - cached_time) < ttl:
+        return cached_value
     if not fs_db:
         return UID_CALLSIGN_CACHE.get(uid)
     try:
@@ -3116,7 +3122,7 @@ GAMESTATS_GAME_NAME = "Arma Reforger"
 CALLSIGN_UID_CACHE = {}
 CALLSIGN_UID_CACHE_TIME = {}
 CALLSIGN_UID_CACHE_TTL = 3600
-
+CALLSIGN_UID_NEGATIVE_TTL = 60
 
 def _normalize_callsign_for_lookup(nickname_with_tag: str) -> str:
     name = nickname_with_tag
@@ -3136,8 +3142,10 @@ async def get_uid_by_nickname(nickname: str):
     key = _normalize_callsign_for_lookup(nickname)
     now = datetime.now().timestamp()
     cached_time = CALLSIGN_UID_CACHE_TIME.get(key, 0)
-    if key in CALLSIGN_UID_CACHE and (now - cached_time) < CALLSIGN_UID_CACHE_TTL:
-        return CALLSIGN_UID_CACHE[key]
+    cached_value = CALLSIGN_UID_CACHE.get(key)
+    ttl = CALLSIGN_UID_NEGATIVE_TTL if (key in CALLSIGN_UID_CACHE and cached_value is None) else CALLSIGN_UID_CACHE_TTL
+    if key in CALLSIGN_UID_CACHE and (now - cached_time) < ttl:
+        return cached_value
     if not fs_db:
         return CALLSIGN_UID_CACHE.get(key)
     try:
@@ -3724,6 +3732,20 @@ def build_attendance_report_text(record: dict) -> str:
                 report_text += "\n\n"
     return report_text
 
+async def rename_thread_if_needed(thread, desired_name: str):
+    """Переименовывает ветку ТОЛЬКО если имя реально отличается от текущего.
+    Discord жёстко лимитирует переименование ветки — не более 2 раз за
+    10 минут; без этой проверки повторные вызовы desired_thread_name()
+    с уже актуальным именем впустую расходовали этот лимит и рисковали
+    надолго заблокировать bucket для соседних операций с той же веткой."""
+    if not thread:
+        return
+    if thread.name == desired_name:
+        return
+    try:
+        await thread.edit(name=desired_name)
+    except Exception as e:
+        print(f"⚠️ Не удалось переименовать ветку {thread.id}: {e}")
 
 async def lock_and_archive_thread(thread):
     """Закрывает и блокирует ветку обсуждения (locked+archived)."""
@@ -4637,7 +4659,7 @@ async def cancel_event(interaction, event_id):
         try:
             thread = await client.fetch_channel(event['thread_id'])
             await unlock_and_unarchive_thread(thread)
-            await thread.edit(name=desired_thread_name(event))
+            await rename_thread_if_needed(thread, desired_thread_name(event))
             msg = await thread.send(render_cancel_message(event, interaction.user.display_name))
             record_thread_message(event, msg.id, 'cancelled', extra={'by_user': interaction.user.display_name})
             save_json(EVENTS_FILE, events)
@@ -4665,7 +4687,7 @@ async def reactivate_event(interaction, event_id):
         try:
             thread = await client.fetch_channel(event['thread_id'])
             await unlock_and_unarchive_thread(thread)
-            await thread.edit(name=desired_thread_name(event))
+            await rename_thread_if_needed(thread, desired_thread_name(event))
             msg = await thread.send(render_reactivate_message(event))
             record_thread_message(event, msg.id, 'reactivated')
             save_json(EVENTS_FILE, events)
@@ -4838,7 +4860,8 @@ async def get_or_create_thread(event, event_id, title):
         return None
 
 
-async def create_event(title, description, start_time, end_time, image_key='none', num_games=0, color=15844367, mandatory=True):
+async def create_event(title, description, start_time, end_time, image_key='none', num_games=0, color=15844367,
+                        mandatory=True, weekly_id=None, week_key=None):
     event_id = str(uuid.uuid4())
     events = load_json(EVENTS_FILE, {})
     events[event_id] = {
@@ -4850,7 +4873,9 @@ async def create_event(title, description, start_time, end_time, image_key='none
         'reminder_2days_sent': False, 'reminder_15min_sent': False,
         'status': 'active',
         'mandatory': mandatory,
-        'created_at': int(datetime.now(MSK).timestamp())
+        'created_at': int(datetime.now(MSK).timestamp()),
+        'weekly_id': weekly_id,   # используется для идемпотентности catch-up (см. post_weekly_events)
+        'week_key': week_key,
     }
     save_json(EVENTS_FILE, events)
     try:
@@ -4874,13 +4899,36 @@ async def create_event(title, description, start_time, end_time, image_key='none
         print(f"❌ Ошибка публикации мероприятия: {e}")
 
 
-async def post_weekly_events():
+def _iso_week_key(dt: datetime) -> str:
+    """Ключ ISO-недели вида '2026-W37' — используется для идемпотентности
+    еженедельных мероприятий: даже при повторном запуске post_weekly_events
+    (например, при catch-up после простоя бота) мероприятия одной и той же
+    недели не будут созданы дважды."""
+    year, week, _ = dt.isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+async def post_weekly_events(week_key: str = None):
+    """Публикует еженедельные мероприятия. Если week_key не передан —
+    считается для текущего момента. Каждое созданное мероприятие получает
+    поля weekly_id и week_key — по ним can_catch_up_weekly_events() определяет,
+    было ли мероприятие для этой недели уже создано."""
     ensure_weekly_events_file()
     weekly_events = load_json(WEEKLY_EVENTS_FILE, {})
     now = datetime.now(MSK)
+    if week_key is None:
+        week_key = _iso_week_key(now)
+
+    existing_events = load_json(EVENTS_FILE, {})
+    already_created_weekly_ids = {
+        e.get('weekly_id') for e in existing_events.values()
+        if e.get('week_key') == week_key and e.get('weekly_id')
+    }
 
     prepared = []
     for weekly_id, entry in weekly_events.items():
+        if weekly_id in already_created_weekly_ids:
+            continue  # уже создано для этой недели — пропускаем (идемпотентность)
         try:
             start_h, start_m = map(int, entry['start_time'].split(':'))
             end_h, end_m = map(int, entry['end_time'].split(':'))
@@ -4893,8 +4941,7 @@ async def post_weekly_events():
             print(f"❌ Ошибка подготовки еженедельного мероприятия '{entry.get('name', '?')}': {e}")
 
     # Публикуем СТРОГО в хронологическом порядке дат (например, сначала
-    # пятничное мероприятие, затем субботнее, затем воскресное) — а не
-    # в произвольном порядке хранения записей в базе данных.
+    # пятничное мероприятие, затем субботнее, затем воскресное).
     prepared.sort(key=lambda item: item[0])
 
     for event_start, event_end, weekly_id, entry in prepared:
@@ -4903,11 +4950,41 @@ async def post_weekly_events():
                 clean_event_title(entry['name']), entry['description'], event_start, event_end,
                 image_key=entry.get('image_key', 'none'),
                 num_games=entry.get('num_games', 0),
-                mandatory=entry.get('mandatory', True)
+                mandatory=entry.get('mandatory', True),
+                weekly_id=weekly_id, week_key=week_key
             )
             await asyncio.sleep(2)
         except Exception as e:
             print(f"❌ Ошибка публикации еженедельного мероприятия '{entry.get('name', '?')}': {e}")
+
+
+async def catch_up_weekly_events_on_startup():
+    """Вызывается один раз при старте бота: если сейчас понедельник и
+    текущее время УЖЕ позже 08:00 (момента, когда должен был сработать cron),
+    а мероприятия текущей недели ещё не созданы (например, бот был выключен
+    именно в это время) — публикует их немедленно вместо того, чтобы ждать
+    следующего понедельника."""
+    now = datetime.now(MSK)
+    if now.weekday() != 0:  # 0 = понедельник
+        return
+    scheduled_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
+    if now < scheduled_time:
+        return  # ещё рано, штатный cron сам сработает вовремя
+
+    week_key = _iso_week_key(now)
+    weekly_events = load_json(WEEKLY_EVENTS_FILE, {})
+    if not weekly_events:
+        return
+
+    existing_events = load_json(EVENTS_FILE, {})
+    already_created = {
+        e.get('weekly_id') for e in existing_events.values()
+        if e.get('week_key') == week_key and e.get('weekly_id')
+    }
+    missing = set(weekly_events.keys()) - already_created
+    if missing:
+        print(f"🔁 Обнаружены несозданные еженедельные мероприятия за неделю {week_key} — наверстываю ({len(missing)} шт.).")
+        await post_weekly_events(week_key=week_key)
 
 
 async def check_event_reminders():
@@ -4923,8 +5000,12 @@ async def check_event_reminders():
             time_until_start = event_start - current_time
 
             # === Напоминание за 2 суток — только для ОБЯЗАТЕЛЬНЫХ мероприятий (п.11) ===
+            # Окно расширено с узкого [47ч;48ч] до [0;48ч] — если бот был выключен
+            # именно в тот час, когда должно было уйти напоминание, оно теперь
+            # наверстается при следующем запуске (флаг reminder_2days_sent
+            # уже гарантирует, что оно не отправится дважды).
             if event.get('mandatory', True) and not event.get('reminder_2days_sent', False):
-                if timedelta(hours=47) <= time_until_start <= timedelta(hours=48):
+                if timedelta(0) <= time_until_start <= timedelta(hours=48):
                     active_members = await get_active_members(current_time)
                     accepted = list(event.get('accepted', {}).keys())
                     declined = list(event.get('declined', {}).keys())
@@ -4939,8 +5020,13 @@ async def check_event_reminders():
                     changed = True
 
             # === Напоминание за 15 минут (п.12, п.15) ===
+            # Окно расширено до [-10мин;15мин] — если бот был выключен ровно
+            # в момент, когда должно было уйти напоминание, и мероприятие уже
+            # чуть-чуть началось к моменту перезапуска, напоминание всё равно
+            # наверстается (не имеет смысла напоминать спустя много часов
+            # после старта, поэтому нижняя граница ограничена -10 минутами).
             if not event.get('reminder_15min_sent', False):
-                if timedelta(0) <= time_until_start <= timedelta(minutes=15):
+                if timedelta(minutes=-10) <= time_until_start <= timedelta(minutes=15):
                     thread = await get_or_create_thread(event, event_id, event['title'])
                     should_send = True
                     if thread:
@@ -5018,7 +5104,7 @@ async def check_event_completion():
             if event.get('thread_id'):
                 try:
                     thread = await client.fetch_channel(event['thread_id'])
-                    await thread.edit(name=desired_thread_name(event))
+                    await rename_thread_if_needed(thread, desired_thread_name(event))
                     msg = await thread.send(render_completion_message(event))
                     record_thread_message(event, msg.id, 'completion')
                 except Exception:
@@ -5800,10 +5886,29 @@ async def on_voice_state_update(member, before, after):
         await cleanup_empty_temp_room(before.channel.id)
 
 
+_bot_fully_initialized = False
+
+
 @client.event
 async def on_ready():
+    global _bot_fully_initialized
     print(f'Бот запущен как {client.user} (PID {os.getpid()})')
-    
+
+    if _bot_fully_initialized:
+        # on_ready вызывается discord.py не только при первом старте, но и
+        # при некоторых сценариях восстановления соединения. Тяжёлая
+        # инициализация (полная перезагрузка данных из Firebase, пересборка
+        # индекса участников, сканирование голосовых комнат, планировщик,
+        # регистрация views, запуск watcher'ов) должна выполняться РОВНО
+        # ОДИН РАЗ за жизнь процесса — повторный прогон не только напрасно
+        # нагружает Firebase/Discord API, но и рискует откатить локальный
+        # кэш к устаревшему состоянию, если в этот момент ещё не завершилась
+        # какая-то отложенная запись.
+        for guild in client.guilds:
+            member_index.rebuild(guild)
+        print("ℹ️ Повторный on_ready (восстановление соединения) — тяжёлая инициализация пропущена, обновлён только индекс участников.")
+        return
+
     await load_all_firebase_data()
     ensure_weekly_events_file()
     await load_clan_members_from_firebase()
@@ -5813,7 +5918,11 @@ async def on_ready():
         await setup_voice_room_triggers(guild)
         await sync_voice_rooms_on_startup(guild)
 
-    
+    try:
+        await catch_up_weekly_events_on_startup()
+    except Exception as e:
+        print(f"⚠️ Ошибка при проверке несозданных еженедельных мероприятий: {e}")
+
     if not scheduler.get_job('spreadsheet_check'):
         scheduler.add_job(
             scheduled_check_spreadsheet, 'cron', day='*/2', hour=18, minute=0,
@@ -5865,11 +5974,13 @@ async def on_ready():
     # и watcher'ы запущены (setup_firestore_watchers выше). Явный flush сразу
     # после print — чтобы не ждать планового цикла раз в 15 секунд, и лог
     # о готовности бота появился в Discord-ветке немедленно.
+    _bot_fully_initialized = True
     print(f"✅ Бот полностью загружен и готов к работе (PID {os.getpid()}).")
     try:
         await flush_log_buffer_to_discord()
     except Exception:
         pass
+
 
 
 
@@ -5903,8 +6014,12 @@ async def on_message(message):
 
 
 if __name__ == '__main__':
+    discord_token = os.environ.get('DISCORD_TOKEN')
+    if not discord_token:
+        print("❌ Переменная окружения DISCORD_TOKEN не задана. Бот не может быть запущен.")
+        sys.exit(1)
     try:
-        client.run(os.environ['DISCORD_TOKEN'])
+        client.run(discord_token)
     finally:
         # wait=True — дожидаемся завершения всех фоновых записей в Firebase перед выходом
         EXECUTOR.shutdown(wait=True)
