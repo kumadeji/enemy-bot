@@ -1286,45 +1286,76 @@ class OrderedFirestoreWriter:
     схлопывает (coalesce) быстро следующие друг за другом изменения одного
     и того же doc_name — если за короткое окно submit() вызван несколько
     раз для одного документа, реальная запись в Firestore произойдёт
-    только ОДИН РАЗ с последним переданным состоянием, а не несколько раз
-    подряд в непредсказуемом порядке через пул потоков."""
+    только ОДИН РАЗ с последним переданным состоянием.
+
+    ВАЖНО (drain-цикл): раньше _flush_one делал ОДИН pop() и завершался.
+    Если submit() вызывался повторно ПОКА шла запись предыдущей версии
+    (task ещё не done()) — новая версия зависала в _pending и могла
+    остаться неотправленной в Firebase НАВСЕГДА (до следующего случайного
+    submit того же документа). При рестарте бота кэш откатывался бы
+    к устаревшей версии из облака. Теперь _flush_one работает в цикле:
+    после записи снова проверяет _pending и, если там появилось что-то
+    новое, пишет и это тоже — гарантированно "выгребает" очередь до пуста."""
     def __init__(self, debounce: float = 0.5):
         self._debounce = debounce
-        self._pending: dict[str, any] = {}
+        self._pending: dict[str, dict] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._tasks: dict[str, asyncio.Task] = {}
 
-    def submit(self, doc_name: str, data):
-        self._pending[doc_name] = data
+    def submit(self, doc_name: str, data: dict):
+        # Кладём КОПИЮ — вызывающий код (save_json) может продолжить
+        # использовать словарь после submit(), и без copy.deepcopy
+        # в Firebase мог бы улететь не тот снимок, что был на момент вызова.
+        self._pending[doc_name] = copy.deepcopy(data)
         if doc_name not in self._tasks or self._tasks[doc_name].done():
             self._tasks[doc_name] = asyncio.create_task(self._flush_one(doc_name))
 
     async def _flush_one(self, doc_name: str):
-        await asyncio.sleep(self._debounce)
-        data = self._pending.pop(doc_name, None)
-        if data is None:
-            return
         lock = self._locks.setdefault(doc_name, asyncio.Lock())
         async with lock:
-            try:
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(EXECUTOR, _firestore_write_sync, doc_name, data)
-            except Exception as e:
-                print(f"❌ Ошибка записи в Firebase ({doc_name}): {e}")
+            await asyncio.sleep(self._debounce)
+            while True:
+                data = self._pending.pop(doc_name, None)
+                if data is None:
+                    return
+                try:
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(EXECUTOR, _firestore_write_sync, doc_name, data)
+                except Exception as e:
+                    print(f"❌ Ошибка записи в Firebase ({doc_name}): {e}")
+                    return
+                # Если за время записи в _pending успела появиться НОВАЯ
+                # версия этого документа — пишем и её тоже, не выходя из
+                # функции с необработанным хвостом.
+                if doc_name not in self._pending:
+                    return
+
+    async def flush(self, timeout: float = 15.0):
+        """Дожидается, пока ВСЕ отложенные записи будут выгружены —
+        вызывается перед принудительным перезапуском/остановкой бота,
+        чтобы не потерять данные, всё ещё сидящие в debounce-паузе
+        (EXECUTOR.shutdown сам по себе их не ждёт, так как задачи этого
+        writer'а могут быть ещё внутри asyncio.sleep, а не в пуле потоков)."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while self._pending or any(not t.done() for t in self._tasks.values()):
+            if asyncio.get_running_loop().time() > deadline:
+                print(f"⚠️ OrderedFirestoreWriter.flush(): таймаут {timeout}с, часть записей могла не завершиться.")
+                return
+            await asyncio.sleep(0.1)
 
 
 firestore_writer = OrderedFirestoreWriter(debounce=0.5)
 
 def _write_local_backup_sync(filename, data):
     """Пишет резервную JSON-копию на диск АТОМАРНО: сначала во временный
-    файл в той же папке, затем os.replace() — это операция файловой системы,
-    которая либо полностью применяется, либо не применяется вовсе. Раньше
-    прямая запись через open(filename, 'w') могла оставить файл наполовину
-    записанным (невалидный JSON), если процесс был убит посреди записи
-    (например, внешним Stop-Process -Force) — а именно этот файл служит
-    аварийным бэкапом на случай недоступности Firebase, повреждённым он
-    быть не должен."""
-    tmp_path = f"{filename}.tmp_{os.getpid()}"
+    файл в той же папке, затем os.replace(). Суффикс временного файла
+    включает не только PID, но и уникальный случайный хвост — раньше
+    два ПАРАЛЛЕЛЬНЫХ вызова этой функции для ОДНОГО И ТОГО ЖЕ filename
+    (из разных потоков EXECUTOR, где PID один и тот же на весь процесс)
+    использовали один и тот же временный путь и могли повредить содержимое
+    друг друга при записи — а именно этот файл служит аварийным бэкапом на
+    случай недоступности Firebase, повреждённым он быть не должен."""
+    tmp_path = f"{filename}.tmp_{os.getpid()}_{uuid.uuid4().hex[:8]}"
     try:
         with open(tmp_path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -2424,11 +2455,17 @@ async def refresh_event_message(event_id):
 class EmbedRefresher:
     """Коалесирует запросы на обновление embed'а мероприятия: если за короткое
     окно (delay секунд) по одному и тому же event_id пришло несколько
-    запросов (например, 20 бойцов подряд жмут 'Приду' после общего пинга),
-    реальный refresh_event_message() выполняется РОВНО ОДИН РАЗ на event_id,
-    а не по разу на каждый клик — это резко снижает число edit-запросов
-    к Discord (и связанный с ними риск 429) и заодно СУЖАЕТ окно гонки
-    'load-modify-save' между параллельными обработчиками."""
+    запросов, реальный refresh_event_message() выполняется один раз на
+    event_id, а не по разу на каждый клик.
+
+    ВАЖНО (drain-цикл): раньше, если schedule() вызывался ПОКА _run() уже
+    обрабатывал предыдущий батч (задача ещё не done()), новый event_id
+    попадал в _pending, но не обрабатывался — новая задача не создавалась,
+    а текущая уже не вернётся посмотреть на новый _pending. В итоге такой
+    'хвостовой' клик мог не отрисоваться в embed НИКОГДА, до следующего
+    случайного клика по этому же мероприятию. Теперь _run() работает
+    циклом: после обработки батча снова проверяет _pending и, если там
+    что-то появилось, обрабатывает и это тоже."""
     def __init__(self, delay: float = 1.5):
         self._delay = delay
         self._pending: set[str] = set()
@@ -2441,12 +2478,18 @@ class EmbedRefresher:
 
     async def _run(self):
         await asyncio.sleep(self._delay)
-        ids, self._pending = self._pending, set()
-        for eid in ids:
-            try:
-                await refresh_event_message(eid)
-            except Exception as e:
-                print(f"⚠️ EmbedRefresher: ошибка обновления {eid}: {e}")
+        while self._pending:
+            ids, self._pending = self._pending, set()
+            for eid in ids:
+                try:
+                    await refresh_event_message(eid)
+                except Exception as e:
+                    print(f"⚠️ EmbedRefresher: ошибка обновления {eid}: {e}")
+            # Если за время обработки батча накопились новые запросы —
+            # даём небольшую паузу и обрабатываем их тоже, не выходя
+            # из цикла с необработанным хвостом.
+            if self._pending:
+                await asyncio.sleep(self._delay)
 
 
 embed_refresher = EmbedRefresher(delay=1.5)
@@ -2965,7 +3008,18 @@ async def handle_new_profile_watch(doc_id, data):
         channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
         mention_block = get_anketa_leadership_mentions(channel.guild, data.get('gamesInterested', []))
         embed = await build_anketa_embed(doc_id, data, is_new=True)
-        msg = await channel.send(content=mention_block if mention_block else None, embed=embed)
+        # Явно разрешаем упоминание всех 4 возможных ролей руководства —
+        # без этого глобальный клиентский AllowedMentions(roles=False)
+        # тихо гасил бы реальный пинг: текст "<@&ID>" отображался бы
+        # в сообщении, но комбат/замы не получали бы уведомление.
+        all_leadership_role_ids = [
+            ROLE_IDS['kombat_arma'], ROLE_IDS['zam_kombat_arma'],
+            ROLE_IDS['kombat_squad'], ROLE_IDS['zam_kombat_squad'],
+        ]
+        leadership_roles = [channel.guild.get_role(rid) for rid in all_leadership_role_ids]
+        leadership_roles = [r for r in leadership_roles if r]
+        allowed = discord.AllowedMentions(roles=leadership_roles, users=True, everyone=False)
+        msg = await channel.send(content=mention_block if mention_block else None, embed=embed, allowed_mentions=allowed)
         save_anketa_message_info(doc_id, msg.id, channel.id)
         published = True
     except Exception as e:
@@ -4050,6 +4104,32 @@ class AttendanceStepView(discord.ui.View):
                 next_page_btn.callback = self._make_page_callback(page + 1)
                 self.add_item(next_page_btn)
 
+        # ВОССТАНОВЛЕНО: этот блок раньше находился внутри _make_page_callback,
+        # ПОСЛЕ return callback — то есть был мёртвым, никогда не выполняющимся
+        # кодом. Из-за этого шаг выбора явившихся не имел кнопок "Далее"/
+        # "Пропустить" вообще, и мастер явки физически не мог перейти
+        # к выбору командиров — заполнить явку было невозможно.
+        # Также заменены голые step/wizard на self.step/self.wizard,
+        # так как вне метода эти имена не существуют.
+        if self.step == 0 and self.wizard.num_games == 0:
+            finish_btn = discord.ui.Button(label=es("➡️ Далее (командир отделения)"), style=discord.ButtonStyle.primary, custom_id=f"attendance_to_commander_{self.step}", row=4)
+            finish_btn.callback = self.to_commander_callback
+            self.add_item(finish_btn)
+        elif self.wizard.num_games > 1 and self.step < self.wizard.num_games - 1:
+            skip_btn = discord.ui.Button(label=es("⏭️ Пропустить этот матч"), style=discord.ButtonStyle.secondary, custom_id=f"attendance_skip_{self.step}", row=4)
+            skip_btn.callback = self.skip_callback
+            self.add_item(skip_btn)
+            next_btn = discord.ui.Button(label=es(f"➡️ Далее (командир отделения)"), style=discord.ButtonStyle.primary, custom_id=f"attendance_next_{self.step}", row=4)
+            next_btn.callback = self.to_commander_callback
+            self.add_item(next_btn)
+        else:
+            skip_btn = discord.ui.Button(label=es("⏭️ Пропустить этот матч"), style=discord.ButtonStyle.secondary, custom_id=f"attendance_skip_{self.step}", row=4)
+            skip_btn.callback = self.skip_callback
+            self.add_item(skip_btn)
+            next_btn = discord.ui.Button(label=es(f"➡️ Далее (командир отделения)"), style=discord.ButtonStyle.primary, custom_id=f"attendance_next_{self.step}", row=4)
+            next_btn.callback = self.to_commander_callback
+            self.add_item(next_btn)
+
     def _make_page_callback(self, target_page: int):
         async def callback(interaction):
             if interaction.user.id not in ADMIN_USER_IDS:
@@ -4062,26 +4142,7 @@ class AttendanceStepView(discord.ui.View):
             new_view = AttendanceStepView(self.wizard, self.step, self._clan_members, page=target_page, accumulated=merged)
             await interaction.response.edit_message(view=new_view)
         return callback
-        
-        if step == 0 and wizard.num_games == 0:
-            finish_btn = discord.ui.Button(label=es("➡️ Далее (командир отделения)"), style=discord.ButtonStyle.primary, custom_id=f"attendance_to_commander_{step}", row=4)
-            finish_btn.callback = self.to_commander_callback
-            self.add_item(finish_btn)
-        elif wizard.num_games > 1 and step < wizard.num_games - 1:
-            skip_btn = discord.ui.Button(label=es("⏭️ Пропустить этот матч"), style=discord.ButtonStyle.secondary, custom_id=f"attendance_skip_{step}", row=4)
-            skip_btn.callback = self.skip_callback
-            self.add_item(skip_btn)
-            next_btn = discord.ui.Button(label=es(f"➡️ Далее (командир отделения)"), style=discord.ButtonStyle.primary, custom_id=f"attendance_next_{step}", row=4)
-            next_btn.callback = self.to_commander_callback
-            self.add_item(next_btn)
-        else:
-            skip_btn = discord.ui.Button(label=es("⏭️ Пропустить этот матч"), style=discord.ButtonStyle.secondary, custom_id=f"attendance_skip_{step}", row=4)
-            skip_btn.callback = self.skip_callback
-            self.add_item(skip_btn)
-            next_btn = discord.ui.Button(label=es(f"➡️ Далее (командир отделения)"), style=discord.ButtonStyle.primary, custom_id=f"attendance_next_{step}", row=4)
-            next_btn.callback = self.to_commander_callback
-            self.add_item(next_btn)
-    
+
     def _make_select_callback(self, select):
         async def callback(interaction):
             if interaction.user.id not in ADMIN_USER_IDS:
@@ -4431,8 +4492,19 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
             guild = channel.guild
             mention_block = get_leadership_mentions(guild, 'kombat_arma', 'zam_kombat_arma')
             vacation_mention = f"<#{VACATION_CHANNEL_ID}>"
+            # Явно разрешаем упоминание именно этих двух ролей руководства —
+            # глобальный клиентский AllowedMentions(roles=False) иначе тихо
+            # гасил бы реальный пинг, оставляя видимым только текст <@&ID>
+            # без фактического уведомления комбата/заместителей.
+            leadership_role_ids = [ROLE_IDS['kombat_arma'], ROLE_IDS['zam_kombat_arma']]
+            leadership_roles = [guild.get_role(rid) for rid in leadership_role_ids]
+            leadership_roles = [r for r in leadership_roles if r]
+            allowed = discord.AllowedMentions(roles=leadership_roles, users=True, everyone=False)
             if mention_block:
-                await thread.send(f"{mention_block}\n\n" + es(f"Новый запрос на отпуск от **{nickname}**! Перейдите в канал {vacation_mention} и рассмотрите рапорт."))
+                await thread.send(
+                    f"{mention_block}\n\n" + es(f"Новый запрос на отпуск от **{nickname}**! Перейдите в канал {vacation_mention} и рассмотрите рапорт."),
+                    allowed_mentions=allowed
+                )
             else:
                 await thread.send(es(f"Новый запрос на отпуск от **{nickname}**! Перейдите в канал {vacation_mention}."))
             async with _vacations_write_lock:
@@ -5293,9 +5365,23 @@ async def check_event_reminders():
                 fresh = fresh_events.get(event_id)
                 if fresh is None:
                     continue
+                # reminder_1day_sent раньше отсутствовал в этом списке — флаг
+                # никогда не сохранялся, из-за чего суточное напоминание
+                # (окно [0;24ч]) рассылалось повторно КАЖДУЮ МИНУТУ работы job'а.
                 fresh['reminder_2days_sent'] = event.get('reminder_2days_sent', fresh.get('reminder_2days_sent'))
                 fresh['reminder_1day_sent'] = event.get('reminder_1day_sent', fresh.get('reminder_1day_sent'))
                 fresh['reminder_15min_sent'] = event.get('reminder_15min_sent', fresh.get('reminder_15min_sent'))
+                # thread_messages тоже терялся: записи о новых напоминаниях,
+                # отправленных в этом прогоне, накапливались только в локальной
+                # копии event и не попадали в fresh — ресинхронизация оформления
+                # (update_all_templates) не находила эти сообщения.
+                local_thread_messages = event.get('thread_messages', [])
+                fresh_thread_messages = fresh.get('thread_messages', [])
+                existing_ids = {m.get('id') for m in fresh_thread_messages}
+                for msg_record in local_thread_messages:
+                    if msg_record.get('id') not in existing_ids:
+                        fresh_thread_messages.append(msg_record)
+                fresh['thread_messages'] = fresh_thread_messages
             save_json(EVENTS_FILE, fresh_events)
 
 
@@ -5317,20 +5403,21 @@ async def check_event_completion():
             changed = True
             completed_ids.append(event_id)
     if changed:
+        # Переносим смену статуса на completed в актуальный снимок под локом,
+        # не затирая отметки, которые могли прийти параллельно через
+        # handle_event_response.
         async with _events_write_lock:
             fresh_events = load_json(EVENTS_FILE, {})
             for event_id in completed_ids:
                 fresh = fresh_events.get(event_id)
                 if fresh is not None:
                     fresh['status'] = 'completed'
-                    # Список сохранённых ID сообщений в ветке больше не
-                    # нужен после завершения мероприятия: ветка блокируется
-                    # ниже и повторно синхронизироваться через
-                    # update_all_templates не будет. Без очистки этот список
-                    # рос бы бесконечно на каждое напоминание/объявление.
+                    # Список сообщений в ветке больше не нужен после
+                    # завершения — ветка блокируется ниже.
                     fresh.pop('thread_messages', None)
             save_json(EVENTS_FILE, fresh_events)
             events = fresh_events
+
         for event_id in completed_ids:
             event = events[event_id]
             await refresh_event_message(event_id)
@@ -5340,18 +5427,35 @@ async def check_event_completion():
                     thread = await client.fetch_channel(event['thread_id'])
                     await rename_thread_if_needed(thread, desired_thread_name(event))
                     msg = await thread.send(render_completion_message(event))
-                    record_thread_message(event, msg.id, 'completion')
+                    # ВАЖНО: записываем ID сообщения СРАЗУ, через отдельный
+                    # fresh-read под локом — а не в локальную переменную
+                    # 'events', которую раньше сохраняли ОДНИМ ОБЩИМ save_json
+                    # в самом конце всей функции. Тот финальный save
+                    # затирал устаревшим снимком поля discipline_processed/
+                    # discipline_applied, которые process_inactivity_discipline_for_event
+                    # успевала записать САМА (через свои независимые load/save)
+                    # ДО этого финального save — из-за чего recover_incomplete_discipline
+                    # каждые 15 минут считала обработку незавершённой и повторно
+                    # выносила взыскания уже наказанным бойцам.
+                    async with _events_write_lock:
+                        ev_after_send = load_json(EVENTS_FILE, {})
+                        fresh_ev = ev_after_send.get(event_id)
+                        if fresh_ev is not None:
+                            record_thread_message(fresh_ev, msg.id, 'completion')
+                            save_json(EVENTS_FILE, ev_after_send)
                 except Exception:
                     thread = None
-            # ВАЖНО: дисциплина применяется ДО блокировки ветки — иначе
-            # process_inactivity_discipline_for_event пытается писать
-            # уведомления в уже заблокированную (заархивированную) ветку
-            # и падает с 'Thread is archived', боец не получает уведомление
-            # о вынесенном замечании/выговоре.
+
+            # Дисциплина применяется ДО блокировки ветки — иначе она пытается
+            # писать уведомления в уже заблокированную (заархивированную) ветку.
             await process_inactivity_discipline_for_event(event_id)
+
             if thread:
                 await lock_and_archive_thread(thread)
-        save_json(EVENTS_FILE, events)
+        # ВАЖНО: здесь больше НЕТ финального save_json(EVENTS_FILE, events) —
+        # он был источником бага выше. Все нужные изменения (status,
+        # thread_messages, discipline_processed/discipline_applied) уже
+        # записаны точечно, каждое под своим локом, в момент их появления.
 
 
 # ============== ОБНОВЛЕНИЕ ШАБЛОНОВ СООБЩЕНИЙ ==============
@@ -6033,6 +6137,11 @@ async def force_restart_bot():
         pass
 
     try:
+        await firestore_writer.flush(timeout=15)
+    except Exception:
+        pass
+
+    try:
         loop = asyncio.get_running_loop()
         await asyncio.wait_for(
             loop.run_in_executor(None, lambda: EXECUTOR.shutdown(wait=True)),
@@ -6267,6 +6376,10 @@ if __name__ == '__main__':
     try:
         client.run(discord_token)
     finally:
+        try:
+            asyncio.run(firestore_writer.flush(timeout=10))
+        except Exception:
+            pass
         # wait=True — дожидаемся завершения всех фоновых записей в Firebase перед выходом
         EXECUTOR.shutdown(wait=True)
         if os.path.exists(LOCK_FILE):
