@@ -987,35 +987,76 @@ async def get_expected_squad_commander(event: dict, current_date: datetime):
         return nickname
     return None
 
-async def find_discord_user(nickname: str, thread):
-    try:
-        guild = thread.guild
-        for member in guild.members:
-            if member.display_name == nickname:
-                return member
-        for member in guild.members:
-            if nickname.lower() in member.display_name.lower():
+class MemberIndex:
+    """Индекс участников гильдии для O(1)-поиска вместо линейного перебора
+    guild.members на каждый вызов (который раньше происходил, в частности,
+    внутри find_member_by_nickname на КАЖДЫЙ ник в build_mentions_for_nicknames —
+    то есть 26 бойцов в упоминаниях = 26 полных сканов гильдии). Обновляется
+    при старте (rebuild) и точечно при join/remove/update конкретного участника."""
+    def __init__(self):
+        self._by_display: dict[str, discord.Member] = {}
+        self._guild: discord.Guild | None = None
+
+    def rebuild(self, guild: discord.Guild):
+        self._guild = guild
+        self._by_display = {m.display_name: m for m in guild.members}
+
+    def upsert(self, member: discord.Member):
+        # Точечное обновление одного участника (используется в
+        # on_member_join/on_member_update) — без полного rebuild.
+        self._by_display[member.display_name] = member
+
+    def remove(self, member: discord.Member):
+        self._by_display.pop(member.display_name, None)
+
+    def get_exact(self, display_name: str) -> discord.Member | None:
+        return self._by_display.get(display_name)
+
+    def get_fuzzy(self, nickname: str) -> discord.Member | None:
+        # Fallback на случай расхождения регистра/лишних символов —
+        # используется ТОЛЬКО если точное совпадение не найдено.
+        needle = nickname.lower()
+        for name, member in self._by_display.items():
+            if needle in name.lower():
                 return member
         return None
+
+    @property
+    def guild(self) -> discord.Guild | None:
+        return self._guild
+
+
+member_index = MemberIndex()
+
+
+async def find_discord_user(nickname: str, thread):
+    """Обёртка для обратной совместимости мест, где guild берётся из thread —
+    реальный поиск теперь идёт через member_index (O(1))."""
+    try:
+        if member_index.guild is None:
+            member_index.rebuild(thread.guild)
+        member = member_index.get_exact(nickname)
+        if member:
+            return member
+        return member_index.get_fuzzy(nickname)
     except Exception as e:
         print(f"Ошибка при поиске пользователя {nickname}: {e}")
         return None
 
 
 async def find_member_by_nickname(nickname: str):
+    """Больше НЕ делает fetch_channel(VACATION_CHANNEL_ID) ради guild —
+    это был лишний HTTP-запрос на КАЖДЫЙ вызов. guild уже закэширован
+    в member_index при старте бота."""
     try:
-        channel = await client.fetch_channel(VACATION_CHANNEL_ID)
-        guild = channel.guild
-        for member in guild.members:
-            if member.display_name == nickname:
-                return member
-        for member in guild.members:
-            if nickname.lower() in member.display_name.lower():
-                return member
-        return None
+        member = member_index.get_exact(nickname)
+        if member:
+            return member
+        return member_index.get_fuzzy(nickname)
     except Exception as e:
         print(f"Ошибка поиска участника: {e}")
         return None
+
 
 
 async def send_chunked(thread, text, user_name="") -> list:
@@ -2598,19 +2639,15 @@ async def get_profile_data(uid: str):
 
 
 async def find_member_by_discord_username(discord_username: str):
-    """Ищет участника гильдии по полю 'Discord ID' анкеты — это username
-    (например, 'kumadeji'), а НЕ отображаемое имя/позывной на сервере."""
-    if not discord_username:
+    """Ищет участника гильдии по полю 'Discord ID' анкеты (username, не
+    display_name). Использует общий member_index.guild вместо отдельного
+    fetch_channel(ANKETA_CHANNEL_ID) ради guild."""
+    if not discord_username or member_index.guild is None:
         return None
     try:
-        channel = await client.fetch_channel(ANKETA_CHANNEL_ID)
-        guild = channel.guild
         uname_lower = discord_username.strip().lower()
-        for member in guild.members:
-            if member.name.lower() == uname_lower:
-                return member
-        for member in guild.members:
-            if str(member).lower() == uname_lower:
+        for member in member_index.guild.members:
+            if member.name.lower() == uname_lower or str(member).lower() == uname_lower:
                 return member
         return None
     except Exception as e:
@@ -5506,7 +5543,14 @@ async def sweep_empty_voice_rooms():
 async def force_restart_bot():
     """Освобождает lock-файл, поднимает НОВЫЙ независимый процесс бота
     и завершает текущий процесс. Вызывается кнопкой '🔄 Принудительный
-    перезапуск' в админ-панели."""
+    перезапуск' в админ-панели.
+
+    ВАЖНО: flush_log_buffer_to_discord() вызывается ПОСЛЕ каждого этапа,
+    а не один раз в начале — иначе все print(), написанные уже ПОСЛЕ
+    первого flush (включая сам факт успешного перезапуска), оставались
+    в локальном буфере и никогда не попадали в Discord-ветку логов,
+    потому что процесс завершался (os._exit) раньше следующего
+    планового flush (который происходит раз в 15 секунд)."""
     try:
         await flush_log_buffer_to_discord()
     except Exception:
@@ -5514,9 +5558,7 @@ async def force_restart_bot():
 
     # Дожидаемся завершения ВСЕХ фоновых записей (Firebase, локальные бэкапы,
     # safety-снапшоты), стоящих в очереди EXECUTOR — иначе они безвозвратно
-    # теряются при os._exit() ниже. shutdown(wait=True) сам по себе блокирующий
-    # вызов — выполняем его в ДРУГОМ (дефолтном) executor'е, чтобы не блокировать
-    # event loop напрямую, и с таймаутом на случай зависшей задачи.
+    # теряются при os._exit() ниже.
     try:
         loop = asyncio.get_running_loop()
         await asyncio.wait_for(
@@ -5528,6 +5570,11 @@ async def force_restart_bot():
         _original_print("⚠️ Не все фоновые записи завершились за 15 секунд — продолжаю перезапуск принудительно.")
     except Exception as e:
         _original_print(f"⚠️ Ошибка при ожидании завершения фоновых задач: {e}")
+
+    try:
+        await flush_log_buffer_to_discord()
+    except Exception:
+        pass
 
     try:
         _release_instance_lock()
@@ -5550,11 +5597,39 @@ async def force_restart_bot():
     except Exception as e:
         _original_print(f"❌ Не удалось запустить новый процесс бота при перезапуске: {e}")
 
+    # Финальный flush — гарантированно отправляет ВСЕ логи, накопленные
+    # на предыдущих шагах (включая сообщение о запуске нового процесса),
+    # прежде чем текущий процесс будет убит.
+    try:
+        await flush_log_buffer_to_discord()
+    except Exception:
+        pass
+
     os._exit(0)
 
 
 
+
 # ============== СОБЫТИЯ DISCORD ==============
+
+@client.event
+async def on_member_join(member: discord.Member):
+    member_index.upsert(member)
+
+
+@client.event
+async def on_member_remove(member: discord.Member):
+    member_index.remove(member)
+
+
+@client.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    # Срабатывает при смене ника/ролей — обновляем индекс, чтобы поиск
+    # по позывному продолжал находить бойца после смены display_name.
+    if before.display_name != after.display_name:
+        member_index.remove(before)
+    member_index.upsert(after)
+
 
 @client.event
 async def on_voice_state_update(member, before, after):
@@ -5595,8 +5670,10 @@ async def on_ready():
     await load_clan_members_from_firebase()
     
     for guild in client.guilds:
+        member_index.rebuild(guild)
         await setup_voice_room_triggers(guild)
         await sync_voice_rooms_on_startup(guild)
+
     
     if not scheduler.get_job('spreadsheet_check'):
         scheduler.add_job(
