@@ -2862,13 +2862,15 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление д
             return
 
         event_start = datetime.fromtimestamp(event['start_time'], MSK)
-        start_ts = int(event_start.timestamp())
-        current_time = datetime.now(MSK)
 
         if event_created_late(event):
             # Мероприятие создано менее чем за сутки — тегаем всех активных,
             # кто не в отпуске (роль 'Боец ArmA' целиком больше не пингуется).
-            mention_block = await get_all_active_members_mentions(current_time)
+            # Отпуска считаются НА ДАТУ МЕРОПРИЯТИЯ, а не на "сейчас": иначе
+            # боец, уходящий в отпуск до старта, получал бы объявление о модах
+            # для мероприятия, на котором его заведомо не будет, а тот, кто
+            # к старту уже вернётся, — не получал бы его вовсе.
+            mention_block = await get_all_active_members_mentions(event_start)
         else:
             # По умолчанию — только тем, кто отметился "Приду"
             accepted = list(event.get('accepted', {}).keys())
@@ -2876,7 +2878,7 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление д
                 mention_block = await build_mentions_for_nicknames(accepted)
             else:
                 # Никто ещё не отметился — тегаем всех активных, кто не в отпуске
-                mention_block = await get_all_active_members_mentions(current_time)
+                mention_block = await get_all_active_members_mentions(event_start)
 
         server_name = self.server_name.value.strip()
         server_ip = self.server_ip.value.strip()
@@ -5860,7 +5862,13 @@ async def create_event(title, description, start_time, end_time, image_key='none
         events[event_id]['message_id'] = message.id
         thread = await message.create_thread(name=desired_thread_name(events[event_id]))
         events[event_id]['thread_id'] = thread.id
-        mention_block = await get_all_active_members_mentions(datetime.now(MSK))
+        # Отпуска — на дату НАЧАЛА мероприятия, а не на момент создания.
+        # Так анонс получают ровно те, кто будет доступен к старту: боец,
+        # уходящий в отпуск раньше, пинг не получит, а тот, кто к старту
+        # вернётся из отпуска, — получит. Это же согласует состав анонса
+        # со списком «Не отметились» в embed, который тоже считается
+        # по event_start_dt.
+        mention_block = await get_all_active_members_mentions(start_time)
         announcement_msg = await thread.send(render_announcement_message(mention_block))
         record_thread_message(events[event_id], announcement_msg.id, 'announcement', mention_block=mention_block)
 
