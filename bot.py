@@ -1787,12 +1787,17 @@ async def build_mentions_for_nicknames(nicknames: list) -> str:
     return " ".join(mentions)
 
 
-async def get_all_active_members_mentions(current_time: datetime) -> str:
+async def get_all_active_members_mentions(target_date: datetime) -> str:
     """Упоминания ВСЕХ действующих бойцов клана (composition из
-    ACTIVE_CLAN_COMPOSITIONS), которые НЕ в отпуске на момент вызова.
+    ACTIVE_CLAN_COMPOSITIONS), которые НЕ в отпуске НА УКАЗАННУЮ ДАТУ.
     Используется везде, где раньше пинговалась роль 'Боец ArmA' целиком —
-    теперь эта роль нигде в коде не пингуется вообще."""
-    active_members = await get_active_members(current_time)
+    теперь эта роль нигде в коде не пингуется вообще.
+
+    ВАЖНО: передавать дату НАЧАЛА МЕРОПРИЯТИЯ, а не datetime.now(). Иначе
+    боец, уходящий в отпуск до старта, получит анонс мероприятия, на котором
+    его заведомо не будет, — а тот, кто к старту уже вернётся, анонс
+    не получит вовсе."""
+    active_members = await get_active_members(target_date)
     return await build_mentions_for_nicknames(active_members)
 
 
@@ -4562,7 +4567,13 @@ async def start_attendance_wizard(interaction, event_id):
         return
     num_games = event.get('num_games', 0)
     wizard = AttendanceWizard(event_id, num_games, event.get('title', ''))
-    clan_members = await get_active_members(datetime.now(MSK))
+    # ПОЛНЫЙ состав клана, БЕЗ фильтра по отпускам: отпуск освобождает от
+    # обязанности отмечаться в расписании, но НЕ запрещает играть. Раньше
+    # здесь стоял get_active_members(), из-за чего боец, бывший в отпуске
+    # (или ушедший в него уже ПОСЛЕ мероприятия — список зависел от момента
+    # нажатия кнопки), физически отсутствовал в селекте: его нельзя было
+    # отметить, он не получал отыгрыш и не мог быть назначен командиром.
+    clan_members = await load_clan_members_from_firebase()
     if not clan_members:
         await interaction.response.send_message(es("❌ Список клана пуст!"), ephemeral=True)
         return
@@ -4597,7 +4608,8 @@ async def show_commander_step(interaction, wizard):
     await interaction.followup.send(title_text, view=view, ephemeral=True)
 
 async def proceed_to_next_step(interaction, wizard):
-    clan_members = await get_active_members(datetime.now(MSK))
+    # Полный состав, без фильтра по отпускам — см. коммент в start_attendance_wizard.
+    clan_members = await load_clan_members_from_firebase()
     
     if wizard.num_games == 0:
         await finalize_attendance(interaction, wizard)
