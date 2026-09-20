@@ -1,0 +1,45 @@
+name: Deploy Enemy Bot
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.ENEMY_BOT_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.ENEMY_BOT_KNOWN_HOSTS }}
+        run: |
+          set -eu
+
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$KNOWN_HOSTS"
+
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/enemy-bot-deploy"
+          chmod 600 "$HOME/.ssh/enemy-bot-deploy"
+
+          printf '%s\n' "$KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 644 "$HOME/.ssh/known_hosts"
+
+      - name: Deploy to VPS
+        run: |
+          ssh \
+            -T \
+            -i "$HOME/.ssh/enemy-bot-deploy" \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes \
+            -o ConnectTimeout=20 \
+            ubuntu@13.143.134.123
