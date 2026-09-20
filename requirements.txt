@@ -2,3 +2,5 @@ discord.py
 gspread
 apscheduler
 pytz
+firebase-admin
+google-cloud-firestore
