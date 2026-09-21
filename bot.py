@@ -252,24 +252,26 @@ _NOISY_LOG_SUBSTRINGS = (
 
 class _NoSelfLoopLogFilter(logging.Filter):
     """Защита форвардера от зацикливания на самом себе + подавление
-    технического шума (см. _NOISY_LOG_SUBSTRINGS):
-    - discord.http часто пишет WARNING 'We are being rate limited' именно
-      В МОМЕНТ, когда сам форвардер шлёт накопленные логи в Discord — без
-      фильтра это создаёт петлю (лог о рейтлимите -> он же уходит в буфер ->
-      следующая отправка -> снова рейтлимит);
-    - пока идёт flush_log_buffer_to_discord(), любые логи discord.* уровня
-      ниже WARNING подавляются, чтобы сам процесс отправки не порождал
-      новые записи для следующей отправки."""
+    технического шума."""
     def filter(self, record: logging.LogRecord) -> bool:
         message_lower = record.getMessage().lower()
+
+        # APScheduler пишет INFO о каждом запуске и завершении job.
+        # Это штатная работа, в Discord-логах такой спам не нужен.
+        # WARNING/ERROR/CRITICAL при этом остаются видимыми.
+        if record.name.startswith("apscheduler") and record.levelno < logging.WARNING:
+            return False
+
         if any(noisy in message_lower for noisy in _NOISY_LOG_SUBSTRINGS):
             return False
+
         if record.name == 'discord.http' and 'rate limited' in message_lower:
             return False
+
         if _FLUSHING_LOG_BUFFER and record.name.startswith('discord') and record.levelno < logging.WARNING:
             return False
-        return True
 
+        return True
 
 class _DiscordLogHandler(logging.Handler):
     """Перехватывает системные логи discord.py и apscheduler (подключения,
@@ -7429,7 +7431,7 @@ async def on_ready():
         )
     
     logging.getLogger("enemy_bot.discord_watchdog").info(
-        "Discord connectivity watchdog started: timeout=%ss, check_interval=%ss",
+        "Запущен watchdog для контроля соединения с Discord: timeout=%ss, check_interval=%ss",
         DISCORD_CONNECTION_TIMEOUT,
         DISCORD_CONNECTION_CHECK_INTERVAL
     )
@@ -7457,7 +7459,7 @@ async def on_connect():
     _discord_disconnected_at = None
 
     logging.getLogger("enemy_bot.discord").info(
-        "Discord Gateway connected."
+        "Соединение с Discord Gateway установлено."
     )
 
 
@@ -7468,7 +7470,7 @@ async def on_resumed():
     _discord_disconnected_at = None
 
     logging.getLogger("enemy_bot.discord").info(
-        "Discord Gateway session successfully resumed."
+        "Сессия Discord Gateway успешно восстановлена."
     )
 
 
@@ -7483,7 +7485,7 @@ async def on_disconnect():
         _discord_disconnected_at = time.monotonic()
 
         logging.getLogger("enemy_bot.discord").warning(
-            "Discord Gateway connection lost. Starting 5-minute watchdog timer."
+            "Соединение с Discord Gateway потеряно. Запущен 5-минутный таймер контроля."
         )
 
 @client.event
