@@ -4,6 +4,7 @@ import sys
 import time
 import signal
 import atexit
+import socket
 
 # На Windows, если stdout/stderr перенаправлены в файл (а не в реальную консоль),
 # Python выбирает кодировку по системной ANSI-кодовой странице (часто cp1251),
@@ -41,6 +42,70 @@ LOG_FORWARD_LEVEL = logging.INFO  # при желании поднять до lo
 _FALLBACK_LOG_THREAD_ID = None
 
 _original_print = print  # сохраняем оригинальный print ДО подмены
+
+# ============== SYSTEMD WATCHDOG ==============
+
+_systemd_watchdog_task = None
+
+
+def _systemd_notify(message: str) -> bool:
+    """
+    Отправляет уведомление systemd через NOTIFY_SOCKET.
+    Ничего не делает, если бот запущен не под systemd.
+    """
+    notify_socket = os.environ.get("NOTIFY_SOCKET")
+
+    if not notify_socket:
+        return False
+
+    address = notify_socket
+
+    # systemd использует @ для abstract UNIX socket.
+    if address.startswith("@"):
+        address = "\0" + address[1:]
+
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
+            sock.sendto(message.encode("utf-8"), address)
+        return True
+    except OSError:
+        return False
+
+
+async def _systemd_watchdog_loop():
+    """
+    Heartbeat для systemd.
+
+    WATCHDOG_USEC приходит от systemd автоматически.
+    Отправляем heartbeat примерно раз в половину WatchdogSec.
+    Если event loop зависнет, этот coroutine тоже перестанет выполняться,
+    heartbeat прекратится, и systemd перезапустит сервис.
+    """
+    watchdog_usec_raw = os.environ.get("WATCHDOG_USEC", "0")
+
+    try:
+        watchdog_usec = int(watchdog_usec_raw)
+    except ValueError:
+        watchdog_usec = 0
+
+    if watchdog_usec <= 0:
+        return
+
+    interval = max(5.0, watchdog_usec / 2_000_000.0)
+
+    _systemd_notify(
+        "READY=1\n"
+        "STATUS=Enemy bot is fully initialized and watchdog is active."
+    )
+
+    while True:
+        await asyncio.sleep(interval)
+
+        _systemd_notify(
+            "WATCHDOG=1\n"
+            "STATUS=Enemy bot event loop is alive."
+        )
+
 _log_forward_buffer = _deque_early(maxlen=2000)
 _log_forward_lock = _threading_early.Lock()
 
@@ -7237,6 +7302,18 @@ async def on_ready():
     # о готовности бота появился в Discord-ветке немедленно.
     _bot_fully_initialized = True
     print(f"✅ Бот полностью загружен и готов к работе (PID {os.getpid()}).")
+    
+    global _systemd_watchdog_task
+    
+    if (
+        _systemd_watchdog_task is None
+        or _systemd_watchdog_task.done()
+    ):
+        _systemd_watchdog_task = asyncio.create_task(
+            _systemd_watchdog_loop(),
+            name="systemd-watchdog"
+        )
+    
     try:
         await flush_log_buffer_to_discord()
     except Exception:
