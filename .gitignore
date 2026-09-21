@@ -7,3 +7,4 @@ attendance_data.json
 weekly_events.json
 voice_rooms.json
 last_scheduled_check.json
+logs/

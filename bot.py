@@ -24,6 +24,7 @@ if sys.platform == 'win32':
 
 
 import logging
+from logging.handlers import RotatingFileHandler
 import threading as _threading_early
 from collections import deque as _deque_early
 
@@ -41,11 +42,67 @@ LOG_FORWARD_LEVEL = logging.INFO  # при желании поднять до lo
 # (форвардер логов стартует раньше, чем on_ready успевает создать якоря).
 _FALLBACK_LOG_THREAD_ID = None
 
+# ============== FILE LOGGING ==============
+
+_LOG_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "logs"
+)
+
+os.makedirs(_LOG_DIR, exist_ok=True)
+
+_LOG_FILE = os.path.join(_LOG_DIR, "enemy-bot.log")
+
+_LOG_FORMATTER = logging.Formatter(
+    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    "%Y-%m-%d %H:%M:%S"
+)
+
+# Файловый handler для обычного logging / discord.py.
+_file_handler = RotatingFileHandler(
+    _LOG_FILE,
+    maxBytes=10 * 1024 * 1024,
+    backupCount=7,
+    encoding="utf-8"
+)
+
+_file_handler.setLevel(logging.INFO)
+_file_handler.setFormatter(_LOG_FORMATTER)
+_file_handler.name = "enemy_bot_file"
+
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.INFO)
+
+if not any(
+    getattr(handler, "name", None) == "enemy_bot_file"
+    for handler in _root_logger.handlers
+):
+    _root_logger.addHandler(_file_handler)
+
+
+# Отдельный logger для перехваченных print().
+# propagate=False нужен, чтобы print не записывался в файл дважды.
+_print_logger = logging.getLogger("enemy_bot.print")
+_print_logger.setLevel(logging.INFO)
+_print_logger.propagate = False
+
+if not any(
+    handler is _file_handler
+    for handler in _print_logger.handlers
+):
+    _print_logger.addHandler(_file_handler)
+
 _original_print = print  # сохраняем оригинальный print ДО подмены
 
 # ============== SYSTEMD WATCHDOG ==============
 
 _systemd_watchdog_task = None
+
+_discord_connection_watchdog_task = None
+_discord_disconnected_at = None
+
+DISCORD_CONNECTION_CHECK_INTERVAL = 30
+DISCORD_CONNECTION_TIMEOUT = 5 * 60
 
 
 def _systemd_notify(message: str) -> bool:
@@ -106,6 +163,49 @@ async def _systemd_watchdog_loop():
             "STATUS=Enemy bot event loop is alive."
         )
 
+async def _discord_connection_watchdog_loop():
+    """
+    Следит именно за длительной потерей Discord Gateway.
+
+    Кратковременный DNS/сетевой сбой не вызывает restart:
+    discord.py получает возможность самостоятельно восстановить соединение.
+
+    Если после полного запуска бота соединение отсутствует непрерывно
+    5 минут, процесс завершается через SIGTERM, после чего systemd
+    выполняет Restart=on-failure.
+    """
+    logger = logging.getLogger("enemy_bot.discord_watchdog")
+
+    while True:
+        await asyncio.sleep(DISCORD_CONNECTION_CHECK_INTERVAL)
+
+        if client.is_closed():
+            return
+
+        if not _bot_fully_initialized:
+            continue
+
+        if _discord_disconnected_at is None:
+            continue
+
+        disconnected_for = time.monotonic() - _discord_disconnected_at
+
+        if disconnected_for < DISCORD_CONNECTION_TIMEOUT:
+            continue
+
+        logger.error(
+            "Discord Gateway отсутствует уже %.0f секунд. "
+            "Перезапускаю процесс через systemd.",
+            disconnected_for
+        )
+
+        _systemd_notify(
+            "STATUS=Discord Gateway unavailable for 5 minutes; restarting."
+        )
+
+        os.kill(os.getpid(), signal.SIGTERM)
+        return
+
 _log_forward_buffer = _deque_early(maxlen=2000)
 _log_forward_lock = _threading_early.Lock()
 
@@ -116,13 +216,24 @@ def _enqueue_log_line(line: str):
 
 
 def print(*args, **kwargs):
-    """Подменённый print(): работает как обычно + дублирует строку в очередь
-    на пересылку в Discord-ветку (см. flush_log_buffer_to_discord)."""
+    """Подменённый print(): обычный вывод + Discord log buffer + file log."""
     sep = kwargs.get('sep', ' ')
+
     try:
-        _enqueue_log_line(sep.join(str(a) for a in args))
+        line = sep.join(str(a) for a in args)
+    except Exception:
+        line = "<failed to format print arguments>"
+
+    try:
+        _enqueue_log_line(line)
     except Exception:
         pass
+
+    try:
+        _print_logger.info(line)
+    except Exception:
+        pass
+
     _original_print(*args, **kwargs)
 
 
@@ -7301,8 +7412,28 @@ async def on_ready():
     # после print — чтобы не ждать планового цикла раз в 15 секунд, и лог
     # о готовности бота появился в Discord-ветке немедленно.
     _bot_fully_initialized = True
-    print(f"✅ Бот полностью загружен и готов к работе (PID {os.getpid()}).")
     
+    print(
+        f"✅ Бот полностью загружен и готов к работе (PID {os.getpid()})."
+    )
+    
+    global _discord_connection_watchdog_task
+    
+    if (
+        _discord_connection_watchdog_task is None
+        or _discord_connection_watchdog_task.done()
+    ):
+        _discord_connection_watchdog_task = asyncio.create_task(
+            _discord_connection_watchdog_loop(),
+            name="discord-connection-watchdog"
+        )
+    
+    logging.getLogger("enemy_bot.discord_watchdog").info(
+        "Discord connectivity watchdog started: timeout=%ss, check_interval=%ss",
+        DISCORD_CONNECTION_TIMEOUT,
+        DISCORD_CONNECTION_CHECK_INTERVAL
+    )
+
     global _systemd_watchdog_task
     
     if (
@@ -7319,8 +7450,41 @@ async def on_ready():
     except Exception:
         pass
 
+@client.event
+async def on_connect():
+    global _discord_disconnected_at
+
+    _discord_disconnected_at = None
+
+    logging.getLogger("enemy_bot.discord").info(
+        "Discord Gateway connected."
+    )
 
 
+@client.event
+async def on_resumed():
+    global _discord_disconnected_at
+
+    _discord_disconnected_at = None
+
+    logging.getLogger("enemy_bot.discord").info(
+        "Discord Gateway session successfully resumed."
+    )
+
+
+@client.event
+async def on_disconnect():
+    global _discord_disconnected_at
+
+    if not _bot_fully_initialized:
+        return
+
+    if _discord_disconnected_at is None:
+        _discord_disconnected_at = time.monotonic()
+
+        logging.getLogger("enemy_bot.discord").warning(
+            "Discord Gateway connection lost. Starting 5-minute watchdog timer."
+        )
 
 @client.event
 async def on_message(message):
