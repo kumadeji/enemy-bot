@@ -570,10 +570,10 @@ SHEET_NAME = 'Основная таблица'
 
 COLUMNS_TO_CHECK = [
     'Discord клана (с клантегом)', 'Discord ECHO (с клантегом)',
-    'Discord AS VDV (с клантегом)', 'Discord TT (с клантегом)',
+    'Discord AS VDV (с клантегом)', 'Discord Triad Tactics (с клантегом)',
     'Steam (с клантегом)', 'Steam (в друзьях у BURBON?)',
     'Сайт клана (без клантега)', 'Сайт ECHO (без клантега)',
-    'Сайт AS VDV (без клантега)', 'Сайт TT (без клантега)'
+    'Сайт AS VDV (без клантега)', 'Сайт Triad Tactics (без клантега)'
 ]
 
 EXPECTED_INTRO_MAX_LEN = 700
