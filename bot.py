@@ -2183,7 +2183,7 @@ class AdminVacationModal(discord.ui.Modal, title=es("🏖️ Отпуск для
     async def on_submit(self, interaction):
         await handle_vacation_request(interaction, self.player_name.value, self.start_date.value, self.end_date.value, self.reason.value, by_admin=True)
 
-class SendEmbedModal(discord.ui.Modal, title=es("📦 Отправка JSON Embed сообщения")):
+class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embed сообщения")):
 
     channel_id = discord.ui.TextInput(
         label="ID канала или ветки",
