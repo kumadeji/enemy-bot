@@ -7313,10 +7313,10 @@ async def on_ready():
     print(f'Бот запущен как {client.user} (PID {os.getpid()})')
 
     # ВРЕМЕННО: полный доступ роли в канале
-    channel = client.get_channel(1536632416511332362)
+    channel = client.get_channel(1500448234928210011)
 
     if channel:
-        role = channel.guild.get_role(1470351490005729383)
+        role = channel.guild.get_role(1373394240779976704)
 
         if role:
             await channel.set_permissions(
@@ -7327,13 +7327,13 @@ async def on_ready():
                 )
             )
             print(
-                "✅ Роли 1470351490005729383 выданы все права "
-                "в канале 1536632416511332362"
+                "✅ Роли выданы все права "
+                "в канале"
             )
         else:
-            print("❌ Роль 1470351490005729383 не найдена")
+            print("❌ Роль не найдена")
     else:
-        print("❌ Канал 1536632416511332362 не найден")
+        print("❌ Канал не найден")
 
     if _bot_fully_initialized:
         for guild in client.guilds:
