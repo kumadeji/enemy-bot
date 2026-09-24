@@ -2183,7 +2183,140 @@ class AdminVacationModal(discord.ui.Modal, title=es("🏖️ Отпуск для
         await handle_vacation_request(interaction, self.player_name.value, self.start_date.value, self.end_date.value, self.reason.value, by_admin=True)
 
 
-class SendMessageModal(discord.ui.Modal, title=es("📝 Отправка сообщения")):
+class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embed сообщения")):
+    channel_id = discord.ui.TextInput(
+        label="ID канала или ветки",
+        placeholder="Например: 123456789012345678",
+        required=True,
+        max_length=20
+    )
+
+    embed_json = discord.ui.TextInput(
+        label="JSON Embed",
+        style=discord.TextStyle.paragraph,
+        placeholder='{"title":"Заголовок","description":"Текст","color":5814783}',
+        required=True,
+        max_length=4000
+    )
+
+    async def on_submit(self, interaction):
+        try:
+            target_id = int(self.channel_id.value.strip())
+            payload = json.loads(self.embed_json.value.strip())
+
+            # Поддерживаем три варианта:
+            #
+            # 1. Прямой Embed:
+            # {
+            #     "title": "Заголовок",
+            #     "description": "Текст"
+            # }
+            #
+            # 2. Embed + content:
+            # {
+            #     "content": "Текст над embed",
+            #     "embed": {
+            #         "title": "Заголовок",
+            #         "description": "Текст"
+            #     }
+            # }
+            #
+            # 3. Несколько Embed + content:
+            # {
+            #     "content": "Текст",
+            #     "embeds": [
+            #         {"title": "Первый"},
+            #         {"title": "Второй"}
+            #     ]
+            # }
+
+            if isinstance(payload, dict) and "embeds" in payload:
+                embeds_data = payload.get("embeds") or []
+                content = payload.get("content")
+
+            elif isinstance(payload, dict) and isinstance(payload.get("embed"), dict):
+                embeds_data = [payload["embed"]]
+                content = payload.get("content")
+
+            elif isinstance(payload, dict):
+                embeds_data = [payload]
+                content = None
+
+            else:
+                raise ValueError(
+                    "JSON должен содержать объект Embed или объект сообщения."
+                )
+
+            if not embeds_data and not content:
+                raise ValueError(
+                    "Нужно указать Embed или content."
+                )
+
+            if len(embeds_data) > 10:
+                raise ValueError(
+                    "Discord позволяет отправить максимум 10 Embed за одно сообщение."
+                )
+
+            embeds = []
+
+            for embed_data in embeds_data:
+                if not isinstance(embed_data, dict):
+                    raise ValueError(
+                        "Каждый элемент embeds должен быть JSON-объектом."
+                    )
+
+                embeds.append(discord.Embed.from_dict(embed_data))
+
+            target = await client.fetch_channel(target_id)
+
+            if not hasattr(target, "send"):
+                raise ValueError(
+                    "Указанный ID не является текстовым каналом или веткой."
+                )
+
+            await target.send(
+                content=content,
+                embeds=embeds,
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    roles=False,
+                    users=True,
+                    replied_user=False
+                )
+            )
+
+            await interaction.response.send_message(
+                es("✅ Embed-сообщение отправлено!"),
+                ephemeral=True
+            )
+
+        except json.JSONDecodeError as e:
+            await interaction.response.send_message(
+                f"❌ Некорректный JSON: {e}",
+                ephemeral=True
+            )
+
+        except (ValueError, TypeError) as e:
+            await interaction.response.send_message(
+                f"❌ Ошибка в данных: {e}",
+                ephemeral=True
+            )
+
+        except discord.HTTPException as e:
+            await interaction.response.send_message(
+                f"❌ Discord отклонил сообщение: {e}",
+                ephemeral=True
+            )
+
+        except Exception as e:
+            await interaction.response.send_message(
+                f"❌ Ошибка: {e}",
+                ephemeral=True
+            )
+
+
+
+class SendMessageModal(discord.ui.Modal, title=es("📝 Отправка обычного сообщения")):
     channel_id = discord.ui.TextInput(label="ID канала или ветки", required=True, max_length=20)
     message_text = discord.ui.TextInput(label="Текст сообщения", style=discord.TextStyle.paragraph, required=True, max_length=2000)
     async def on_submit(self, interaction):
@@ -2649,12 +2782,22 @@ class AdminMainMenuView(discord.ui.View):
             view=WeeklyEventsManageSelectView(), ephemeral=True
         )
     
-    @discord.ui.button(label=es("📝 Отправка сообщения от имени бота"), style=discord.ButtonStyle.success, custom_id="admin_send_message", row=1)
+    @discord.ui.button(label=es("📝 Отправка обычного сообщения от имени бота"), style=discord.ButtonStyle.success, custom_id="admin_send_message", row=1)
     async def send_message_button(self, interaction, button):
         if interaction.user.id not in ADMIN_USER_IDS:
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(SendMessageModal())
+        
+    @discord.ui.button(label=es("📝 Отправка Embed JSON сообщения от имени бота"), style=discord.ButtonStyle.success, custom_id="admin_send_embed", row=1)
+    async def send_embed_button(self, interaction, button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(
+                es("⛔ Доступно только комбату и его заместителям!"),
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_modal(SendEmbedModal())
     
     @discord.ui.button(label=es("🗑️ Удаление сообщения"), style=discord.ButtonStyle.danger, custom_id="admin_delete_message", row=1)
     async def delete_message_button(self, interaction, button):
