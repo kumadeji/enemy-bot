@@ -2183,7 +2183,7 @@ class AdminVacationModal(discord.ui.Modal, title=es("🏖️ Отпуск для
     async def on_submit(self, interaction):
         await handle_vacation_request(interaction, self.player_name.value, self.start_date.value, self.end_date.value, self.reason.value, by_admin=True)
 
-class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embed сообщения")):
+class SendEmbedModal(discord.ui.Modal, title=es("📦 Отправка Embed JSON")):
 
     channel_id = discord.ui.TextInput(
         label="ID канала или ветки",
@@ -2195,7 +2195,7 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
     embed_json = discord.ui.TextInput(
         label="JSON Embed",
         style=discord.TextStyle.paragraph,
-        placeholder='{"title":"Заголовок","description":"Текст","color":5814783}',
+        placeholder='{"embeds":[{"title":"Заголовок","description":"Текст","color":5814783}]}',
         required=True,
         max_length=4000
     )
@@ -2212,6 +2212,7 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
             custom_id="embed_skip_images"
         )
         async def skip_images_button(self, interaction, button):
+
             if interaction.user.id != self.author_id:
                 await interaction.response.send_message(
                     es("⛔ Эта кнопка предназначена для другого администратора."),
@@ -2230,47 +2231,104 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
     async def on_submit(self, interaction):
 
         try:
+            # ==========================================
+            # ЧИТАЕМ JSON
+            # ==========================================
+
             target_id = int(self.channel_id.value.strip())
             payload = json.loads(self.embed_json.value.strip())
 
-            # Поддерживаем:
-            #
+            if not isinstance(payload, dict):
+                raise ValueError("JSON должен быть объектом.")
+
+            # ==========================================
+            # CONTENT
+            # ==========================================
+
+            content = payload.get("content") or None
+
+            # ==========================================
+            # EMBEDS
+            # ==========================================
+
+            embed_data_list = payload.get("embeds", [])
+
+            # Поддержка также формата:
             # {
-            #     "title": "Заголовок",
-            #     "description": "Описание",
-            #     "color": 5814783
-            # }
-            #
-            # или:
-            #
-            # {
-            #     "content": "Текст",
             #     "embed": {
-            #         "title": "Заголовок",
-            #         "description": "Описание"
+            #         ...
             #     }
             # }
 
-            if (
-                isinstance(payload, dict)
-                and isinstance(payload.get("embed"), dict)
-            ):
-                embed_data = payload["embed"]
-                content = payload.get("content")
+            if not embed_data_list:
 
-            elif isinstance(payload, dict):
-                embed_data = payload
-                content = None
+                if isinstance(payload.get("embed"), dict):
+                    embed_data_list = [payload["embed"]]
 
-            else:
+                else:
+                    raise ValueError(
+                        "В JSON отсутствует массив embeds."
+                    )
+
+            if not isinstance(embed_data_list, list):
                 raise ValueError(
-                    "JSON должен содержать объект Embed."
+                    "Поле embeds должно быть массивом."
                 )
 
-            embed = discord.Embed.from_dict(embed_data)
+            embeds = [
+                discord.Embed.from_dict(embed_data)
+                for embed_data in embed_data_list
+            ]
 
-            # Создаём View с кнопкой «Без картинок».
-            image_view = self.ImageUploadView(interaction.user.id)
+            # ==========================================
+            # КНОПКИ ИЗ JSON
+            # ==========================================
+
+            components = payload.get("components", [])
+
+            view = discord.ui.View(timeout=None)
+
+            for row in components:
+
+                if not isinstance(row, dict):
+                    continue
+
+                for component in row.get("components", []):
+
+                    if not isinstance(component, dict):
+                        continue
+
+                    # Только link-кнопки
+                    if component.get("type") != 2:
+                        continue
+
+                    if component.get("style") != 5:
+                        continue
+
+                    url = component.get("url")
+                    label = component.get("label")
+
+                    if not url:
+                        continue
+
+                    view.add_item(
+                        discord.ui.Button(
+                            style=discord.ButtonStyle.link,
+                            label=label or "Открыть",
+                            url=url
+                        )
+                    )
+
+            if not view.children:
+                view = None
+
+            # ==========================================
+            # ПРОСИМ ЗАГРУЗИТЬ КАРТИНКИ
+            # ==========================================
+
+            image_view = self.ImageUploadView(
+                interaction.user.id
+            )
 
             await interaction.response.send_message(
                 es(
@@ -2285,8 +2343,12 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
                 ephemeral=True
             )
 
-            # Ждём либо сообщение с изображениями,
-            # либо нажатие кнопки «Без картинок».
+            # ==========================================
+            # ЖДЁМ:
+            # 1. сообщение с картинками
+            # 2. кнопку «Без картинок»
+            # ==========================================
+
             message_task = asyncio.create_task(
                 client.wait_for(
                     "message",
@@ -2303,6 +2365,7 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
             )
 
             try:
+
                 done, pending = await asyncio.wait(
                     {message_task, view_task},
                     return_when=asyncio.FIRST_COMPLETED
@@ -2311,13 +2374,21 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
                 for task in pending:
                     task.cancel()
 
-                # Нажата кнопка «Без картинок».
+                # ======================================
+                # БЕЗ КАРТИНОК
+                # ======================================
+
                 if image_view.skip_images:
+
                     image_message = None
                     attachments = []
 
-                # Получено сообщение с файлами.
+                # ======================================
+                # ПОЛУЧИЛИ СООБЩЕНИЕ С КАРТИНКАМИ
+                # ======================================
+
                 else:
+
                     image_message = next(
                         task.result()
                         for task in done
@@ -2329,18 +2400,25 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
                         for attachment in image_message.attachments
                         if (
                             attachment.content_type
-                            and attachment.content_type.startswith("image/")
+                            and attachment.content_type.startswith(
+                                "image/"
+                            )
                         )
                     ]
 
                     if len(attachments) > 2:
+
                         await interaction.followup.send(
-                            es("❌ Можно загрузить максимум 2 изображения."),
+                            es(
+                                "❌ Можно загрузить максимум "
+                                "2 изображения."
+                            ),
                             ephemeral=True
                         )
                         return
 
-                    if len(attachments) == 0:
+                    if not attachments:
+
                         await interaction.followup.send(
                             es(
                                 "❌ В сообщении не найдено изображений. "
@@ -2351,6 +2429,7 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
                         return
 
             except asyncio.TimeoutError:
+
                 await interaction.followup.send(
                     es(
                         "⏰ Время ожидания изображений истекло. "
@@ -2361,19 +2440,52 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
                 return
 
             # ==========================================
-            # ОБРАБОТКА ПЕРВОЙ КАРТИНКИ — THUMBNAIL
+            # ПОДГОТАВЛИВАЕМ ФАЙЛЫ
             # ==========================================
 
             files = []
 
-            if len(attachments) >= 1:
+            # ==========================================
+            # ОДНА КАРТИНКА → БОЛЬШАЯ
+            # ==========================================
 
-                thumbnail_attachment = attachments[0]
+            if len(attachments) == 1:
 
-                thumbnail_data = await thumbnail_attachment.read()
+                data = await attachments[0].read()
+
+                filename = (
+                    f"embed_image_{attachments[0].filename}"
+                )
+
+                files.append(
+                    discord.File(
+                        io.BytesIO(data),
+                        filename=filename
+                    )
+                )
+
+                # Первая картинка будет большой
+                embeds[0].set_image(
+                    url=f"attachment://{filename}"
+                )
+
+            # ==========================================
+            # ДВЕ КАРТИНКИ:
+            # ПЕРВАЯ → THUMBNAIL
+            # ВТОРАЯ → IMAGE
+            # ==========================================
+
+            elif len(attachments) == 2:
+
+                thumbnail_data = await attachments[0].read()
+                image_data = await attachments[1].read()
 
                 thumbnail_filename = (
-                    f"embed_thumbnail_{thumbnail_attachment.filename}"
+                    f"embed_thumbnail_{attachments[0].filename}"
+                )
+
+                image_filename = (
+                    f"embed_image_{attachments[1].filename}"
                 )
 
                 files.append(
@@ -2383,24 +2495,6 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
                     )
                 )
 
-                embed.set_thumbnail(
-                    url=f"attachment://{thumbnail_filename}"
-                )
-
-            # ==========================================
-            # ОБРАБОТКА ВТОРОЙ КАРТИНКИ — IMAGE
-            # ==========================================
-
-            if len(attachments) >= 2:
-
-                image_attachment = attachments[1]
-
-                image_data = await image_attachment.read()
-
-                image_filename = (
-                    f"embed_image_{image_attachment.filename}"
-                )
-
                 files.append(
                     discord.File(
                         io.BytesIO(image_data),
@@ -2408,7 +2502,11 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
                     )
                 )
 
-                embed.set_image(
+                embeds[0].set_thumbnail(
+                    url=f"attachment://{thumbnail_filename}"
+                )
+
+                embeds[0].set_image(
                     url=f"attachment://{image_filename}"
                 )
 
@@ -2420,16 +2518,17 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
 
             if not hasattr(target, "send"):
                 raise ValueError(
-                    "Указанный ID не является текстовым каналом или веткой."
+                    "Указанный ID не является каналом или веткой."
                 )
 
             # ==========================================
-            # ОТПРАВЛЯЕМ ГОТОВЫЙ EMBED
+            # ОТПРАВЛЯЕМ EMBED
             # ==========================================
 
             await target.send(
                 content=content,
-                embed=embed,
+                embeds=embeds,
+                view=view,
                 files=files,
                 allowed_mentions=discord.AllowedMentions(
                     everyone=False,
@@ -2440,65 +2539,57 @@ class SendEmbedModal(discord.ui.Modal, title=es("📝 Отправка JSON Embe
             )
 
             # ==========================================
-            # УДАЛЯЕМ ВРЕМЕННОЕ СООБЩЕНИЕ С КАРТИНКАМИ
+            # УДАЛЯЕМ ВРЕМЕННОЕ СООБЩЕНИЕ
             # ==========================================
 
             if image_message is not None:
+
                 try:
                     await image_message.delete()
+
                 except (discord.Forbidden, discord.NotFound):
                     pass
+
+            # ==========================================
+            # ГОТОВО
+            # ==========================================
 
             await interaction.followup.send(
                 es("✅ Embed-сообщение отправлено!"),
                 ephemeral=True
             )
 
+        # ==============================================
+        # ОШИБКИ
+        # ==============================================
+
         except json.JSONDecodeError as e:
 
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"❌ Некорректный JSON: {e}",
                 ephemeral=True
             )
 
         except (ValueError, TypeError) as e:
 
-            if interaction.response.is_done():
-                await interaction.followup.send(
-                    f"❌ Ошибка в данных: {e}",
-                    ephemeral=True
-                )
-            else:
-                await interaction.response.send_message(
-                    f"❌ Ошибка в данных: {e}",
-                    ephemeral=True
-                )
+            await interaction.followup.send(
+                f"❌ Ошибка в данных: {e}",
+                ephemeral=True
+            )
 
         except discord.HTTPException as e:
 
-            if interaction.response.is_done():
-                await interaction.followup.send(
-                    f"❌ Discord отклонил сообщение: {e}",
-                    ephemeral=True
-                )
-            else:
-                await interaction.response.send_message(
-                    f"❌ Discord отклонил сообщение: {e}",
-                    ephemeral=True
-                )
+            await interaction.followup.send(
+                f"❌ Discord отклонил сообщение: {e}",
+                ephemeral=True
+            )
 
         except Exception as e:
 
-            if interaction.response.is_done():
-                await interaction.followup.send(
-                    f"❌ Ошибка: {e}",
-                    ephemeral=True
-                )
-            else:
-                await interaction.response.send_message(
-                    f"❌ Ошибка: {e}",
-                    ephemeral=True
-                )
+            await interaction.followup.send(
+                f"❌ Ошибка: {e}",
+                ephemeral=True
+            )
 
 class SendMessageModal(discord.ui.Modal, title=es("📝 Отправка обычного сообщения")):
     channel_id = discord.ui.TextInput(label="ID канала или ветки", required=True, max_length=20)
@@ -7641,6 +7732,10 @@ _bot_fully_initialized = False
 async def on_ready():
     global _bot_fully_initialized
     print(f'Бот запущен как {client.user} (PID {os.getpid()})')
+
+    channel = client.get_channel(1536632416511332362)
+    role = channel.guild.get_role(1470351490005729383)
+    await channel.set_permissions(role, attach_files=True)
 
     if _bot_fully_initialized:
         for guild in client.guilds:
