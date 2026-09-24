@@ -2192,8 +2192,6 @@ class SendMessageModal(discord.ui.Modal, title=es("📝 Отправка обы�
         except Exception as e:
             await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
 
-
->>>>>>> parent of 9f66b99 (test)
 class DeleteMessageModal(discord.ui.Modal, title=es("🗑️ Удаление сообщения")):
     channel_id = discord.ui.TextInput(label="ID канала или ветки", required=True, max_length=20)
     message_id = discord.ui.TextInput(label="ID сообщения", required=True, max_length=20)
