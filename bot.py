@@ -370,7 +370,6 @@ import gspread
 
 import re
 import json
-import io
 import uuid
 import copy
 import threading
@@ -2183,6 +2182,19 @@ class AdminVacationModal(discord.ui.Modal, title=es("🏖️ Отпуск для
     async def on_submit(self, interaction):
         await handle_vacation_request(interaction, self.player_name.value, self.start_date.value, self.end_date.value, self.reason.value, by_admin=True)
 
+class SendMessageModal(discord.ui.Modal, title=es("📝 Отправка обычного сообщения")):
+    channel_id = discord.ui.TextInput(label="ID канала или ветки", required=True, max_length=20)
+    message_text = discord.ui.TextInput(label="Текст сообщения", style=discord.TextStyle.paragraph, required=True, max_length=2000)
+    async def on_submit(self, interaction):
+        try:
+            channel = await client.fetch_channel(int(self.channel_id.value))
+            await channel.send(self.message_text.value)
+            await interaction.response.send_message(es("✅ Сообщение отправлено!"), ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+
+
+>>>>>>> parent of 9f66b99 (test)
 class DeleteMessageModal(discord.ui.Modal, title=es("🗑️ Удаление сообщения")):
     channel_id = discord.ui.TextInput(label="ID канала или ветки", required=True, max_length=20)
     message_id = discord.ui.TextInput(label="ID сообщения", required=True, max_length=20)
@@ -2643,16 +2655,6 @@ class AdminMainMenuView(discord.ui.View):
             await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
             return
         await interaction.response.send_modal(SendMessageModal())
-        
-    @discord.ui.button(label=es("📝 Отправка Embed сообщения от имени бота"), style=discord.ButtonStyle.success, custom_id="admin_send_embed", row=1)
-    async def send_embed_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(
-                es("⛔ Доступно только комбату и его заместителям!"),
-                ephemeral=True
-            )
-            return
-        await interaction.response.send_modal(SendEmbedModal())
     
     @discord.ui.button(label=es("🗑️ Удаление сообщения"), style=discord.ButtonStyle.danger, custom_id="admin_delete_message", row=1)
     async def delete_message_button(self, interaction, button):
