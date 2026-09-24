@@ -3584,6 +3584,12 @@ class SendEmbedModal(
         image_message = None
         json_message = None
 
+        # Всегда инициализируем список вложений.
+        # При JSON, введённом прямо в модалке, ветка с .json-файлом
+        # не выполняется, поэтому без этой строки переменная
+        # uploaded_attachments остаётся не определена.
+        uploaded_attachments = []
+
         try:
             # ==================================================
             # 1. CHANNEL
