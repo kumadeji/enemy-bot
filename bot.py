@@ -2196,12 +2196,17 @@ class SendEmbedModal(
     embed_json = discord.ui.TextInput(
         label="JSON Embed / Components V2",
         style=discord.TextStyle.paragraph,
-        required=True,
+        required=False,
         max_length=4000,
+        placeholder=(
+            "Вставьте JSON до 4000 символов. "
+            "Для более длинного JSON прикрепите .json файл "
+            "после отправки формы."
+        ),
     )
 
     # ==========================================================
-    # ОКНО ОЖИДАНИЯ КАРТИНОК
+    # VIEW ДЛЯ КАРТИНОК
     # ==========================================================
 
     class ImageUploadView(discord.ui.View):
@@ -2239,7 +2244,17 @@ class SendEmbedModal(
             self.stop()
 
     # ==========================================================
-    # ОПРЕДЕЛЕНИЕ COMPONENTS V2
+    # VIEW ДЛЯ ЗАГРУЗКИ ДЛИННОГО JSON
+    # ==========================================================
+
+    class JsonUploadView(discord.ui.View):
+        def __init__(self, owner_id):
+            super().__init__(timeout=120)
+
+            self.owner_id = owner_id
+
+    # ==========================================================
+    # ОПРЕДЕЛЯЕМ COMPONENTS V2
     # ==========================================================
 
     @staticmethod
@@ -2249,7 +2264,7 @@ class SendEmbedModal(
         if not isinstance(components, list):
             return False
 
-        def check(items):
+        def walk(items):
             if not isinstance(items, list):
                 return False
 
@@ -2260,18 +2275,139 @@ class SendEmbedModal(
                 if component.get("type") in {
                     9,   # Section
                     10,  # Text Display
+                    11,  # Thumbnail
                     12,  # Media Gallery
                     14,  # Separator
                     17,  # Container
                 }:
                     return True
 
-                if check(component.get("components")):
+                if walk(component.get("components")):
                     return True
 
             return False
 
-        return check(components)
+        return walk(components)
+
+    # ==========================================================
+    # ПРОВЕРЯЕМ, ЕСТЬ ЛИ УЖЕ КАРТИНКИ В JSON
+    # ==========================================================
+
+    @staticmethod
+    def has_images_in_json(data):
+        """
+        Возвращает True, если JSON уже содержит картинку.
+
+        Поддерживается:
+            Components V2:
+                type 11 = Thumbnail
+                type 12 = Media Gallery
+                type 13 = Media Gallery Item
+
+            Обычный Embed:
+                image.url
+                thumbnail.url
+
+            Также проверяется media.url.
+        """
+
+        def valid_url(value):
+            return (
+                isinstance(value, str)
+                and value.strip()
+            )
+
+        def walk(obj):
+            if isinstance(obj, list):
+                for item in obj:
+                    if walk(item):
+                        return True
+
+                return False
+
+            if not isinstance(obj, dict):
+                return False
+
+            component_type = obj.get("type")
+
+            # --------------------------------------------------
+            # Components V2 Thumbnail / Media Gallery
+            # --------------------------------------------------
+
+            if component_type in {11, 12, 13}:
+                media = obj.get("media")
+
+                if isinstance(media, dict):
+                    if valid_url(media.get("url")):
+                        return True
+
+                if component_type == 12:
+                    if walk(obj.get("items", [])):
+                        return True
+
+            # --------------------------------------------------
+            # Обычный Embed image
+            # --------------------------------------------------
+
+            image = obj.get("image")
+
+            if isinstance(image, dict):
+                if valid_url(image.get("url")):
+                    return True
+
+            # --------------------------------------------------
+            # Обычный Embed thumbnail
+            # --------------------------------------------------
+
+            thumbnail = obj.get("thumbnail")
+
+            if isinstance(thumbnail, dict):
+                if valid_url(thumbnail.get("url")):
+                    return True
+
+            # --------------------------------------------------
+            # Произвольный media
+            # --------------------------------------------------
+
+            media = obj.get("media")
+
+            if isinstance(media, dict):
+                if valid_url(media.get("url")):
+                    return True
+
+            # --------------------------------------------------
+            # Рекурсивный поиск
+            # --------------------------------------------------
+
+            for value in obj.values():
+                if isinstance(value, (dict, list)):
+                    if walk(value):
+                        return True
+
+            return False
+
+        return walk(data)
+
+    # ==========================================================
+    # ПРОВЕРЯЕМ, ЧТО ВОТ ЭТО JSON-ФАЙЛ
+    # ==========================================================
+
+    @staticmethod
+    def is_json_attachment(attachment):
+        filename = (
+            attachment.filename
+            or ""
+        ).lower()
+
+        content_type = (
+            attachment.content_type
+            or ""
+        ).lower()
+
+        return (
+            filename.endswith(".json")
+            or content_type == "application/json"
+        )
 
     # ==========================================================
     # КНОПКА-СCЫЛКА
@@ -2279,29 +2415,52 @@ class SendEmbedModal(
 
     @staticmethod
     def build_link_button(data):
-        if not isinstance(data, dict):
+        if not isinstance(
+            data,
+            dict,
+        ):
             return None
 
         if data.get("type") != 2:
             return None
 
-        if not data.get("url"):
+        url = data.get("url")
+
+        if not url:
             return None
 
         kwargs = {
             "style": discord.ButtonStyle.link,
-            "url": data["url"],
-            "label": data.get("label"),
-            "disabled": data.get("disabled", False),
+            "url": url,
+            "disabled": data.get(
+                "disabled",
+                False,
+            ),
         }
+
+        label = data.get("label")
+
+        if label:
+            kwargs["label"] = label
+
+        component_id = data.get("id")
+
+        if component_id is not None:
+            kwargs["id"] = component_id
 
         emoji = data.get("emoji")
 
         if emoji:
-            if isinstance(emoji, str):
+            if isinstance(
+                emoji,
+                str,
+            ):
                 kwargs["emoji"] = emoji
 
-            elif isinstance(emoji, dict):
+            elif isinstance(
+                emoji,
+                dict,
+            ):
                 emoji_id = emoji.get("id")
                 emoji_name = emoji.get("name")
 
@@ -2310,29 +2469,48 @@ class SendEmbedModal(
                         name=emoji_name,
                         id=int(emoji_id),
                     )
+
                 elif emoji_name:
                     kwargs["emoji"] = emoji_name
 
-        return discord.ui.Button(**kwargs)
+        return discord.ui.Button(
+            **kwargs
+        )
 
     # ==========================================================
     # ПОСТРОЕНИЕ COMPONENTS V2
     # ==========================================================
 
     @classmethod
-    def build_v2_component(cls, data):
-        if not isinstance(data, dict):
+    def build_v2_component(
+        cls,
+        data,
+    ):
+        if not isinstance(
+            data,
+            dict,
+        ):
             return None
 
         component_type = data.get("type")
+        component_id = data.get("id")
 
         # ------------------------------------------------------
         # TYPE 10 — TEXT DISPLAY
         # ------------------------------------------------------
 
         if component_type == 10:
+            kwargs = {}
+
+            if component_id is not None:
+                kwargs["id"] = component_id
+
             return discord.ui.TextDisplay(
-                data.get("content", "")
+                data.get(
+                    "content",
+                    "",
+                ),
+                **kwargs,
             )
 
         # ------------------------------------------------------
@@ -2342,60 +2520,69 @@ class SendEmbedModal(
         if component_type == 14:
             spacing = (
                 discord.SeparatorSpacing.large
-                if data.get("spacing", 1) == 2
+                if data.get(
+                    "spacing",
+                    1,
+                ) == 2
                 else discord.SeparatorSpacing.small
             )
 
-            return discord.ui.Separator(
-                visible=data.get(
+            kwargs = {
+                "visible": data.get(
                     "divider",
                     True,
                 ),
-                spacing=spacing,
+                "spacing": spacing,
+            }
+
+            if component_id is not None:
+                kwargs["id"] = component_id
+
+            return discord.ui.Separator(
+                **kwargs
             )
 
         # ------------------------------------------------------
-        # TYPE 2 — BUTTON
+        # TYPE 11 — THUMBNAIL
         # ------------------------------------------------------
 
-        if component_type == 2:
-            return cls.build_link_button(data)
+        if component_type == 11:
+            media = data.get(
+                "media",
+                {},
+            )
 
-        # ------------------------------------------------------
-        # TYPE 9 — SECTION
-        # ------------------------------------------------------
-
-        if component_type == 9:
-            children = []
-
-            for child_data in data.get(
-                "components",
-                [],
+            if not isinstance(
+                media,
+                dict,
             ):
-                child = cls.build_v2_component(
-                    child_data
-                )
+                return None
 
-                if child is not None:
-                    children.append(child)
+            url = media.get("url")
 
-            accessory_data = data.get("accessory")
-            accessory = None
+            if not url:
+                return None
 
-            if accessory_data:
-                accessory = cls.build_link_button(
-                    accessory_data
-                )
+            kwargs = {}
 
-            if accessory is None:
-                raise ValueError(
-                    "Section type=9 без поддерживаемой "
-                    "кнопки accessory."
-                )
+            description = data.get(
+                "description"
+            )
 
-            return discord.ui.Section(
-                *children,
-                accessory=accessory,
+            if description is not None:
+                kwargs["description"] = description
+
+            kwargs["spoiler"] = data.get(
+                "spoiler",
+                False,
+            )
+
+            if component_id is not None:
+                kwargs["id"] = component_id
+
+            return discord.ui.Thumbnail(
+                url,
+                **kwargs,
             )
 
         # ------------------------------------------------------
@@ -2403,7 +2590,14 @@ class SendEmbedModal(
         # ------------------------------------------------------
 
         if component_type == 12:
-            gallery = discord.ui.MediaGallery()
+            kwargs = {}
+
+            if component_id is not None:
+                kwargs["id"] = component_id
+
+            gallery = discord.ui.MediaGallery(
+                **kwargs
+            )
 
             for item_data in data.get(
                 "items",
@@ -2428,12 +2622,102 @@ class SendEmbedModal(
 
                 url = media.get("url")
 
-                if url:
-                    gallery.add_item(
-                        media=url
-                    )
+                if not url:
+                    continue
+
+                description = item_data.get(
+                    "description"
+                )
+
+                spoiler = item_data.get(
+                    "spoiler",
+                    False,
+                )
+
+                gallery.add_item(
+                    media=url,
+                    description=description,
+                    spoiler=spoiler,
+                )
 
             return gallery
+
+        # ------------------------------------------------------
+        # TYPE 2 — LINK BUTTON
+        # ------------------------------------------------------
+
+        if component_type == 2:
+            return cls.build_link_button(
+                data
+            )
+
+        # ------------------------------------------------------
+        # TYPE 9 — SECTION
+        # ------------------------------------------------------
+
+        if component_type == 9:
+            children = []
+
+            for child_data in data.get(
+                "components",
+                [],
+            ):
+                child = cls.build_v2_component(
+                    child_data
+                )
+
+                if child is not None:
+                    children.append(
+                        child
+                    )
+
+            accessory_data = data.get(
+                "accessory"
+            )
+
+            accessory = None
+
+            if isinstance(
+                accessory_data,
+                dict,
+            ):
+                accessory_type = (
+                    accessory_data.get(
+                        "type"
+                    )
+                )
+
+                if accessory_type == 2:
+                    accessory = (
+                        cls.build_link_button(
+                            accessory_data
+                        )
+                    )
+
+                elif accessory_type == 11:
+                    accessory = (
+                        cls.build_v2_component(
+                            accessory_data
+                        )
+                    )
+
+            if accessory is None:
+                raise ValueError(
+                    "Section не содержит поддерживаемый "
+                    "accessory type=2 или type=11."
+                )
+
+            kwargs = {
+                "accessory": accessory,
+            }
+
+            if component_id is not None:
+                kwargs["id"] = component_id
+
+            return discord.ui.Section(
+                *children,
+                **kwargs,
+            )
 
         # ------------------------------------------------------
         # TYPE 17 — CONTAINER
@@ -2451,7 +2735,9 @@ class SendEmbedModal(
                 )
 
                 if child is not None:
-                    children.append(child)
+                    children.append(
+                        child
+                    )
 
             kwargs = {
                 "spoiler": data.get(
@@ -2469,6 +2755,9 @@ class SendEmbedModal(
                     accent_color
                 )
 
+            if component_id is not None:
+                kwargs["id"] = component_id
+
             return discord.ui.Container(
                 *children,
                 **kwargs,
@@ -2477,32 +2766,25 @@ class SendEmbedModal(
         return None
 
     # ==========================================================
-    # НАХОДИМ ПЕРВЫЙ CONTAINER
+    # СОЗДАЁМ КАРТИНКУ В THUMBNAIL
     # ==========================================================
 
     @staticmethod
-    def find_container(view):
-        for child in view.children:
-            if isinstance(
-                child,
-                discord.ui.Container,
-            ):
-                return child
-
-        return None
+    def build_uploaded_thumbnail(
+        filename,
+    ):
+        return discord.ui.Thumbnail(
+            f"attachment://{filename}"
+        )
 
     # ==========================================================
-    # ДОБАВЛЯЕМ ЗАГРУЖЕННЫЕ КАРТИНКИ В MEDIA GALLERY
+    # СОЗДАЁМ MEDIA GALLERY ИЗ ЗАГРУЖЕННЫХ ФАЙЛОВ
     # ==========================================================
 
     @staticmethod
-    def add_uploaded_gallery(
-        parent,
+    def build_uploaded_gallery(
         files,
     ):
-        if not files:
-            return
-
         gallery = discord.ui.MediaGallery()
 
         for file_info in files:
@@ -2513,10 +2795,361 @@ class SendEmbedModal(
                 )
             )
 
-        parent.add_item(gallery)
+        return gallery
 
     # ==========================================================
-    # ОЖИДАНИЕ КАРТИНОК ИЛИ НАЖАТИЯ "БЕЗ КАРТИНОК"
+    # ДОБАВЛЯЕМ UPLOADED IMAGES
+    #
+    # 1 картинка:
+    #       большая снизу
+    #
+    # 2 картинки:
+    #       первая = маленькая справа сверху
+    #       вторая = большая снизу
+    # ==========================================================
+
+    @classmethod
+    def add_uploaded_images_to_layout(
+        cls,
+        layout,
+        attachments,
+    ):
+        if not attachments:
+            return
+
+        # ------------------------------------------------------
+        # Переименовываем файлы для attachment://
+        # ------------------------------------------------------
+
+        for index, attachment in enumerate(
+            attachments[:2]
+        ):
+            attachment["send_filename"] = (
+                f"components_v2_{index}_"
+                f"{attachment['filename']}"
+            )
+
+        # ------------------------------------------------------
+        # ДВЕ КАРТИНКИ
+        # ------------------------------------------------------
+
+        if len(attachments) >= 2:
+            thumbnail = cls.build_uploaded_thumbnail(
+                attachments[0]["send_filename"]
+            )
+
+            gallery = cls.build_uploaded_gallery(
+                [attachments[1]]
+            )
+
+            # ==============================================
+            # Пытаемся добавить маленькую картинку
+            # в Section.
+            #
+            # Сначала ищем существующий Section без
+            # accessory. В присланном JSON такие Sections
+            # могут отсутствовать/быть заняты кнопками.
+            # Поэтому при необходимости создаём отдельный
+            # технический Section сверху.
+            # ==============================================
+
+            container = None
+
+            for item in layout.children:
+                if isinstance(
+                    item,
+                    discord.ui.Container,
+                ):
+                    container = item
+                    break
+
+            if container is not None:
+                existing_section = None
+
+                for item in container.walk_children():
+                    if isinstance(
+                        item,
+                        discord.ui.Section,
+                    ):
+                        try:
+                            if item.accessory is None:
+                                existing_section = item
+                                break
+                        except Exception:
+                            pass
+
+                # ------------------------------------------
+                # Если свободного Section нет, создаём
+                # отдельный маленький Section сверху.
+                # ------------------------------------------
+
+                if existing_section is None:
+                    top_section = discord.ui.Section(
+                        "\u200b",
+                        accessory=thumbnail,
+                    )
+
+                    # Container не имеет insert_item_at(),
+                    # поэтому пересобираем его порядок:
+                    old_children = list(
+                        container.children
+                    )
+
+                    container.clear_items()
+
+                    container.add_item(
+                        top_section
+                    )
+
+                    for old_child in old_children:
+                        container.add_item(
+                            old_child
+                        )
+
+                else:
+                    # У Section accessory обычно уже None.
+                    # Если библиотека разрешает прямую замену,
+                    # используем её.
+                    try:
+                        existing_section.accessory = (
+                            thumbnail
+                        )
+                    except Exception:
+                        # Нечего ломать существующую структуру:
+                        # создаём отдельный Section сверху.
+                        top_section = discord.ui.Section(
+                            "\u200b",
+                            accessory=thumbnail,
+                        )
+
+                        old_children = list(
+                            container.children
+                        )
+
+                        container.clear_items()
+
+                        container.add_item(
+                            top_section
+                        )
+
+                        for old_child in old_children:
+                            container.add_item(
+                                old_child
+                            )
+
+                # Вторая картинка добавляется в самый низ
+                # Container.
+                container.add_item(
+                    gallery
+                )
+
+            else:
+                # Нет Container — делаем:
+                #
+                # [thumbnail справа сверху]
+                # [остальные компоненты]
+                # [gallery снизу]
+                #
+                top_section = discord.ui.Section(
+                    "\u200b",
+                    accessory=thumbnail,
+                )
+
+                old_children = list(
+                    layout.children
+                )
+
+                layout.clear_items()
+
+                layout.add_item(
+                    top_section
+                )
+
+                for old_child in old_children:
+                    layout.add_item(
+                        old_child
+                    )
+
+                layout.add_item(
+                    gallery
+                )
+
+            return
+
+        # ------------------------------------------------------
+        # ОДНА КАРТИНКА
+        # ------------------------------------------------------
+
+        gallery = cls.build_uploaded_gallery(
+            [attachments[0]]
+        )
+
+        container = None
+
+        for item in layout.children:
+            if isinstance(
+                item,
+                discord.ui.Container,
+            ):
+                container = item
+                break
+
+        if container is not None:
+            container.add_item(
+                gallery
+            )
+        else:
+            layout.add_item(
+                gallery
+            )
+
+    # ==========================================================
+    # ИЩЕМ ОТКРЫТЫЙ CONTAINER
+    # ==========================================================
+
+    @staticmethod
+    def has_container(
+        layout,
+    ):
+        return any(
+            isinstance(
+                item,
+                discord.ui.Container,
+            )
+            for item in layout.children
+        )
+
+    # ==========================================================
+    # ОЖИДАЕМ JSON ФАЙЛ
+    #
+    # В одном сообщении можно отправить:
+    #
+    #   message.json
+    #   image1.png
+    #   image2.png
+    #
+    # Если JSON уже содержит картинки, image1/image2
+    # игнорируются.
+    # ==========================================================
+
+    async def wait_for_json_file(
+        self,
+        interaction,
+    ):
+        def check(message):
+            if (
+                message.author.id
+                != interaction.user.id
+            ):
+                return False
+
+            if (
+                message.channel.id
+                != interaction.channel.id
+            ):
+                return False
+
+            return any(
+                self.is_json_attachment(
+                    attachment
+                )
+                for attachment in message.attachments
+            )
+
+        try:
+            message = await client.wait_for(
+                "message",
+                timeout=120,
+                check=check,
+            )
+
+        except asyncio.TimeoutError:
+            return None, None, None
+
+        json_attachment = None
+
+        for attachment in message.attachments:
+            if self.is_json_attachment(
+                attachment
+            ):
+                json_attachment = attachment
+                break
+
+        if json_attachment is None:
+            return (
+                message,
+                None,
+                [],
+            )
+
+        raw = await json_attachment.read()
+
+        try:
+            json_text = raw.decode(
+                "utf-8-sig"
+            )
+        except UnicodeDecodeError:
+            raise ValueError(
+                "JSON-файл должен быть сохранён "
+                "в кодировке UTF-8."
+            )
+
+        try:
+            data = json.loads(
+                json_text
+            )
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                "Некорректный JSON-файл:\n"
+                f"{e}"
+            )
+
+        # Все остальные вложения считаем картинками
+        image_attachments = []
+
+        for attachment in message.attachments:
+            if attachment is json_attachment:
+                continue
+
+            content_type = (
+                attachment.content_type
+                or ""
+            ).lower()
+
+            filename = (
+                attachment.filename
+                or ""
+            ).lower()
+
+            is_image = (
+                content_type.startswith(
+                    "image/"
+                )
+                or filename.endswith(
+                    (
+                        ".png",
+                        ".jpg",
+                        ".jpeg",
+                        ".gif",
+                        ".webp",
+                        ".bmp",
+                    )
+                )
+            )
+
+            if is_image:
+                image_attachments.append(
+                    attachment
+                )
+
+        return (
+            message,
+            data,
+            image_attachments[:2],
+        )
+
+    # ==========================================================
+    # ОЖИДАЕМ 1–2 КАРТИНКИ
     # ==========================================================
 
     async def wait_for_images(
@@ -2524,29 +3157,28 @@ class SendEmbedModal(
         interaction,
         upload_view,
     ):
-        def message_check(message):
+        def check(message):
             return (
                 message.author.id
                 == interaction.user.id
                 and message.channel.id
                 == interaction.channel.id
-                and 1 <= len(message.attachments) <= 2
+                and 1
+                <= len(message.attachments)
+                <= 2
             )
 
         message_task = asyncio.create_task(
             client.wait_for(
                 "message",
                 timeout=120,
-                check=message_check,
+                check=check,
             )
         )
 
         skip_task = asyncio.create_task(
             upload_view.skip_event.wait()
         )
-
-        image_message = None
-        attachments = []
 
         try:
             done, pending = await asyncio.wait(
@@ -2558,65 +3190,50 @@ class SendEmbedModal(
                 return_when=asyncio.FIRST_COMPLETED,
             )
 
-            # --------------------------------------------------
-            # TIMEOUT
-            # --------------------------------------------------
-
             if not done:
-                await interaction.edit_original_response(
-                    content=es(
-                        "⌛ Время ожидания истекло."
-                    ),
-                    view=None,
-                )
-
                 return None, []
 
             # --------------------------------------------------
-            # SKIP
+            # БЕЗ КАРТИНОК
             # --------------------------------------------------
 
             if skip_task in done:
                 upload_view.skipped = True
-
-                message_task.cancel()
-
                 return None, []
 
             # --------------------------------------------------
-            # КАРТИНКИ
+            # ПОЛУЧИЛИ КАРТИНКИ
             # --------------------------------------------------
 
             if message_task in done:
-                image_message = (
+                message = (
                     message_task.result()
                 )
 
-                skip_task.cancel()
+                attachments = []
 
                 for attachment in (
-                    image_message.attachments[:2]
+                    message.attachments[:2]
                 ):
-                    try:
-                        file_data = (
-                            await attachment.read()
-                        )
+                    content_type = (
+                        attachment.content_type
+                        or "application/octet-stream"
+                    )
 
-                        attachments.append(
-                            {
-                                "data": file_data,
-                                "filename": attachment.filename,
-                                "content_type": (
-                                    attachment.content_type
-                                    or "application/octet-stream"
-                                ),
-                            }
-                        )
+                    data = await attachment.read()
 
-                    except Exception:
-                        pass
+                    attachments.append(
+                        {
+                            "data": data,
+                            "filename": attachment.filename,
+                            "content_type": content_type,
+                        }
+                    )
 
-                return image_message, attachments
+                return (
+                    message,
+                    attachments,
+                )
 
             return None, []
 
@@ -2638,7 +3255,7 @@ class SendEmbedModal(
         self,
         channel,
         data,
-        attachments,
+        uploaded_attachments=None,
     ):
         if not hasattr(
             discord.ui,
@@ -2648,6 +3265,16 @@ class SendEmbedModal(
                 "Для Components V2 требуется "
                 "discord.py 2.6 или новее."
             )
+
+        uploaded_attachments = (
+            uploaded_attachments
+            or []
+        )
+
+        # ------------------------------------------------------
+        # Если JSON содержит content/embeds, Components V2
+        # всё равно отправляем через LayoutView.
+        # ------------------------------------------------------
 
         layout = discord.ui.LayoutView(
             timeout=None
@@ -2667,12 +3294,14 @@ class SendEmbedModal(
             )
 
         # ------------------------------------------------------
-        # СОЗДАЁМ COMPONENTS V2
+        # Строим исходные Components V2
         # ------------------------------------------------------
 
         for component_data in components:
-            component = self.build_v2_component(
-                component_data
+            component = (
+                self.build_v2_component(
+                    component_data
+                )
             )
 
             if component is not None:
@@ -2681,22 +3310,123 @@ class SendEmbedModal(
                 )
 
         # ------------------------------------------------------
-        # ЗАГРУЖЕННЫЕ ФАЙЛЫ
+        # Подготовка файлов
         # ------------------------------------------------------
 
         discord_files = []
 
         for index, attachment in enumerate(
-            attachments
+            uploaded_attachments[:2]
         ):
-            filename = (
+            attachment[
+                "send_filename"
+            ] = (
                 f"components_v2_{index}_"
                 f"{attachment['filename']}"
             )
 
-            attachment["send_filename"] = filename
-
             discord_files.append(
+                discord.File(
+                    io.BytesIO(
+                        attachment["data"]
+                    ),
+                    filename=attachment[
+                        "send_filename"
+                    ],
+                )
+            )
+
+        # ------------------------------------------------------
+        # Добавляем пользовательские картинки,
+        # ТОЛЬКО если их действительно передали.
+        # ------------------------------------------------------
+
+        if uploaded_attachments:
+            self.add_uploaded_images_to_layout(
+                layout,
+                uploaded_attachments,
+            )
+
+        # ------------------------------------------------------
+        # Отправка
+        #
+        # LayoutView сам делает Components V2.
+        # flags=32768 вручную здесь не нужен.
+        # ------------------------------------------------------
+
+        await channel.send(
+            view=layout,
+            files=discord_files,
+            allowed_mentions=(
+                discord.AllowedMentions(
+                    everyone=False,
+                    roles=False,
+                    users=True,
+                )
+            ),
+        )
+
+    # ==========================================================
+    # ОБЫЧНЫЙ EMBED
+    # ==========================================================
+
+    async def send_normal_embed(
+        self,
+        channel,
+        data,
+        uploaded_attachments,
+    ):
+        embeds_data = data.get(
+            "embeds",
+            [],
+        )
+
+        if not isinstance(
+            embeds_data,
+            list,
+        ):
+            raise ValueError(
+                "Поле embeds должно быть массивом."
+            )
+
+        embeds = []
+
+        for embed_data in embeds_data:
+            if not isinstance(
+                embed_data,
+                dict,
+            ):
+                raise ValueError(
+                    "Каждый элемент embeds "
+                    "должен быть объектом."
+                )
+
+            embeds.append(
+                discord.Embed.from_dict(
+                    embed_data
+                )
+            )
+
+        if not embeds:
+            raise ValueError(
+                "В JSON отсутствует embeds."
+            )
+
+        files = []
+
+        # ------------------------------------------------------
+        # 1 картинка = IMAGE
+        # ------------------------------------------------------
+
+        if len(uploaded_attachments) == 1:
+            attachment = uploaded_attachments[0]
+
+            filename = (
+                f"embed_image_"
+                f"{attachment['filename']}"
+            )
+
+            files.append(
                 discord.File(
                     io.BytesIO(
                         attachment["data"]
@@ -2705,46 +3435,135 @@ class SendEmbedModal(
                 )
             )
 
-        # ------------------------------------------------------
-        # ДОБАВЛЯЕМ MEDIA GALLERY
-        # ------------------------------------------------------
-
-        if attachments:
-            container = self.find_container(
-                layout
+            embeds[0].set_image(
+                url=(
+                    f"attachment://"
+                    f"{filename}"
+                )
             )
 
-            if container is not None:
-                self.add_uploaded_gallery(
-                    container,
-                    attachments,
+        # ------------------------------------------------------
+        # 2 картинки:
+        # первая = thumbnail
+        # вторая = image
+        # ------------------------------------------------------
+
+        elif len(uploaded_attachments) >= 2:
+            thumbnail = uploaded_attachments[0]
+            image = uploaded_attachments[1]
+
+            thumbnail_filename = (
+                f"embed_thumbnail_"
+                f"{thumbnail['filename']}"
+            )
+
+            image_filename = (
+                f"embed_image_"
+                f"{image['filename']}"
+            )
+
+            files.append(
+                discord.File(
+                    io.BytesIO(
+                        thumbnail["data"]
+                    ),
+                    filename=thumbnail_filename,
                 )
+            )
 
-            else:
-                gallery = discord.ui.MediaGallery()
+            files.append(
+                discord.File(
+                    io.BytesIO(
+                        image["data"]
+                    ),
+                    filename=image_filename,
+                )
+            )
 
-                for attachment in attachments:
-                    gallery.add_item(
-                        media=(
-                            f"attachment://"
-                            f"{attachment['send_filename']}"
+            embeds[0].set_thumbnail(
+                url=(
+                    f"attachment://"
+                    f"{thumbnail_filename}"
+                )
+            )
+
+            embeds[0].set_image(
+                url=(
+                    f"attachment://"
+                    f"{image_filename}"
+                )
+            )
+
+        # ------------------------------------------------------
+        # КНОПКИ-СCЫЛКИ
+        # ------------------------------------------------------
+
+        view = discord.ui.View(
+            timeout=None
+        )
+
+        def add_link_buttons(items):
+            if not isinstance(
+                items,
+                list,
+            ):
+                return
+
+            for component_data in items:
+                if not isinstance(
+                    component_data,
+                    dict,
+                ):
+                    continue
+
+                if (
+                    component_data.get(
+                        "type"
+                    ) == 2
+                    and component_data.get(
+                        "url"
+                    )
+                ):
+                    button = (
+                        self.build_link_button(
+                            component_data
                         )
                     )
 
-                layout.add_item(
-                    gallery
+                    if button is not None:
+                        view.add_item(
+                            button
+                        )
+
+                nested = component_data.get(
+                    "components"
                 )
 
+                if nested:
+                    add_link_buttons(
+                        nested
+                    )
+
+        add_link_buttons(
+            data.get(
+                "components"
+            )
+        )
+
+        if not view.children:
+            view = None
+
         # ------------------------------------------------------
-        # ОТПРАВКА
+        # Обычный channel.send()
         # ------------------------------------------------------
 
         await channel.send(
             content=data.get(
                 "content"
             ),
-            view=layout,
-            files=discord_files,
+            embeds=embeds,
+            files=files,
+            view=view,
             allowed_mentions=(
                 discord.AllowedMentions(
                     everyone=False,
@@ -2762,9 +3581,12 @@ class SendEmbedModal(
         self,
         interaction: discord.Interaction,
     ):
+        image_message = None
+        json_message = None
+
         try:
             # ==================================================
-            # 1. КАНАЛ
+            # 1. CHANNEL
             # ==================================================
 
             channel = await client.fetch_channel(
@@ -2774,27 +3596,105 @@ class SendEmbedModal(
             )
 
             # ==================================================
-            # 2. JSON
+            # 2. ПОЛУЧАЕМ JSON
             # ==================================================
 
-            try:
-                data = json.loads(
-                    self.embed_json.value
-                )
+            raw_json = (
+                self.embed_json.value
+                or ""
+            ).strip()
 
-            except json.JSONDecodeError as e:
+            data = None
+
+            # --------------------------------------------------
+            # JSON прямо в модалке
+            # --------------------------------------------------
+
+            if raw_json:
+                try:
+                    data = json.loads(
+                        raw_json
+                    )
+
+                except json.JSONDecodeError as e:
+                    await interaction.response.send_message(
+                        "❌ Некорректный JSON:\n"
+                        f"```text\n{e}\n```\n\n"
+                        "Если JSON длиннее 4000 символов, "
+                        "прикрепите его как `.json` файл.",
+                        ephemeral=True,
+                    )
+                    return
+
+            # --------------------------------------------------
+            # JSON будет отправлен отдельным файлом
+            # --------------------------------------------------
+
+            else:
                 await interaction.response.send_message(
-                    f"❌ Некорректный JSON:\n"
-                    f"```text\n{e}\n```",
+                    es(
+                        "📄 Прикрепите `.json` файл "
+                        "сообщением в этот канал."
+                    ),
                     ephemeral=True,
                 )
-                return
+
+                (
+                    json_message,
+                    data,
+                    file_images,
+                ) = await self.wait_for_json_file(
+                    interaction
+                )
+
+                if data is None:
+                    await interaction.followup.send(
+                        es(
+                            "⌛ Время ожидания истекло "
+                            "или JSON-файл не найден."
+                        ),
+                        ephemeral=True,
+                    )
+                    return
+
+                # ----------------------------------------------
+                # Если JSON уже содержит картинки,
+                # дополнительные картинки не нужны.
+                # ----------------------------------------------
+
+                if self.has_images_in_json(
+                    data
+                ):
+                    file_images = []
+
+                # ----------------------------------------------
+                # Если в JSON нет картинок, изображения,
+                # приложенные вместе с JSON-файлом,
+                # используем сразу.
+                # ----------------------------------------------
+
+                if file_images:
+                    uploaded_attachments = []
+
+                    for attachment in file_images:
+                        uploaded_attachments.append(
+                            {
+                                "data": await attachment.read(),
+                                "filename": attachment.filename,
+                                "content_type": (
+                                    attachment.content_type
+                                    or "application/octet-stream"
+                                ),
+                            }
+                        )
+                else:
+                    uploaded_attachments = []
 
             if not isinstance(
                 data,
                 dict,
             ):
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     es(
                         "❌ JSON должен быть объектом."
                     ),
@@ -2803,50 +3703,70 @@ class SendEmbedModal(
                 return
 
             # ==================================================
-            # 3. ПРОСИМ КАРТИНКИ
+            # 3. ПРОВЕРЯЕМ, ЕСТЬ ЛИ КАРТИНКИ В САМОМ JSON
             # ==================================================
 
-            upload_view = self.ImageUploadView(
-                interaction.user.id
-            )
-
-            await interaction.response.send_message(
-                es(
-                    "🖼️ Прикрепите 1–2 картинки "
-                    "одним сообщением.\n\n"
-                    "Если прикреплена одна картинка — "
-                    "она будет большой снизу.\n"
-                    "Если прикреплены две — первая будет "
-                    "маленькой сверху, а вторая большой снизу.\n\n"
-                    "Если картинки не нужны, нажмите "
-                    "«Без картинок»."
-                ),
-                view=upload_view,
-                ephemeral=True,
-            )
-
-            # ==================================================
-            # 4. ЖДЁМ КАРТИНКИ
-            # ==================================================
-
-            image_message, attachments = (
-                await self.wait_for_images(
-                    interaction,
-                    upload_view,
+            json_already_has_images = (
+                self.has_images_in_json(
+                    data
                 )
             )
 
             # ==================================================
-            # 5. COMPONENTS V2
+            # 4. ЕСЛИ JSON УЖЕ С КАРТИНКАМИ —
+            #    БОЛЬШЕ НИЧЕГО НЕ СПРАШИВАЕМ
+            # ==================================================
+
+            if json_already_has_images:
+                uploaded_attachments = []
+
+            # ==================================================
+            # 5. ЕСЛИ КАРТИНОК НЕТ —
+            #    СПРАШИВАЕМ ПОЛЬЗОВАТЕЛЯ
+            # ==================================================
+
+            elif not uploaded_attachments:
+                upload_view = self.ImageUploadView(
+                    interaction.user.id
+                )
+
+                await interaction.followup.send(
+                    es(
+                        "🖼️ Прикрепите 1–2 картинки "
+                        "одним сообщением.\n\n"
+                        "Если прикреплена одна картинка — "
+                        "она будет большой снизу.\n"
+                        "Если прикреплены две — первая будет "
+                        "маленькой справа сверху, а вторая "
+                        "будет большой снизу.\n\n"
+                        "Если картинки не нужны, нажмите "
+                        "«Без картинок»."
+                    ),
+                    view=upload_view,
+                    ephemeral=True,
+                )
+
+                (
+                    image_message,
+                    uploaded_attachments,
+                ) = await self.wait_for_images(
+                    interaction,
+                    upload_view,
+                )
+
+            # ==================================================
+            # 6. COMPONENTS V2
             # ==================================================
 
             if self.is_components_v2(
                 data
             ):
                 await self.send_components_v2(
-                    channel,
-                    data,
-                    attachments,
+                    channel=channel,
+                    data=data,
+                    uploaded_attachments=(
+                        uploaded_attachments
+                    ),
                 )
 
                 await interaction.followup.send(
@@ -2857,224 +3777,28 @@ class SendEmbedModal(
                     ephemeral=True,
                 )
 
-                # Удаляем сообщение пользователя
-                # с картинками
-                if image_message is not None:
-                    try:
-                        await image_message.delete()
-                    except Exception:
-                        pass
-
-                return
-
             # ==================================================
-            # 6. ОБЫЧНЫЙ EMBED
+            # 7. ОБЫЧНЫЙ EMBED
             # ==================================================
 
-            embeds_data = data.get(
-                "embeds",
-                [],
-            )
-
-            if not isinstance(
-                embeds_data,
-                list,
-            ):
-                raise ValueError(
-                    "Поле embeds должно быть массивом."
+            else:
+                await self.send_normal_embed(
+                    channel=channel,
+                    data=data,
+                    uploaded_attachments=(
+                        uploaded_attachments
+                    ),
                 )
 
-            embeds = []
-
-            for embed_data in embeds_data:
-                if not isinstance(
-                    embed_data,
-                    dict,
-                ):
-                    raise ValueError(
-                        "Каждый элемент embeds "
-                        "должен быть объектом."
-                    )
-
-                embeds.append(
-                    discord.Embed.from_dict(
-                        embed_data
-                    )
-                )
-
-            if not embeds:
-                raise ValueError(
-                    "В JSON отсутствует embeds."
+                await interaction.followup.send(
+                    es(
+                        "✅ Embed отправлен!"
+                    ),
+                    ephemeral=True,
                 )
 
             # ==================================================
-            # 7. КАРТИНКИ ДЛЯ ОБЫЧНОГО EMBED
-            # ==================================================
-
-            files = []
-
-            # --------------------------------------------------
-            # ОДНА КАРТИНКА → БОЛЬШАЯ
-            # --------------------------------------------------
-
-            if len(attachments) == 1:
-                attachment = attachments[0]
-
-                filename = (
-                    f"embed_image_"
-                    f"{attachment['filename']}"
-                )
-
-                files.append(
-                    discord.File(
-                        io.BytesIO(
-                            attachment["data"]
-                        ),
-                        filename=filename,
-                    )
-                )
-
-                embeds[0].set_image(
-                    url=(
-                        f"attachment://"
-                        f"{filename}"
-                    )
-                )
-
-            # --------------------------------------------------
-            # ДВЕ КАРТИНКИ
-            #
-            # ПЕРВАЯ → THUMBNAIL
-            # ВТОРАЯ → IMAGE
-            # --------------------------------------------------
-
-            elif len(attachments) >= 2:
-                thumbnail = attachments[0]
-                image = attachments[1]
-
-                thumbnail_filename = (
-                    f"embed_thumbnail_"
-                    f"{thumbnail['filename']}"
-                )
-
-                image_filename = (
-                    f"embed_image_"
-                    f"{image['filename']}"
-                )
-
-                files.append(
-                    discord.File(
-                        io.BytesIO(
-                            thumbnail["data"]
-                        ),
-                        filename=thumbnail_filename,
-                    )
-                )
-
-                files.append(
-                    discord.File(
-                        io.BytesIO(
-                            image["data"]
-                        ),
-                        filename=image_filename,
-                    )
-                )
-
-                embeds[0].set_thumbnail(
-                    url=(
-                        f"attachment://"
-                        f"{thumbnail_filename}"
-                    )
-                )
-
-                embeds[0].set_image(
-                    url=(
-                        f"attachment://"
-                        f"{image_filename}"
-                    )
-                )
-
-            # ==================================================
-            # 8. КНОПКИ-СCЫЛКИ ДЛЯ ОБЫЧНОГО EMBED
-            # ==================================================
-
-            view = discord.ui.View(
-                timeout=None
-            )
-
-            def add_link_buttons(items):
-                if not isinstance(
-                    items,
-                    list,
-                ):
-                    return
-
-                for component_data in items:
-                    if not isinstance(
-                        component_data,
-                        dict,
-                    ):
-                        continue
-
-                    if (
-                        component_data.get("type")
-                        == 2
-                        and component_data.get("url")
-                    ):
-                        button = (
-                            self.build_link_button(
-                                component_data
-                            )
-                        )
-
-                        if button is not None:
-                            view.add_item(
-                                button
-                            )
-
-                    nested = component_data.get(
-                        "components"
-                    )
-
-                    if nested:
-                        add_link_buttons(
-                            nested
-                        )
-
-            add_link_buttons(
-                data.get("components")
-            )
-
-            if not view.children:
-                view = None
-
-            # ==================================================
-            # 9. ОТПРАВКА ОБЫЧНОГО EMBED
-            # ==================================================
-
-            await channel.send(
-                content=data.get(
-                    "content"
-                ),
-                embeds=embeds,
-                files=files,
-                view=view,
-                allowed_mentions=(
-                    discord.AllowedMentions(
-                        everyone=False,
-                        roles=False,
-                        users=True,
-                    )
-                ),
-            )
-
-            await interaction.followup.send(
-                es("✅ Embed отправлен!"),
-                ephemeral=True,
-            )
-
-            # ==================================================
-            # 10. УДАЛЯЕМ СООБЩЕНИЕ С КАРТИНКАМИ
+            # 8. УДАЛЯЕМ ТЕХНИЧЕСКИЕ СООБЩЕНИЯ
             # ==================================================
 
             if image_message is not None:
@@ -3083,17 +3807,43 @@ class SendEmbedModal(
                 except Exception:
                     pass
 
+            if json_message is not None:
+                try:
+                    await json_message.delete()
+                except Exception:
+                    pass
+
         except Exception as e:
-            if interaction.response.is_done():
-                await interaction.followup.send(
-                    f"❌ Ошибка: {e}",
-                    ephemeral=True,
-                )
-            else:
-                await interaction.response.send_message(
-                    f"❌ Ошибка: {e}",
-                    ephemeral=True,
-                )
+            if image_message is not None:
+                try:
+                    await image_message.delete()
+                except Exception:
+                    pass
+
+            if json_message is not None:
+                try:
+                    await json_message.delete()
+                except Exception:
+                    pass
+
+            error_text = (
+                f"❌ Ошибка: "
+                f"{type(e).__name__}: {e}"
+            )
+
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        error_text,
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        error_text,
+                        ephemeral=True,
+                    )
+            except Exception:
+                pass
 
 class SendMessageModal(discord.ui.Modal, title=es("📝 Отправка обычного сообщения")):
     channel_id = discord.ui.TextInput(label="ID канала или ветки", required=True, max_length=20)
