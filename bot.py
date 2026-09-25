@@ -7320,7 +7320,7 @@ async def on_ready():
 
         if role:
             await channel.set_permissions(
-                role,
+                role, 
                 overwrite=discord.PermissionOverwrite.from_pair(
                     discord.Permissions.all_channel(),
                     discord.Permissions.none()
