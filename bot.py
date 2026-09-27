@@ -2881,13 +2881,11 @@ class AdminMainMenuView(discord.ui.View):
                "Это может занять несколько минут."),
             ephemeral=True
         )
-        (ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors,
-         tn_fixed, tm_fixed, tl_fixed, anchors_fixed, anketa_updated, anketa_errors) = await update_all_templates()
+        (ev_updated, ev_errors, vac_updated, vac_errors,
+         anchors_fixed, anketa_updated, anketa_errors) = await update_all_templates()
         await interaction.followup.send(
             es(f"📅 Мероприятий обновлено: **{ev_updated}** (ошибок: {ev_errors})\n"
                f"🏖️ Отпусков обновлено: **{vac_updated}** (ошибок: {vac_errors})\n"
-               f"🏆 Отчётов о явке обновлено: **{att_updated}** (ошибок: {att_errors})\n"
-               f"💬 Названий веток исправлено: **{tn_fixed}**, сообщений в ветках: **{tm_fixed}**, блокировок: **{tl_fixed}**\n"
                f"🛠️ Якорных сообщений обновлено: **{anchors_fixed}**\n"
                f"📝 Анкет ресинхронизировано: **{anketa_updated}** (ошибок: {anketa_errors})"),
             ephemeral=True
@@ -5589,20 +5587,28 @@ def build_vacation_rules_embed():
     return embed
 
 
+# Известный ID уже существующего сообщения с правилами отпусков — используется
+# как fallback, ЕСЛИ ADMIN_ANCHORS_FILE ещё не содержит сохранённый message_id
+# (это сообщение было опубликовано ДО того, как якорь стал сохраняться в файл).
+# Без этой константы бот полагался ТОЛЬКО на скан последних 200 сообщений
+# канала — при активном канале отпусков (embed на каждый запрос отпуска)
+# старое сообщение быстро "выпадает" за пределы этого окна, и бот создавал
+# дубликат вместо обновления существующего.
+KNOWN_VACATION_RULES_MESSAGE_ID = 1536512525535944726
+
+
 async def find_or_create_vacation_rules_message(channel):
-    """Ищет сообщение с правилами отпусков: сначала по сохранённому ID
-    (надёжно и дёшево, переживает любую активность в канале), затем скан
-    истории как fallback, и только потом создаёт новое. Раньше здесь был
-    ТОЛЬКО скан последних 20 сообщений канала — при активном канале отпусков
-    (по сообщению на каждый запрос) сообщение с правилами быстро выпадало
-    за пределы этого окна, и бот создавал ДУБЛИКАТ при каждом обновлении
-    шаблонов."""
+    """Ищет сообщение с правилами отпусков: сначала по сохранённому ID из
+    файла, затем по известному захардкоженному ID (см. выше), затем скан
+    истории как последний fallback, и только потом создаёт новое."""
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
-    saved_id = anchors.get('vacation_rules_message_id')
-    if saved_id:
+    candidate_id = anchors.get('vacation_rules_message_id') or KNOWN_VACATION_RULES_MESSAGE_ID
+    if candidate_id:
         try:
-            message = await channel.fetch_message(saved_id)
-            if message.embeds and message.embeds[0].title == es("🏖️ Оформление отпусков"):
+            message = await channel.fetch_message(candidate_id)
+            if message.author.id == client.user.id:
+                anchors['vacation_rules_message_id'] = message.id
+                save_json(ADMIN_ANCHORS_FILE, anchors)
                 return message
         except Exception:
             pass  # сообщение удалено/недоступно — переходим к скану истории
@@ -7081,52 +7087,6 @@ FIELD_REQUESTED_BY = es("👤 Запросил")
 FIELD_APPROVED_BY = es("✅ Утвердил")
 FIELD_REJECTED_BY = es("❌ Отклонил")
 
-async def recover_thread_messages_from_history(thread, event) -> list:
-    """Восстанавливает список thread_messages, просканировав историю ветки.
-
-    Старая версия check_event_completion выполняла
-    fresh.pop('thread_messages', None) при завершении мероприятия — ID анонса
-    и всех напоминаний терялись, и update_all_templates (секция 1.5) больше
-    не могла переформатировать эти сообщения при смене шаблонов.
-
-    'mods' и 'cancelled' НЕ восстанавливаем: у них в extra лежат данные
-    (сервер, IP, пароль, кто отменил), которых в тексте может не оказаться —
-    перерисовка по пустому extra затёрла бы их.
-    """
-    recovered = []
-    try:
-        async for msg in thread.history(limit=100, oldest_first=True):
-            if msg.author.id != client.user.id:
-                continue
-            body = msg.content or ''
-            if not body:
-                continue
-
-            parts = body.split('\n\n', 1)
-            mention_block = parts[0] if len(parts) > 1 and '<@' in parts[0] else ''
-
-            kind = None
-            if 'запланировано мероприятие' in body:
-                kind = 'announcement'
-            elif 'осталось 2 суток' in body:
-                kind = 'reminder_2days'
-            elif 'остались одни сутки' in body:
-                kind = 'reminder_1day'
-            elif 'Ждем вас на сборах' in body:
-                kind = 'reminder_15min'
-            elif 'автоматически помечено как завершённое' in body:
-                kind = 'completion'
-            elif 'завершено досрочно после публикации' in body:
-                kind = 'early_completion'
-            elif 'снова активно' in body:
-                kind = 'reactivated'
-
-            if kind:
-                recovered.append({'id': msg.id, 'kind': kind, 'mention_block': mention_block})
-    except Exception as e:
-        print(f"⚠️ Не удалось просканировать историю ветки {getattr(thread, 'id', '?')}: {e}")
-    return recovered
-
 async def update_all_templates():
     """Обновляет шаблоны всех сообщений бота:
     - все сообщения мероприятий
@@ -7302,108 +7262,6 @@ async def update_all_templates():
         events = fresh_events_after_sync
 
 
-    # === 1.5. РЕСИНХРОНИЗАЦИЯ НАЗВАНИЙ ВЕТОК, ВСЕХ СООБЩЕНИЙ БОТА В НИХ, БЛОКИРОВКИ (п.3, п.4) ===
-
-    thread_names_fixed = 0
-    thread_messages_fixed = 0
-    thread_locks_fixed = 0
-    attendance_for_sync = load_json(ATTENDANCE_FILE, {})
-    for event_id, event in events.items():
-        thread_id = event.get('thread_id')
-        if not thread_id:
-            continue
-        try:
-            thread = await client.fetch_channel(thread_id)
-        except Exception:
-            continue
-
-        # Разблокируем ОДИН РАЗ перед ЛЮБЫМИ правками (и переименованием,
-        # и редактированием сообщений) — раньше разблокировка происходила
-        # только внутри блока переименования, из-за чего правка сообщений
-        # в уже закрытой ветке падала с 'Thread is archived'.
-        was_locked = getattr(thread, 'locked', False) or getattr(thread, 'archived', False)
-        if was_locked:
-            await unlock_and_unarchive_thread(thread)
-
-        desired_name = desired_thread_name(event)
-        if thread.name != desired_name:
-            try:
-                await thread.edit(name=desired_name)
-                thread_names_fixed += 1
-            except Exception as e:
-                print(f"⚠️ Не удалось обновить название ветки {thread_id}: {e}")
-
-        # У каждого мероприятия при создании записывается 'announcement'.
-        # Если его нет — значит историю стёрла старая версия
-        # check_event_completion (pop('thread_messages')), и переформатировать
-        # нечего. Восстанавливаем ID сообщений, просканировав саму ветку.
-        # Флаг _thread_messages_recovered не даёт сканировать историю повторно
-        # при каждой последующей синхронизации (100 сообщений на ветку —
-        # дорогая операция, и она нужна ровно один раз).
-        thread_messages = event.get('thread_messages', [])
-        has_announcement = any(m.get('kind') == 'announcement' for m in thread_messages)
-        if not has_announcement and not event.get('_thread_messages_recovered'):
-            known_ids = {m.get('id') for m in thread_messages}
-            recovered = await recover_thread_messages_from_history(thread, event)
-            new_ones = [r for r in recovered if r['id'] not in known_ids]
-            if new_ones:
-                thread_messages = list(thread_messages) + new_ones
-                print(f"🔧 Восстановлено {len(new_ones)} сообщений в ветке "
-                      f"«{event.get('title', '?')[:40]}»")
-            async with _events_write_lock:
-                ev_now = load_json(EVENTS_FILE, {})
-                target = ev_now.get(event_id)
-                if target is not None:
-                    target['thread_messages'] = thread_messages
-                    target['_thread_messages_recovered'] = True
-                    save_json(EVENTS_FILE, ev_now)
-
-        for msg_record in thread_messages:
-            try:
-                msg = await thread.fetch_message(msg_record['id'])
-            except Exception:
-                continue
-            kind = msg_record.get('kind')
-            extra = msg_record.get('extra', {})
-            mention_block = msg_record.get('mention_block', '')
-            new_text = None
-            if kind == 'announcement':
-                new_text = render_announcement_message(mention_block)
-            elif kind == 'completion':
-                new_text = render_completion_message(event)
-            elif kind == 'early_completion':
-                new_text = render_early_completion_message(event)
-            elif kind == 'cancelled':
-                new_text = render_cancel_message(event, extra.get('by_user', '?'))
-            elif kind == 'reactivated':
-                new_text = render_reactivate_message(event)
-            elif kind == 'reminder_2days':
-                new_text = render_reminder_2days_message(mention_block)
-            elif kind == 'reminder_1day':
-                new_text = render_reminder_1day_message(mention_block)
-            elif kind == 'reminder_15min':
-                new_text = render_reminder_15min_message(mention_block, event)
-            elif kind == 'mods':
-                new_text = render_mods_message(mention_block, event, extra.get('server_name'), extra.get('password'),
-                                                extra.get('server_ip', ''), extra.get('server_port', ''))
-            if new_text is not None and msg.content != new_text:
-                try:
-                    await msg.edit(content=new_text)
-                    thread_messages_fixed += 1
-                    await asyncio.sleep(1)
-                except Exception as e:
-                    print(f"⚠️ Не удалось обновить сообщение {msg_record.get('id')} в ветке {thread_id}: {e}")
-
-        # Восстанавливаем блокировку ОДИН РАЗ в конце — если ветка была
-        # заблокирована ДО правок, либо мероприятие завершено и по нему уже
-        # есть отчёт о явке (должно оставаться заблокированным по правилам п.1/п.2).
-        should_be_locked = was_locked or (event.get('status') == 'completed' and event_id in attendance_for_sync)
-        if should_be_locked:
-            await lock_and_archive_thread(thread)
-            if not was_locked:
-                thread_locks_fixed += 1
-
-
     # === 2. ОБНОВЛЕНИЕ СООБЩЕНИЙ ОТПУСКОВ ===
     # Перечитываем: снимок vacations был взят в начале функции, а до этой
     # точки прошли секции 1 и 1.5 (десятки секунд, иногда минуты). За это
@@ -7513,43 +7371,7 @@ async def update_all_templates():
         print(f"❌ Ошибка обновления правил отпусков: {e}")
         vac_errors += 1
     
-    # === 4. ОБНОВЛЕНИЕ ОТЧЁТОВ О ЯВКЕ В ВЕТКАХ МЕРОПРИЯТИЙ ===
-    attendance = load_json(ATTENDANCE_FILE, {})
-    att_updated = 0
-    att_errors = 0
-    for event_id, record in attendance.items():
-        if not record.get('attendance_message_id') or not record.get('thread_id'):
-            continue
-        thread = None
-        was_locked = False
-        try:
-            thread = await client.fetch_channel(record['thread_id'])
-            # Большинство мероприятий на этот момент уже завершены — их ветки
-            # заблокированы/заархивированы (см. П.1/П.2), а Discord отклоняет
-            # ЛЮБУЮ правку содержимого в такой ветке (50083: Thread is archived).
-            # Поэтому временно открываем ветку перед редактированием.
-            was_locked = getattr(thread, 'locked', False) or getattr(thread, 'archived', False)
-            if was_locked:
-                await unlock_and_unarchive_thread(thread)
-
-            message = await thread.fetch_message(record['attendance_message_id'])
-            new_text = build_attendance_report_text(record)
-            if message.content != new_text:
-                await message.edit(content=new_text)
-            att_updated += 1
-            await asyncio.sleep(0.4)
-        except discord.NotFound:
-            att_errors += 1
-        except Exception as e:
-            print(f"❌ Ошибка обновления отчёта явки '{record.get('title','?')}': {e}")
-            att_errors += 1
-        finally:
-            # Возвращаем ветку в закрытое состояние, если она была такой ДО правки
-            # (то есть если мероприятие завершено и должно оставаться заблокированным).
-            if thread and was_locked:
-                await lock_and_archive_thread(thread)
-
-    # === 5. РЕСИНХРОНИЗАЦИЯ АНКЕТ (перерисовка embed'а свежими данными профиля) ===
+    # === 4. РЕСИНХРОНИЗАЦИЯ АНКЕТ (перерисовка embed'а свежими данными профиля) ===
     # Живой watcher (handle_profile_modified_watch) обновляет анкету ТОЛЬКО
     # когда сам профиль реально меняется на сайте — если поменялось только
     # оформление embed'а в коде бота (например, добавилось новое поле вроде
@@ -7591,14 +7413,11 @@ async def update_all_templates():
     print(f"🔄 Итог обновления шаблонов:")
     print(f"   📅 Мероприятий: изменено {ev_updated}, без изменений {ev_unchanged}, ошибок {ev_errors}")
     print(f"   🏖️ Отпусков: обновлено {vac_updated}, ошибок {vac_errors}")
-    print(f"   🏆 Отчётов о явке: обновлено {att_updated}, ошибок {att_errors}")
-    print(f"   💬 Названий веток исправлено: {thread_names_fixed}, сообщений в ветках обновлено: {thread_messages_fixed}, блокировок исправлено: {thread_locks_fixed}")
     print(f"   🛠️ Якорных сообщений обновлено: {anchors_fixed}")
     print(f"   📝 Анкет ресинхронизировано: {anketa_updated}, ошибок {anketa_errors}")
     
-    return (ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors,
-            thread_names_fixed, thread_messages_fixed, thread_locks_fixed, anchors_fixed,
-            anketa_updated, anketa_errors)
+    return (ev_updated, ev_errors, vac_updated, vac_errors,
+            anchors_fixed, anketa_updated, anketa_errors)
 
 
 # ============== ПОСТОЯННАЯ ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ==============
