@@ -583,6 +583,7 @@ EVENTS_CHANNEL_ID = 1311705378140196926
 VACATION_CHANNEL_ID = 1284905224099598407
 ADMIN_CHANNEL_ID = 1536632416511332362
 ANKETA_CHANNEL_ID = 1366767440939454504
+MEMBER_LEAVE_LOG_CHANNEL_ID = 734494109590487043
 
 # ============== ЕДИНЫЙ РЕЕСТР РОЛЕЙ (стандартизация) ==============
 # Роли с фиксированным ID собраны здесь в одном месте — это единственный
@@ -758,6 +759,7 @@ VOICE_ROOMS_FILE = os.path.join(BASE_DIR, 'voice_rooms.json')
 CHECK_MESSAGES_FILE = os.path.join(BASE_DIR, 'check_messages.json')
 ADMIN_ANCHORS_FILE = os.path.join(BASE_DIR, 'admin_anchors.json')
 ANKETA_MESSAGES_FILE = os.path.join(BASE_DIR, 'anketa_messages.json')
+DISCORD_LINK_CACHE_FILE = os.path.join(BASE_DIR, 'discord_link_cache.json')
 
 # ============== FIREBASE ==============
 
@@ -794,6 +796,7 @@ FIREBASE_DATA_MAP = {
     CHECK_MESSAGES_FILE: 'checkMessages',
     ADMIN_ANCHORS_FILE: 'adminAnchors',
     ANKETA_MESSAGES_FILE: 'anketaMessages',
+    DISCORD_LINK_CACHE_FILE: 'discordLinkCache',
 }
 
 
@@ -2257,11 +2260,9 @@ SELF_ASSIGN_ROLES = [
 ]
 
 SELF_ASSIGN_DESCRIPTION = es(
-    "🎮 Бойцы, если желаете, можете выбрать себе гостевые роли в нашем сообществе!\n\n"
-    "Выберите нужные роли в меню ниже — они будут выданы сразу. Чтобы снять с себя "
-    "роль — откройте меню снова и просто не отмечайте её среди выбранных."
+    "Бойцы, если желаете, можете выбрать себе гостевые роли в нашем сообществе!\n\n"
+    "Гостевые роли дают доступ к публичным, но малоактивным каналам. Основная активность — в закрытых каналах.\n\nВы можете получить полный доступ по запросу (для открытых направлений) или при регистрации на сайте (для закрытых направлений).\n\n"
 )
-
 
 def build_self_assign_roles_embed():
     return discord.Embed(title=es("🎮 Гостевые роли"), description=SELF_ASSIGN_DESCRIPTION, color=discord.Color.blurple())
@@ -2271,7 +2272,7 @@ class SelfAssignRolesView(discord.ui.View):
         super().__init__(timeout=None)
         options = [discord.SelectOption(label=name, value=str(role_id)) for role_id, name in SELF_ASSIGN_ROLES]
         self.select = discord.ui.Select(
-            placeholder="🎮 Выберите гостевые роли, которые хотите иметь...",
+            placeholder="🎮 Выберите гостевые роли",
             options=options, min_values=0, max_values=len(options),
             custom_id="self_assign_guest_roles"
         )
@@ -2279,10 +2280,20 @@ class SelfAssignRolesView(discord.ui.View):
         self.add_item(self.select)
 
     async def _select_callback(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True, thinking=True)
         selected_ids = {int(v) for v in self.select.values}
         member = interaction.user
         guild = interaction.guild
+
+        # Роль 'Клан ArmA' автоматически есть у всех, чей состав "Запас"
+        # или выше (см. compute_arma_role_keys) — поэтому её наличие
+        # надёжно говорит "этот человек уже в клане", без обращения к Firebase.
+        guest_role_id = ROLE_IDS.get('gost_arma')
+        klan_arma_role = guild.get_role(ROLE_IDS['klan_arma']) if ROLE_IDS.get('klan_arma') else None
+        is_already_clan_member = bool(klan_arma_role and klan_arma_role in member.roles)
+        blocked_guest_attempt = bool(guest_role_id and is_already_clan_member and guest_role_id in selected_ids)
+        if blocked_guest_attempt:
+            selected_ids.discard(guest_role_id)
+
         to_add, to_remove = [], []
         for role_id, name in SELF_ASSIGN_ROLES:
             role = guild.get_role(role_id)
@@ -2309,7 +2320,11 @@ class SelfAssignRolesView(discord.ui.View):
             parts.append("Сняты: " + ", ".join(r.name for r in to_remove))
         if not parts:
             parts.append("Изменений нет — уже всё соответствует вашему выбору.")
-        await interaction.followup.send(es("✅ ") + " | ".join(parts), ephemeral=True)
+        if blocked_guest_attempt:
+            parts.append(es("⚠️ Роль 'Гость ArmA' вам не может быть выдана: вы уже состоите "
+                             "в клане. Она предназначена только для тех, кто "
+                             "ещё не входит в клан."))
+        await interaction.response.send_message(es("✅ ") + " | ".join(parts), ephemeral=True)
 
 
 async def ensure_self_assign_roles_message():
@@ -2866,13 +2881,15 @@ class AdminMainMenuView(discord.ui.View):
                "Это может занять несколько минут."),
             ephemeral=True
         )
-        ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors, tn_fixed, tm_fixed, tl_fixed, anchors_fixed = await update_all_templates()
+        (ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors,
+         tn_fixed, tm_fixed, tl_fixed, anchors_fixed, anketa_updated, anketa_errors) = await update_all_templates()
         await interaction.followup.send(
             es(f"📅 Мероприятий обновлено: **{ev_updated}** (ошибок: {ev_errors})\n"
                f"🏖️ Отпусков обновлено: **{vac_updated}** (ошибок: {vac_errors})\n"
                f"🏆 Отчётов о явке обновлено: **{att_updated}** (ошибок: {att_errors})\n"
                f"💬 Названий веток исправлено: **{tn_fixed}**, сообщений в ветках: **{tm_fixed}**, блокировок: **{tl_fixed}**\n"
-               f"🛠️ Якорных сообщений обновлено: **{anchors_fixed}**"),
+               f"🛠️ Якорных сообщений обновлено: **{anchors_fixed}**\n"
+               f"📝 Анкет ресинхронизировано: **{anketa_updated}** (ошибок: {anketa_errors})"),
             ephemeral=True
         )
 
@@ -3449,6 +3466,77 @@ async def find_member_by_discord_username(discord_username: str):
         return None
 
 
+_discord_link_cache_write_lock = asyncio.Lock()
+
+
+async def resolve_and_cache_discord_user_id(uid: str, discord_username: str):
+    """Возвращает Discord user ID для профиля uid, ПОСТОЯННО запоминая
+    однажды найденное соответствие. find_member_by_discord_username ищет
+    ТОЛЬКО среди текущих участников гильдии — после выхода бойца с сервера
+    он больше не находится по имени пользователя, и ссылка на его Discord-
+    профиль в анкете исчезла бы. Но сама ссылка discord.com/users/<id>
+    продолжает работать независимо от членства в гильдии — если мы её
+    хотя бы раз узнали, сохраняем навсегда."""
+    if not discord_username:
+        return None
+    cache = read_json(DISCORD_LINK_CACHE_FILE, {})
+    cached_id = cache.get(uid)
+
+    member = await find_member_by_discord_username(discord_username)
+    if member:
+        if cached_id != member.id:
+            async with _discord_link_cache_write_lock:
+                fresh_cache = load_json(DISCORD_LINK_CACHE_FILE, {})
+                fresh_cache[uid] = member.id
+                save_json(DISCORD_LINK_CACHE_FILE, fresh_cache)
+        return member.id
+
+    return cached_id
+
+
+def _query_uid_by_discord_username_sync(username: str):
+    docs = fs_db.collection('profiles').where(filter=FieldFilter('discordId', '==', username)).limit(5).stream()
+    return [d.id for d in docs]
+
+
+async def relink_discord_id_on_join(member: discord.Member):
+    """При входе участника на сервер сразу ищет анкету(ы) с совпадающим
+    discordId и обновляет ссылку в анкете немедленно — не дожидаясь
+    следующего изменения профиля на сайте (которое могло бы не произойти
+    вообще, если боец больше ничего не редактирует после регистрации)."""
+    if not fs_db:
+        return
+    loop = asyncio.get_running_loop()
+    try:
+        candidate_uids = await loop.run_in_executor(EXECUTOR, _query_uid_by_discord_username_sync, member.name)
+    except Exception as e:
+        print(f"⚠️ Ошибка поиска анкеты по discordId для присоединившегося {member}: {e}")
+        return
+
+    for uid in candidate_uids:
+        async with _discord_link_cache_write_lock:
+            cache = load_json(DISCORD_LINK_CACHE_FILE, {})
+            if cache.get(uid) == member.id:
+                continue
+            cache[uid] = member.id
+            save_json(DISCORD_LINK_CACHE_FILE, cache)
+
+        anketa_info = get_anketa_message_info(uid)
+        if not anketa_info or not anketa_info.get('channel_id') or not anketa_info.get('message_id'):
+            continue
+        try:
+            fresh_data = await get_profile_data(uid)
+            if not fresh_data:
+                continue
+            channel = await client.fetch_channel(anketa_info['channel_id'])
+            message = await channel.fetch_message(anketa_info['message_id'])
+            was_new = bool(message.embeds and message.embeds[0].title and message.embeds[0].title.startswith("Новая анкета"))
+            embed = await build_anketa_embed(uid, fresh_data, is_new=was_new)
+            await message.edit(embed=embed)
+        except Exception as e:
+            print(f"⚠️ Не удалось обновить ссылку на Discord-профиль в анкете uid={uid}: {e}")
+
+
 def _safe_field_value(text: str, limit: int = 1024) -> str:
     text = text or "—"
     if len(text) > limit:
@@ -3488,9 +3576,9 @@ async def build_anketa_embed(uid, data, is_new: bool = True) -> discord.Embed:
 
     discord_username = data.get('discordId') or ''
     discord_value = discord_username or "—"
-    member = await find_member_by_discord_username(discord_username)
-    if member:
-        discord_value += f" (<https://discord.com/users/{member.id}>)"
+    discord_user_id = await resolve_and_cache_discord_user_id(uid, discord_username)
+    if discord_user_id:
+        discord_value += f" (<https://discord.com/users/{discord_user_id}>)"
     embed.add_field(name="Discord ID", value=_safe_field_value(discord_value), inline=False)
 
     embed.add_field(name="Steam ID", value=_safe_field_value(data.get('steamId')), inline=True)
@@ -3767,6 +3855,35 @@ async def handle_profile_modified_watch(uid, data):
         finally:
             await asyncio.sleep(_ANKETA_EDIT_MIN_INTERVAL)
 
+_LAST_KNOWN_ARMA_COMPOSITION: dict[str, str] = {}
+
+
+async def _handle_roster_membership_change(uid: str, composition: str):
+    """Отслеживает переходы состава конкретного бойца между 'состоит в
+    активном составе клана' (Личный состав/Запас) и 'не состоит' (Отбор/
+    Отставка/что угодно ещё). При КАЖДОМ таком переходе (а также при первом
+    обнаружении этого uid вообще — что произойдёт для ВСЕХ профилей сразу
+    при запуске бота, так как watcher слушает всю коллекцию 'profiles' без
+    фильтра по дате и получает ADDED по всем уже существующим документам):
+      1) сбрасывает часовой кэш состава клана — иначе новый/выбывший боец
+         не появлялся бы (не исчезал бы) из результатов
+         load_clan_members_from_firebase() до целого часа;
+      2) немедленно планирует пересборку embed'а ВСЕХ активных мероприятий —
+         иначе даже после сброса кэша список 'Не отметились' на уже
+         опубликованных сообщениях остаётся замороженным до следующего
+         случайного клика любого бойца по любой кнопке этого мероприятия."""
+    previous_composition = _LAST_KNOWN_ARMA_COMPOSITION.get(uid)
+    _LAST_KNOWN_ARMA_COMPOSITION[uid] = composition
+    if previous_composition == composition:
+        return
+    was_active = previous_composition in ACTIVE_CLAN_COMPOSITIONS
+    is_active = composition in ACTIVE_CLAN_COMPOSITIONS
+    if previous_composition is not None and was_active == is_active:
+        return  # переход между двумя "активными" (или двумя "неактивными") — состав ростера не изменился
+    invalidate_clan_members_cache()
+    await refresh_all_active_event_embeds()
+
+
 async def sync_arma_member_state(uid: str, data: dict):
     """Синхронизирует роли Discord и никнейм бойца с составом/должностью
     в Firebase (направление Arma Reforger). Вызывается watcher'ом на КАЖДОЕ
@@ -3783,7 +3900,7 @@ async def sync_arma_member_state(uid: str, data: dict):
         return
     member = await find_member_by_discord_username(discord_username)
     if not member:
-        print(f"⚠️ sync_arma_member_state: не найден участник Discord по discordId='{discord_username}' "
+        print(f"⚠️ Не найден участник Discord по discordId='{discord_username}' "
               f"(uid={uid}, callsign='{data.get('callsign', '?')}') — роли/никнейм НЕ синхронизированы. "
               f"Проверьте, что это поле в профиле соответствует реальному username в Discord.")
         return
@@ -3792,6 +3909,8 @@ async def sync_arma_member_state(uid: str, data: dict):
     game_role = (data.get('gameRoles') or {}).get(CLAN_ROSTER_GAME) or {}
     composition = (game_role.get('composition') or '').strip()
     position = (game_role.get('position') or '').strip()
+
+    await _handle_roster_membership_change(uid, composition)
 
     now_ms = int(datetime.now(MSK).timestamp() * 1000)
     game_da = (data.get('gameDisciplinaryActions') or {}).get(CLAN_ROSTER_GAME, []) or []
@@ -4233,6 +4352,28 @@ async def refresh_all_active_event_embeds():
             continue
         embed_refresher.schedule(event_id)
 
+async def refresh_event_embeds_overlapping_period(start_iso: str, end_iso: str):
+    """Планирует обновление embed'а КАЖДОГО мероприятия (независимо от
+    текущего статуса — active/cancelled/completed), чья дата начала попадает
+    в период [start_iso; end_iso]. Вызывается при ЛЮБОМ изменении статуса
+    отпуска (оформление, утверждение, закрытие досрочно/по расписанию) —
+    иначе список 'Не отметились' на уже опубликованных сообщениях (как
+    активных, так и уже завершённых мероприятий) остаётся замороженным на
+    момент последнего рендера и не отражает актуальный статус отпуска бойца."""
+    try:
+        start_date = datetime.fromisoformat(start_iso).date()
+        end_date = datetime.fromisoformat(end_iso).date()
+    except Exception:
+        return
+    events = read_json(EVENTS_FILE, {})
+    for event_id, event in events.items():
+        try:
+            event_date = datetime.fromtimestamp(event['start_time'], MSK).date()
+        except Exception:
+            continue
+        if start_date <= event_date <= end_date:
+            embed_refresher.schedule(event_id)
+
 async def apply_attendance_to_gamestats(wizard, old_tally: dict = None):
     """Считает НЕТТО-изменение отыгрышей (новая явка минус старая) и
     инкрементит gameStats в Firebase + создаёт уведомление игроку при
@@ -4293,20 +4434,59 @@ def _is_active_entry(entry, now_ms):
     return entry.get('expiresAtMs', 0) > now_ms
 
 
-def _build_warning_reason(number: int) -> str:
+def _disc_reason_tier(number: int, tier1: str, tier2: str, tier3_plus: str) -> str:
+    """Общая 3-уровневая эскалация формулировки: #1 (первый раз), #2
+    (повторно), #3+ (систематическое игнорирование). number считается
+    ОТДЕЛЬНО для каждого источника нарушения (см. _apply_disciplinary_action_sync),
+    поэтому несвязанные друг с другом нарушения не влияют на формулировку."""
     if number <= 1:
-        return ("Неактивность. Замечание #1. Боец не отметился на мероприятии с обязательной "
-                "записью и не находился в отпуске. Нарушение п. 9 Устава")
-    return (f"Неактивность. Замечание #{number}. Боец повторно не отметился на мероприятии с обязательной "
-            "записью для всех бойцов и не находился в отпуске. Нарушение п. 9 Устава")
+        return tier1
+    if number == 2:
+        return tier2
+    return tier3_plus
 
 
-def _build_reprimand_reason(number: int) -> str:
-    return (f"Неактивность. Выговор #{number}. Боец игнорирует неоднократные замечания о необходимости "
-            "отметок на мероприятия с обязательной записью и не находится в отпуске. Нарушение п. 9 Устава")
+def _disc_action_word_and_verb(action: str):
+    """('замечание', 'вынесено') или ('выговор', 'вынесен') — с ПРАВИЛЬНЫМ
+    грамматическим согласованием ('вынесено замечание' — средний род, но
+    'вынесен выговор' — мужской род; раньше использовалась одна форма
+    'вынесено' для обоих случаев, что грамматически неверно)."""
+    if action == 'warning':
+        return "замечание", "вынесено"
+    return "выговор", "вынесен"
 
 
-def _build_disc_entry(entry_type: str, reason: str, duration: timedelta, now_ms: int) -> dict:
+def _build_inactivity_reason(action_type: str, number: int) -> str:
+    """action_type: 'Замечание' или 'Выговор' — формулировка идентична по
+    смыслу для обоих, отличается только словом и номером."""
+    return _disc_reason_tier(
+        number,
+        f"Неактивность. {action_type} #1. Боец не отметился на мероприятии с обязательной "
+        "записью и не находился в отпуске. Нарушение п. 9 Устава",
+        f"Неактивность. {action_type} #2. Боец повторно не отметился на мероприятии с обязательной "
+        "записью для всех бойцов и не находился в отпуске. Нарушение п. 9 Устава",
+        f"Неактивность. {action_type} #{number}. Боец игнорирует неоднократные замечания о "
+        "необходимости отметок на мероприятия с обязательной записью и не находится в отпуске. "
+        "Нарушение п. 9 Устава",
+    )
+
+
+def _build_false_acceptance_reason(action_type: str, number: int) -> str:
+    """action_type: 'Замечание' или 'Выговор'. Источник: боец отметился
+    'Приду' на мероприятии, но не явился и не предупредил командование
+    (выбирается вручную на финальном шаге мастера явки)."""
+    return _disc_reason_tier(
+        number,
+        f"Неявка при запланированной явке. {action_type} #1. Боец не явился на мероприятие, "
+        "хотя поставил отметку, что придёт, и не предупредил командование. Нарушение п. 9.2 и 9.4 Устава",
+        f"Неявка при запланированной явке. {action_type} #2. Боец повторно не явился на мероприятие, "
+        "хотя поставил отметку, что придёт, и не предупредил командование. Нарушение п. 9.2 и 9.4 Устава",
+        f"Неявка при запланированной явке. {action_type} #{number}. Боец игнорирует неоднократные "
+        "замечания о необходимости предупреждать командование о невозможности явиться на мероприятие, "
+        "хотя ставит отметки, что придёт. Нарушение п. 9.2 и 9.4 Устава",
+    )
+
+def _build_disc_entry(entry_type: str, reason: str, duration: timedelta, now_ms: int, source: str = 'auto_inactivity') -> dict:
     return {
         'id': f"{now_ms}-{uuid.uuid4().hex[:6]}",
         'type': entry_type,
@@ -4314,17 +4494,24 @@ def _build_disc_entry(entry_type: str, reason: str, duration: timedelta, now_ms:
         'scope': GAMESTATS_GAME_NAME,
         'issuedAtMs': now_ms,
         'expiresAtMs': now_ms + int(duration.total_seconds() * 1000),
-        'source': 'auto_inactivity',
+        'source': source,
     }
 
 
-def _apply_disciplinary_action_sync(uid):
+def _apply_disciplinary_action_sync(uid, source='auto_inactivity', reason_builder=None):
     """Транзакционно выносит замечание ИЛИ выговор (в зависимости от того,
-    что ещё не исчерпано из максимума 3), учитывая ВСЕ действующие записи
-    (не только автоматические) при подсчёте лимита. Нумерация #1/#2/#3 в
-    тексте — только по автоматическим записям причины 'Неактивность'.
+    что ещё не исчерпано из ГЛОБАЛЬНОГО максимума 3/3 — считается по ВСЕМ
+    действующим записям, любого источника). Нумерация #1/#2/#3+ в тексте
+    причины — ОТДЕЛЬНЫЙ счётчик, считающий ТОЛЬКО действующие записи
+    ИМЕННО ЭТОГО источника (source), причём ОБЩИЙ между замечаниями и
+    выговорами этого источника — иначе номер сбрасывался бы при переходе
+    от замечания к выговору за один и тот же повторяющийся проступок.
+    Используемые сейчас источники: 'auto_inactivity' (не отметился на
+    мероприятии) и 'false_acceptance' (отметился 'Приду', но не пришёл) —
+    независимы друг от друга, не влияют на нумерацию друг друга.
     При достижении 3 действующих выговоров (любого происхождения) —
     переводит в 'Отставка'/'Дезертир' и в profiles, и в rosterPublic."""
+    reason_builder = reason_builder or _build_inactivity_reason
     profile_ref = fs_db.collection('profiles').document(uid)
     roster_ref = fs_db.collection('rosterPublic').document(uid)
     transaction = fs_db.transaction()
@@ -4333,8 +4520,6 @@ def _apply_disciplinary_action_sync(uid):
     def _txn(transaction):
         snap = profile_ref.get(transaction=transaction)
         if not snap.exists:
-            # Профиль физически не существует — это ПОСТОЯННАЯ причина
-            # (не временный сбой сети), повторные попытки её не исправят.
             return {'action': None, 'status': 'profile_not_found'}
         data = snap.to_dict() or {}
         game_da = data.get('gameDisciplinaryActions', {}) or {}
@@ -4346,35 +4531,37 @@ def _apply_disciplinary_action_sync(uid):
 
         active_warnings = [a for a in actions if active(a, 'Замечание')]
         active_reprimands = [a for a in actions if active(a, 'Выговор')]
+        # Единый (общий для замечаний и выговоров) счётчик номера нарушения
+        # ИМЕННО ЭТОГО источника. Просроченные записи (expiresAtMs <= now_ms)
+        # сюда не попадают — поэтому по истечении срока действия взыскание
+        # для бота "как будто никогда не было", и счёт сам начнётся заново
+        # (это же справедливо и для порогов active_warnings/active_reprimands выше).
+        same_source_active_count = len([
+            a for a in actions if _is_active_entry(a, now_ms) and a.get('source') == source
+        ])
 
         result = {'action': None, 'expelled': False}
 
         if len(active_warnings) < MAX_ACTIVE_WARNINGS:
-            number = len([a for a in active_warnings if a.get('source') == 'auto_inactivity']) + 1
-            reason = _build_warning_reason(number)
-            actions.append(_build_disc_entry('Замечание', reason, WARNING_DURATION, now_ms))
+            number = same_source_active_count + 1
+            reason = reason_builder('Замечание', number)
+            actions.append(_build_disc_entry('Замечание', reason, WARNING_DURATION, now_ms, source))
             result['action'] = 'warning'
             result['reason'] = reason
         elif len(active_reprimands) < MAX_ACTIVE_REPRIMANDS:
-            number = len([a for a in active_reprimands if a.get('source') == 'auto_inactivity']) + 1
-            reason = _build_reprimand_reason(number)
-            actions.append(_build_disc_entry('Выговор', reason, REPRIMAND_DURATION, now_ms))
+            number = same_source_active_count + 1
+            reason = reason_builder('Выговор', number)
+            actions.append(_build_disc_entry('Выговор', reason, REPRIMAND_DURATION, now_ms, source))
             result['action'] = 'reprimand'
             result['reason'] = reason
-        # иначе: уже максимум и того, и другого — ничего не добавляем,
-        # но ниже всё равно проверим порог исключения (например, если 3
-        # выговора набрались ранее вручную, без участия бота).
+        # иначе: уже глобальный максимум и того, и другого — ничего не
+        # добавляем, но ниже всё равно проверим порог исключения.
 
         current_composition = ((data.get('gameRoles') or {}).get(GAMESTATS_GAME_NAME) or {}).get('composition', '')
         final_active_reprimands = [a for a in actions if active(a, 'Выговор')]
         should_expel = len(final_active_reprimands) >= MAX_ACTIVE_REPRIMANDS and current_composition != 'Отставка'
 
-        # profiles — через update(): здесь точечные пути КОРРЕКТНЫ.
         updates = {f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': actions}
-        # rosterPublic — через set(merge=True): в Python-SDK Firestore этот метод
-        # НЕ раскрывает точки как вложенность (в отличие от update()), поэтому
-        # структуру нужно передавать ВЛОЖЕННЫМИ СЛОВАРЯМИ — иначе создалось бы
-        # мусорное поле с буквальным именем "gameDisciplinaryActions.Arma Reforger".
         roster_updates = {'gameDisciplinaryActions': {GAMESTATS_GAME_NAME: actions}}
 
         if should_expel:
@@ -4387,14 +4574,8 @@ def _apply_disciplinary_action_sync(uid):
 
         result['status'] = 'success'
         transaction.update(profile_ref, updates)
-        # set(merge=True) вместо update(): update() требует существования
-        # документа в rosterPublic и в противном случае откатывает ВСЮ
-        # транзакцию целиком (включая обновление profile). set(merge=True)
-        # безопасно создаёт документ при отсутствии, не переписывая
-        # остальные поля, если он уже есть.
         transaction.set(roster_ref, roster_updates, merge=True)
         return result
-
 
     return _txn(transaction)
 
@@ -4403,27 +4584,118 @@ async def apply_inactivity_discipline(uid):
     """Возвращает dict с ключом 'status':
       'success'           — взыскание реально применено (или явно не
                              требовалось при уже существующем max) —
-                             ВСЕГДА безопасно помечать боевого как обработанного.
+                             ВСЕГДА безопасно помечать бойца как обработанного.
       'profile_not_found' — постоянная причина, профиля не существует —
                              тоже безопасно помечать (retry не поможет).
       'retryable_error'   — ВРЕМЕННЫЙ сбой (сеть/Firestore) — боец НЕ должен
                              помечаться обработанным, чтобы recovery-задача
-                             попыталась снова позже. Раньше оба случая
-                             (нет профиля / временный сбой сети) возвращали
-                             одинаковый None и помечались одинаково, из-за
-                             чего транзиентная ошибка Firebase могла
-                             НАВСЕГДА лишить бойца заслуженного взыскания."""
+                             попыталась снова позже."""
     if not fs_db:
         return {'action': None, 'status': 'retryable_error'}
     loop = asyncio.get_running_loop()
     try:
-        result = await loop.run_in_executor(EXECUTOR, _apply_disciplinary_action_sync, uid)
+        result = await loop.run_in_executor(
+            EXECUTOR, _apply_disciplinary_action_sync, uid, 'auto_inactivity', _build_inactivity_reason
+        )
         if 'status' not in result:
             result['status'] = 'success'
         return result
     except Exception as e:
         print(f"❌ Ошибка применения дисциплинарного взыскания (uid={uid}): {e}")
         return {'action': None, 'status': 'retryable_error'}
+
+
+async def apply_false_acceptance_discipline(uid):
+    """То же самое, но для источника 'false_acceptance' — боец отметился
+    'Приду', но не пришёл и не предупредил командование (см. п.3, финальный
+    шаг мастера явки: FalseAcceptanceSelectView)."""
+    if not fs_db:
+        return {'action': None, 'status': 'retryable_error'}
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            EXECUTOR, _apply_disciplinary_action_sync, uid, 'false_acceptance', _build_false_acceptance_reason
+        )
+        if 'status' not in result:
+            result['status'] = 'success'
+        return result
+    except Exception as e:
+        print(f"❌ Ошибка применения дисциплинарного взыскания за ложную отметку (uid={uid}): {e}")
+        return {'action': None, 'status': 'retryable_error'}
+
+
+async def announce_and_apply_expulsion_effects(member, nickname, thread, context_label: str):
+    """Общая часть логики при достижении 3 действующих выговоров (любого
+    источника): снимает управляемые роли Discord и уведомляет бойца в
+    ветке. context_label — уточнение причины в тексте ('за неактивность',
+    'за ложные отметки о явке' и т.д.). Используется и после взыскания за
+    неактивность, и после взыскания за ложную отметку явки."""
+    if member:
+        guild = member.guild
+        roles_to_check = [guild.get_role(ROLE_IDS[key]) for key in EXPULSION_ROLE_KEYS]
+        present_roles = [r for r in roles_to_check if r and r in member.roles]
+        if present_roles:
+            try:
+                await member.remove_roles(*present_roles, reason=f"3 действующих выговора {context_label}")
+            except Exception as e:
+                print(f"⚠️ Не удалось снять роли у {nickname}: {e}")
+    if thread:
+        mention = member.mention if member else f"**{nickname}**"
+        try:
+            await thread.send(
+                f"{mention}\n\n" +
+                es(f"🚫 Вы достигли 3 действующих выговоров {context_label}. Статус на сайте изменён на "
+                   "'Отставка', соответствующие роли на сервере сняты. Если хотите вернуться в клан — "
+                   "обратитесь к командованию.")
+            )
+        except Exception:
+            pass
+
+
+async def apply_false_acceptance_punishments(wizard, thread):
+    """Выносит дисциплинарные взыскания бойцам, отмеченным на финальном шаге
+    мастера явки как 'поставил Приду, но не пришёл и не предупредил'."""
+    any_expelled = False
+    for nickname in (wizard.false_acceptance_punish or []):
+        uid = await get_uid_by_nickname(nickname)
+        if not uid:
+            print(f"⚠️ Не удалось найти uid для '{nickname}' — взыскание за ложную отметку не вынесено")
+            continue
+
+        result = await apply_false_acceptance_discipline(uid)
+        status = result.get('status') if result else 'retryable_error'
+        if status == 'retryable_error':
+            print(f"⚠️ Временный сбой при вынесении взыскания за ложную отметку '{nickname}'.")
+            continue
+        if not result or not result.get('action'):
+            continue
+
+        member = await find_member_by_nickname(nickname)
+        mention = member.mention if member else f"**{nickname}**"
+        action_word, verb = _disc_action_word_and_verb(result['action'])
+
+        if thread:
+            text = (
+                f"{mention}\n\n" +
+                es(f"⚠️ Вам {verb} {action_word} за ложную отметку о явке:\n\n") +
+                f"> {result['reason']}\n\n" +
+                "Пожалуйста, предупреждайте командование заранее, если не сможете явиться на мероприятие, "
+                "если заранее указывали «Приду». Подробности — в вашем личном деле на сайте клана."
+            )
+            try:
+                await thread.send(text)
+            except Exception as e:
+                print(f"⚠️ Не удалось отправить уведомление о взыскании за ложную отметку для {nickname}: {e}")
+
+        if result.get('expelled'):
+            any_expelled = True
+            await announce_and_apply_expulsion_effects(member, nickname, thread, "за ложные отметки о явке")
+
+        await asyncio.sleep(1)
+
+    if any_expelled:
+        invalidate_clan_members_cache()
+        await refresh_all_active_event_embeds()
 
 async def _mark_discipline_processed(event_id: str):
     """Единая точка для пометки event['discipline_processed'] = True —
@@ -4519,12 +4791,12 @@ async def process_inactivity_discipline_for_event(event_id):
 
         member = await find_member_by_nickname(nickname)
         mention = member.mention if member else f"**{nickname}**"
-        action_word = "замечание" if result['action'] == 'warning' else "выговор"
+        action_word, verb = _disc_action_word_and_verb(result['action'])
 
         if thread:
             text = (
                 f"{mention}\n\n" +
-                es(f"⚠️ Вам вынесено {action_word} за неактивность:\n\n") +
+                es(f"⚠️ Вам {verb} {action_word} за неактивность:\n\n") +
                 f"> {result['reason']}\n\n" +
                 "Пожалуйста, не забывайте отмечаться на мероприятиях с обязательной записью, если вы не находитесь "
                 "в отпуске. Подробности — в вашем личном деле на сайте клана."
@@ -4536,25 +4808,7 @@ async def process_inactivity_discipline_for_event(event_id):
 
         if result.get('expelled'):
             any_expelled = True
-            if member:
-                guild = member.guild
-                roles_to_check = [guild.get_role(ROLE_IDS[key]) for key in EXPULSION_ROLE_KEYS]
-                present_roles = [r for r in roles_to_check if r and r in member.roles]
-                if present_roles:
-                    try:
-                        await member.remove_roles(*present_roles, reason="3 действующих выговора за неактивность")
-                    except Exception as e:
-                        print(f"⚠️ Не удалось снять роли у {nickname}: {e}")
-            if thread:
-                try:
-                    await thread.send(
-                        f"{mention}\n\n" +
-                        es("🚫 Вы достигли 3 действующих выговоров за неактивность. Статус на сайте изменён на "
-                           "'Отставка', соответствующие роли на сервере сняты. Если хотите вернуться в клан — "
-                           "обратитесь к командованию.")
-                    )
-                except Exception:
-                    pass
+            await announce_and_apply_expulsion_effects(member, nickname, thread, "за неактивность")
 
         await asyncio.sleep(1)
 
@@ -4802,6 +5056,7 @@ class AttendanceWizard:
         self.side_commanders = {}
         self.current_step = 0
         self.phase = 'players'
+        self.false_acceptance_punish = []  # заполняется на финальном шаге мастера явки (п.3)
 
 
 class CommandersSelectView(discord.ui.View):
@@ -5068,18 +5323,87 @@ async def proceed_to_next_step(interaction, wizard):
     clan_members = await load_clan_members_from_firebase()
     
     if wizard.num_games == 0:
-        await finalize_attendance(interaction, wizard)
+        await show_false_acceptance_step(interaction, wizard)
         return
     
     wizard.current_step += 1
     
     if wizard.current_step >= wizard.num_games:
-        await finalize_attendance(interaction, wizard)
+        await show_false_acceptance_step(interaction, wizard)
         return
     
     view = AttendanceStepView(wizard, wizard.current_step, clan_members)
     title_text = es(f"👥 **{wizard.event_title}**\n\n") + es(f"**Матч {wizard.current_step + 1}** из {wizard.num_games}\nВыберите явившихся:")
     await interaction.followup.send(title_text, view=view, ephemeral=True)
+
+
+async def show_false_acceptance_step(interaction, wizard):
+    """Финальный шаг мастера явки (п.3): среди тех, кто отметился «Приду»
+    на этом мероприятии, но не был отмечен явившимся НИ НА ОДНОМ этапе —
+    опционально позволяет выбрать, кого наказать за ложную отметку. Если
+    таких бойцов нет — шаг автоматически пропускается."""
+    events = load_json(EVENTS_FILE, {})
+    event = events.get(wizard.event_id, {})
+    accepted = set(event.get('accepted', {}).keys())
+
+    all_present = set()
+    for players, _, _ in _extract_game_triples_from_wizard(wizard):
+        all_present.update(players or [])
+
+    candidates = sorted(accepted - all_present)
+
+    if not candidates:
+        wizard.false_acceptance_punish = []
+        await finalize_attendance(interaction, wizard)
+        return
+
+    view = FalseAcceptanceSelectView(wizard, candidates)
+    text = (
+        es("⚠️ **Ложные отметки о явке**\n\n") +
+        "Следующие бойцы отметились «Приду», но не были отмечены явившимися ни на одном этапе:\n\n" +
+        "\n".join(candidates) + "\n\n" +
+        "Если кто-то из них не пришёл и не предупредил командование — выберите их ниже, чтобы вынести "
+        "дисциплинарное взыскание за ложную отметку. Можно оставить пустым, если наказывать никого не нужно."
+    )
+    await interaction.followup.send(text, view=view, ephemeral=True)
+
+
+class FalseAcceptanceSelectView(discord.ui.View):
+    """Опциональный выбор бойцов, отметившихся «Приду», но не пришедших и
+    не предупредивших командование — для вынесения взыскания (п. 9.2/9.4
+    Устава). Публикация отчёта продолжается по нажатию кнопки в любом случае."""
+    def __init__(self, wizard, candidates):
+        super().__init__(timeout=300)
+        self.wizard = wizard
+        self.selected = []
+        capped = candidates[:MAX_SELECT_OPTIONS]
+        options = [discord.SelectOption(label=nick, value=nick) for nick in capped]
+        self.select = discord.ui.Select(
+            placeholder="⚠️ Кого наказать за ложную отметку (необязательно)...",
+            options=options, min_values=0, max_values=len(options)
+        )
+        self.select.callback = self._select_callback
+        self.add_item(self.select)
+
+        finish_btn = discord.ui.Button(label=es("✅ Опубликовать отчёт о явке"), style=discord.ButtonStyle.primary, row=1)
+        finish_btn.callback = self._finish_callback
+        self.add_item(finish_btn)
+
+    async def _select_callback(self, interaction):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Только комбат или заместитель!"), ephemeral=True)
+            return
+        self.selected = list(self.select.values)
+        await interaction.response.defer()
+
+    async def _finish_callback(self, interaction):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Только комбат или заместитель!"), ephemeral=True)
+            return
+        self.wizard.false_acceptance_punish = list(self.selected)
+        self.stop()
+        await interaction.response.defer()
+        await finalize_attendance(interaction, self.wizard)
 
 
 async def finalize_attendance(interaction, wizard):
@@ -5197,6 +5521,8 @@ async def finalize_attendance(interaction, wizard):
     if queue_changed:
         await refresh_all_active_event_embeds()
 
+    await apply_false_acceptance_punishments(wizard, thread)
+
     # === Завершение мероприятия при подаче явки (п.1, п.2) ===
     event_end_dt = datetime.fromtimestamp(event['end_time'], MSK)
     now = datetime.now(MSK)
@@ -5257,13 +5583,62 @@ async def finalize_attendance(interaction, wizard):
 
 # ============== ФУНКЦИИ ОТПУСКОВ ==============
 
+def build_vacation_rules_embed():
+    embed = discord.Embed(title=es("🏖️ Оформление отпусков"), description=VACATION_RULES, color=discord.Color.green())
+    embed.set_footer(text="Нажмите кнопку ниже, чтобы оформить отпуск")
+    return embed
+
+
+async def find_or_create_vacation_rules_message(channel):
+    """Ищет сообщение с правилами отпусков: сначала по сохранённому ID
+    (надёжно и дёшево, переживает любую активность в канале), затем скан
+    истории как fallback, и только потом создаёт новое. Раньше здесь был
+    ТОЛЬКО скан последних 20 сообщений канала — при активном канале отпусков
+    (по сообщению на каждый запрос) сообщение с правилами быстро выпадало
+    за пределы этого окна, и бот создавал ДУБЛИКАТ при каждом обновлении
+    шаблонов."""
+    anchors = load_json(ADMIN_ANCHORS_FILE, {})
+    saved_id = anchors.get('vacation_rules_message_id')
+    if saved_id:
+        try:
+            message = await channel.fetch_message(saved_id)
+            if message.embeds and message.embeds[0].title == es("🏖️ Оформление отпусков"):
+                return message
+        except Exception:
+            pass  # сообщение удалено/недоступно — переходим к скану истории
+
+    async for message in channel.history(limit=200):
+        if message.author.id != client.user.id:
+            continue
+        if message.embeds and message.embeds[0].title == es("🏖️ Оформление отпусков"):
+            anchors['vacation_rules_message_id'] = message.id
+            save_json(ADMIN_ANCHORS_FILE, anchors)
+            return message
+
+    message = await channel.send(embed=build_vacation_rules_embed(), view=VacationRequestView())
+    anchors['vacation_rules_message_id'] = message.id
+    save_json(ADMIN_ANCHORS_FILE, anchors)
+    return message
+
+
+async def ensure_vacation_rules_message():
+    """Находит (или создаёт при первом запуске) сообщение с правилами
+    отпусков — вызывается при старте бота, аналогично якорным сообщениям
+    админ-канала."""
+    channel = await client.fetch_channel(VACATION_CHANNEL_ID)
+    message = await find_or_create_vacation_rules_message(channel)
+    try:
+        await message.edit(embed=build_vacation_rules_embed(), view=VacationRequestView())
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить сообщение с правилами отпусков: {e}")
+
+
 async def publish_vacation_info(interaction):
     try:
         channel = await client.fetch_channel(VACATION_CHANNEL_ID)
-        embed = discord.Embed(title=es("🏖️ Оформление отпусков"), description=VACATION_RULES, color=discord.Color.green())
-        embed.set_footer(text="Нажмите кнопку ниже, чтобы оформить отпуск")
-        await channel.send(embed=embed, view=VacationRequestView())
-        await interaction.response.send_message(es("✅ Правила отпусков опубликованы!"), ephemeral=True)
+        message = await find_or_create_vacation_rules_message(channel)
+        await message.edit(embed=build_vacation_rules_embed(), view=VacationRequestView())
+        await interaction.response.send_message(es("✅ Правила отпусков опубликованы/обновлены!"), ephemeral=True)
     except Exception as e:
         await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
 
@@ -5382,6 +5757,8 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
             member = await find_member_by_nickname(nickname)
             if member:
                 await update_vacation_role(member, True)
+
+            await refresh_event_embeds_overlapping_period(start_date.isoformat(), end_date.isoformat())
 
             await interaction.followup.send(es(f"✅ Отпуск для {nickname} оформлен и сразу активирован!"), ephemeral=True)
             return
@@ -5504,6 +5881,7 @@ async def approve_vacation(interaction, nickname):
             await message.edit(embed=embed, view=VacationMessageView())
     except Exception:
         pass
+    await refresh_event_embeds_overlapping_period(vacation['start'], vacation['end'])
     await interaction.followup.send(f"✅ Отпуск {nickname} утверждён!", ephemeral=True)
 
 
@@ -5596,6 +5974,11 @@ async def close_vacation(interaction, nickname, early=False, by_admin=False):
     if member:
         await update_vacation_role(member, False)
     await send_vacation_return_message(nickname)
+    # Обновляем embed'ы ВСЕХ мероприятий (в т.ч. уже завершённых), чьи даты
+    # попадают в период этого отпуска — и те, что прошли ВО ВРЕМЯ отпуска
+    # (должны по-прежнему корректно его исключать), и те, что впереди
+    # (боец должен снова появиться в списке "Не отметились").
+    await refresh_event_embeds_overlapping_period(vacation['start'], vacation['end'])
     try:
         channel = await client.fetch_channel(vacation['channel_id'])
         message = await channel.fetch_message(vacation['message_id'])
@@ -5666,7 +6049,7 @@ async def check_expired_vacations():
                 continue
 
             closed_at = datetime.now(MSK).isoformat()
-            closed_nicknames.append((nickname, data.get('start'), closed_at))
+            closed_nicknames.append((nickname, data.get('start'), data.get('end'), closed_at))
 
             member = await find_member_by_nickname(nickname)
             if member:
@@ -5691,16 +6074,14 @@ async def check_expired_vacations():
         except Exception:
             pass
 
+    actually_closed_periods = []
     if closed_nicknames:
         async with _vacations_write_lock:
             fresh_vacations = load_json(VACATIONS_FILE, {})
-            for nickname, expected_start, closed_at in closed_nicknames:
+            for nickname, expected_start, expected_end, closed_at in closed_nicknames:
                 fresh_data = fresh_vacations.get(nickname)
                 if fresh_data is None:
                     continue
-                # Сверка 'start' — гарантия, что это ТОТ ЖЕ отпуск, что мы
-                # обрабатывали, а не новый, поданный этим же бойцом за
-                # время выполнения сетевых операций выше.
                 if fresh_data.get('start') != expected_start:
                     continue
                 if fresh_data.get('status') != 'active':
@@ -5708,8 +6089,16 @@ async def check_expired_vacations():
                 fresh_data['status'] = 'ended_scheduled'
                 fresh_data['closed_at'] = closed_at
                 fresh_data['closed_by'] = 'Система (автоматически)'
+                actually_closed_periods.append((expected_start, expected_end))
             save_json(VACATIONS_FILE, fresh_vacations)
-        
+
+    # Пересчитываем embed'ы мероприятий (любого статуса), попавших в период
+    # каждого фактически закрытого отпуска — та же логика, что и при
+    # ручном закрытии (см. close_vacation), но для автоматического истечения срока.
+    for start_iso, end_iso in actually_closed_periods:
+        await refresh_event_embeds_overlapping_period(start_iso, end_iso)
+
+
 async def check_vacation_ending_soon():
     """Отправляет напоминание бойцу за сутки до окончания его отпуска (один раз).
 
@@ -5812,6 +6201,7 @@ async def handle_event_response(interaction, event_id, response_type):
         return
     nickname = interaction.user.display_name
     current_date = datetime.now(MSK)
+    event_start = datetime.fromtimestamp(event['start_time'], MSK)
     event_end = datetime.fromtimestamp(event['end_time'], MSK)
     if current_date > event_end:
         await interaction.followup.send(es("⛔ Мероприятие уже завершено. Отметки больше не принимаются!"), ephemeral=True)
@@ -5827,8 +6217,13 @@ async def handle_event_response(interaction, event_id, response_type):
             )
             return
 
-    if is_on_vacation_dynamic(nickname, current_date):
-        await interaction.followup.send(es("🏖️ Вы сейчас в отпуске."), ephemeral=True)
+    # ВАЖНО: отпуск проверяется на ДАТУ МЕРОПРИЯТИЯ, а не на "сейчас" — иначе
+    # боец, чей отпуск закончится ДО начала мероприятия, не мог бы отметиться
+    # заранее (хотя к моменту события он уже точно вернётся). Согласуется
+    # с build_event_embed/get_active_members, которые тоже считают отпуск
+    # относительно event_start, а не текущего момента.
+    if is_on_vacation_dynamic(nickname, event_start):
+        await interaction.followup.send(es("🏖️ Вы будете в отпуске на дату этого мероприятия."), ephemeral=True)
         return
 
     # ВАЖНО: между первым load_json() выше и этим моментом были await'ы
@@ -7111,22 +7506,9 @@ async def update_all_templates():
     # === 3. ОБНОВЛЕНИЕ ПРАВИЛ ОТПУСКОВ ===
     try:
         channel = await client.fetch_channel(VACATION_CHANNEL_ID)
-        rules_updated = False
-        async for message in channel.history(limit=20):
-            if message.author.id != client.user.id:
-                continue
-            if message.embeds and message.embeds[0].title == es("🏖️ Оформление отпусков"):
-                embed = discord.Embed(title=es("🏖️ Оформление отпусков"), description=VACATION_RULES, color=discord.Color.green())
-                embed.set_footer(text="Нажмите кнопку ниже, чтобы оформить отпуск")
-                await message.edit(embed=embed, view=VacationRequestView())
-                rules_updated = True
-                vac_updated += 1
-                break
-        if not rules_updated:
-            embed = discord.Embed(title=es("🏖️ Оформление отпусков"), description=VACATION_RULES, color=discord.Color.green())
-            embed.set_footer(text="Нажмите кнопку ниже, чтобы оформить отпуск")
-            await channel.send(embed=embed, view=VacationRequestView())
-            vac_updated += 1
+        message = await find_or_create_vacation_rules_message(channel)
+        await message.edit(embed=build_vacation_rules_embed(), view=VacationRequestView())
+        vac_updated += 1
     except Exception as e:
         print(f"❌ Ошибка обновления правил отпусков: {e}")
         vac_errors += 1
@@ -7167,14 +7549,56 @@ async def update_all_templates():
             if thread and was_locked:
                 await lock_and_archive_thread(thread)
 
+    # === 5. РЕСИНХРОНИЗАЦИЯ АНКЕТ (перерисовка embed'а свежими данными профиля) ===
+    # Живой watcher (handle_profile_modified_watch) обновляет анкету ТОЛЬКО
+    # когда сам профиль реально меняется на сайте — если поменялось только
+    # оформление embed'а в коде бота (например, добавилось новое поле вроде
+    # "Причина вступления в клан"), уже опубликованные анкеты сами не
+    # перерисуются никогда, пока боец случайно не отредактирует профиль.
+    # Эта секция принудительно перерисовывает ВСЕ анкеты свежими данными.
+    anketa_updated = 0
+    anketa_errors = 0
+    anketa_mapping = load_json(ANKETA_MESSAGES_FILE, {})
+    for uid, info in anketa_mapping.items():
+        if not info.get('channel_id') or not info.get('message_id'):
+            continue
+        try:
+            fresh_data = await get_profile_data(uid)
+            if not fresh_data:
+                anketa_errors += 1
+                continue
+            channel = await client.fetch_channel(info['channel_id'])
+            message = await channel.fetch_message(info['message_id'])
+            was_new = bool(message.embeds and message.embeds[0].title and message.embeds[0].title.startswith("Новая анкета"))
+            embed = await build_anketa_embed(uid, fresh_data, is_new=was_new)
+
+            old_embed_dict = message.embeds[0].to_dict() if message.embeds else None
+            new_embed_dict = embed.to_dict()
+            if old_embed_dict == new_embed_dict:
+                continue
+
+            await message.edit(embed=embed)
+            _LAST_ANKETA_EMBED_SNAPSHOT[uid] = json.dumps(new_embed_dict, sort_keys=True, default=str)
+            _LAST_ANKETA_RAW_FINGERPRINT[uid] = _anketa_raw_fingerprint(fresh_data)
+            anketa_updated += 1
+            await asyncio.sleep(0.4)
+        except discord.NotFound:
+            anketa_errors += 1
+        except Exception as e:
+            print(f"❌ Ошибка ресинхронизации анкеты uid={uid}: {e}")
+            anketa_errors += 1
+
     print(f"🔄 Итог обновления шаблонов:")
     print(f"   📅 Мероприятий: изменено {ev_updated}, без изменений {ev_unchanged}, ошибок {ev_errors}")
     print(f"   🏖️ Отпусков: обновлено {vac_updated}, ошибок {vac_errors}")
     print(f"   🏆 Отчётов о явке: обновлено {att_updated}, ошибок {att_errors}")
     print(f"   💬 Названий веток исправлено: {thread_names_fixed}, сообщений в ветках обновлено: {thread_messages_fixed}, блокировок исправлено: {thread_locks_fixed}")
     print(f"   🛠️ Якорных сообщений обновлено: {anchors_fixed}")
+    print(f"   📝 Анкет ресинхронизировано: {anketa_updated}, ошибок {anketa_errors}")
     
-    return ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors, thread_names_fixed, thread_messages_fixed, thread_locks_fixed, anchors_fixed
+    return (ev_updated, ev_errors, vac_updated, vac_errors, att_updated, att_errors,
+            thread_names_fixed, thread_messages_fixed, thread_locks_fixed, anchors_fixed,
+            anketa_updated, anketa_errors)
 
 
 # ============== ПОСТОЯННАЯ ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ==============
@@ -7537,12 +7961,25 @@ async def force_restart_bot():
 @client.event
 async def on_member_join(member: discord.Member):
     member_index.upsert(member)
-
+    try:
+        await relink_discord_id_on_join(member)
+    except Exception as e:
+        print(f"⚠️ Ошибка relink_discord_id_on_join для {member}: {e}")
 
 @client.event
 async def on_member_remove(member: discord.Member):
     member_index.remove(member)
-
+    if member.bot:
+        return
+    try:
+        channel = await client.fetch_channel(MEMBER_LEAVE_LOG_CHANNEL_ID)
+        joined_str = member.joined_at.astimezone(MSK).strftime('%d.%m.%Y %H:%M') if member.joined_at else "неизвестно"
+        await channel.send(
+            es(f"🚪 **{member.display_name}** (`{member}`, ID: {member.id}) покинул(а) сервер. "
+               f"Был(а) на сервере с {joined_str} МСК.")
+        )
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить сообщение о выходе {member} с сервера: {e}")
 
 @client.event
 async def on_member_update(before: discord.Member, after: discord.Member):
@@ -7712,6 +8149,10 @@ async def on_ready():
         await ensure_self_assign_roles_message()
     except Exception as e:
         print(f"⚠️ Не удалось опубликовать сообщение выбора гостевых ролей: {e}")
+    try:
+        await ensure_vacation_rules_message()
+    except Exception as e:
+        print(f"⚠️ Не удалось опубликовать/найти сообщение с правилами отпусков: {e}")
 
     # Печатаем ЭТОТ лог последним — только после того, как ветка "🔧 Логирование"
     # уже гарантированно найдена/создана (ensure_admin_channel_anchors выше)
