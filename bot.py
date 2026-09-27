@@ -727,6 +727,21 @@ def compute_arma_role_keys(composition: str, position: str, active_warnings: int
         return {'lichnyj_sostav_arma', pos_key, 'klan_arma', 'klan_enemy'}, 'remove'
     return None
 
+def compute_desired_nickname(composition: str, callsign: str):
+    """Желаемый никнейм в зависимости от состава:
+      Личный состав / Запас -> "[En-Y]Позывной" (с клантегом)
+      Отбор / Отставка      -> "Позывной" (БЕЗ клантега — при переходе
+                                из Личного состава/Запаса в Отставку тег
+                                убирается автоматически)
+      неизвестный/пустой composition -> None (никнейм не трогаем вообще)
+    Возвращает None и в случае пустого callsign — менять никнейм не на что."""
+    if not callsign:
+        return None
+    if composition in ACTIVE_CLAN_COMPOSITIONS:  # {"Личный состав", "Запас"}
+        return f"{CLAN_TAG}{callsign}"
+    if composition in ("Отбор", "Отставка"):
+        return callsign
+    return None
 
 VOICE_CHANNEL_ID = 1284893513921728582
 
@@ -3768,6 +3783,9 @@ async def sync_arma_member_state(uid: str, data: dict):
         return
     member = await find_member_by_discord_username(discord_username)
     if not member:
+        print(f"⚠️ sync_arma_member_state: не найден участник Discord по discordId='{discord_username}' "
+              f"(uid={uid}, callsign='{data.get('callsign', '?')}') — роли/никнейм НЕ синхронизированы. "
+              f"Проверьте, что это поле в профиле соответствует реальному username в Discord.")
         return
     guild = member.guild
 
@@ -3813,19 +3831,21 @@ async def sync_arma_member_state(uid: str, data: dict):
         except Exception as e:
             print(f"⚠️ Не удалось обновить роль 'Гость ArmA' для {member.display_name} (uid={uid}): {e}")
 
-    # === Никнейм "[En-Y]Позывной" для составов "Запас" и выше ===
-    if composition in ACTIVE_CLAN_COMPOSITIONS:  # {"Личный состав", "Запас"}
-        callsign = (data.get('callsign') or '').strip()
-        if callsign:
-            desired_nick = f"{CLAN_TAG}{callsign}"[:32]  # лимит Discord на никнейм
-            if member.display_name != desired_nick:
-                try:
-                    await member.edit(nick=desired_nick, reason="Синхронизация позывного с сайтом")
-                except discord.Forbidden:
-                    print(f"⚠️ Недостаточно прав для смены ника {member.display_name} "
-                          f"(возможно, участник выше бота по иерархии ролей)")
-                except Exception as e:
-                    print(f"⚠️ Не удалось изменить никнейм для {member.display_name} (uid={uid}): {e}")
+    # === Никнейм: с клантегом для "Личный состав"/"Запас", без тега для
+    # "Отбор" (только позывной) и "Отставка" (тег снимается, остаётся
+    # только позывной) — см. compute_desired_nickname().
+    callsign = (data.get('callsign') or '').strip()
+    desired_nick = compute_desired_nickname(composition, callsign)
+    if desired_nick:
+        desired_nick = desired_nick[:32]  # лимит Discord на никнейм
+        if member.display_name != desired_nick:
+            try:
+                await member.edit(nick=desired_nick, reason="Синхронизация позывного/клантега с сайтом")
+            except discord.Forbidden:
+                print(f"⚠️ Недостаточно прав для смены ника {member.display_name} "
+                      f"(возможно, участник выше бота по иерархии ролей)")
+            except Exception as e:
+                print(f"⚠️ Не удалось изменить никнейм для {member.display_name} (uid={uid}): {e}")
 
 
 async def handle_new_notification_watch(doc_id, data):
@@ -3849,6 +3869,24 @@ async def handle_new_notification_watch(doc_id, data):
         await set_watcher_last_ts('notifications', _extract_timestamp(data.get('createdAt')))
 
 
+def _log_watch_task_exception(doc_id, collection_hint: str = ""):
+    """Callback для future от run_coroutine_threadsafe — БЕЗ него необработанное
+    исключение внутри асинхронного обработчика (handle_new_profile_watch,
+    sync_arma_member_state и т.д.) улетало в никуда: run_coroutine_threadsafe
+    возвращает concurrent.futures.Future, результат которого никто не проверял,
+    поэтому любая ошибка внутри обработчика (например, KeyError из-за
+    неожиданного формата данных) была НЕВИДИМА ни в консоли, ни в Discord-логах."""
+    def _cb(future):
+        try:
+            exc = future.exception()
+        except Exception:
+            return
+        if exc:
+            print(f"❌ Необработанная ошибка в обработчике watcher'а{f' ({collection_hint})' if collection_hint else ''} "
+                  f"для документа {doc_id}: {exc}")
+    return _cb
+
+
 def _make_on_added_callback(handler_coro, watch_types=('ADDED',)):
     """Обёртка над Firestore watch-колбэком (выполняется в отдельном grpc-потоке).
     Передаёт обработку в основной event loop бота через run_coroutine_threadsafe.
@@ -3863,7 +3901,8 @@ def _make_on_added_callback(handler_coro, watch_types=('ADDED',)):
             data = doc.to_dict() or {}
             if MAIN_EVENT_LOOP:
                 try:
-                    asyncio.run_coroutine_threadsafe(handler_coro(doc.id, data), MAIN_EVENT_LOOP)
+                    future = asyncio.run_coroutine_threadsafe(handler_coro(doc.id, data), MAIN_EVENT_LOOP)
+                    future.add_done_callback(_log_watch_task_exception(doc.id, getattr(handler_coro, '__name__', '')))
                 except Exception as e:
                     print(f"❌ Ошибка планирования обработки документа {doc.id}: {e}")
     return _callback
