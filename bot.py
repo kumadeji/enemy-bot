@@ -596,24 +596,27 @@ ROLE_IDS = {
     'zam_kombat_arma': 1470351490005729383,
     'kombat_squad': 1230600119053848787,
     'zam_kombat_squad': 1503144759084974150,
-    'boets_arma': 1284456321005129778,
     'otpusk': 1536500577553481768,
     'zapas_arma': 1496435854531366913,
-    'clan_enemy': 1048133924645240903,
     'lichnyj_sostav_arma': 1449782732480577696,
-    'minomyotchik_arma': 1444670257565405337,
-    'btv_arma': 1444670373768593509,
-    'pilot_arma': 1444670451409490090,
-    'vzvozdnyj_ks_arma': 1448035996653588614,
-    'bpla_pilot_arma': 1474032938847834306,
-    'ko_arma': 1528120615821905960,
+    'boec_veteran_arma': 1548660791107133601,   # "Боец-ветеран ArmA"
+    'boec_arma': 1548661548585848882,           # "Боец ArmA" (общая для Личного состава и Запаса)
+    'klan_arma': 1284456321005129778,           # было 'boets_arma' — переименовано, ID тот же ("Клан ArmA")
+    'klan_enemy': 1549047492555833425,          # БЫЛ 1048133924645240903 (устарел) — актуализирован ("КЛАН ENEMY")
+    'gost_arma': 1250828979284213812,           # "Гость ArmA" — авто для состава "Отбор" + самостоятельный выбор (п.3)
+    # Роли специализаций (миномётчик/БТВ/пилот/КО и т.д.) удалены из реестра —
+    # соответствующие роли в Discord больше не существуют.
 }
 
+# Роли, снимаемые при достижении 3 предупреждений + 3 выговоров (сценарий,
+# где взыскание выносит САМ БОТ, см. process_inactivity_discipline_for_event).
+# Этот же набор — единственно верный набор "управляемых" ролей состава/должности,
+# см. также ARMA_MANAGED_ROLE_KEYS ниже (сделаны идентичными намеренно).
 EXPULSION_ROLE_KEYS = [
-    'zapas_arma', 'boets_arma', 'clan_enemy', 'lichnyj_sostav_arma',
-    'minomyotchik_arma', 'btv_arma', 'pilot_arma', 'vzvozdnyj_ks_arma',
-    'bpla_pilot_arma', 'ko_arma',
+    'zapas_arma', 'lichnyj_sostav_arma', 'kombat_arma', 'zam_kombat_arma',
+    'boec_veteran_arma', 'boec_arma', 'klan_arma', 'klan_enemy',
 ]
+
 
 # ============== АВТОМАТИЧЕСКИЕ ЗАМЕЧАНИЯ/ВЫГОВОРЫ ЗА НЕАКТИВНОСТЬ ==============
 
@@ -662,6 +665,67 @@ def get_anketa_leadership_mentions(guild, games_interested: list) -> str:
     if not keys:
         keys = ['kombat_arma', 'zam_kombat_arma']
     return get_leadership_mentions(guild, *keys)
+
+# ============== ВЫЧИСЛЕНИЕ РОЛЕЙ ПО СОСТАВУ/ДОЛЖНОСТИ (ArmA) ==============
+# Единая точка правды: по composition/position из Firebase (profiles.gameRoles.
+# "Arma Reforger") + количеству активных взысканий определяет, какие роли
+# состава/должности должны быть у бойца в Discord. Используется и live-watcher'ом
+# (sync_arma_member_state), и (потенциально) любым другим кодом, которому
+# понадобится тот же расчёт.
+
+ARMA_MANAGED_ROLE_KEYS = {
+    'kombat_arma', 'zam_kombat_arma', 'lichnyj_sostav_arma',
+    'boec_veteran_arma', 'boec_arma', 'zapas_arma',
+    'klan_arma', 'klan_enemy',
+}
+ARMA_GUEST_ROLE_KEY = 'gost_arma'
+
+
+def _map_lichny_sostav_position(position: str) -> str:
+    """Сопоставляет должность 'Личного состава' с ключом роли. Матчинг по
+    ключевым словам, а не по точной строке — формулировки на сайте могут
+    отличаться ('Зам. командира батальона' vs 'Заместитель командира
+    батальона'), и точное сравнение было бы ненадёжным."""
+    p = (position or '').lower()
+    if 'зам' in p:
+        return 'zam_kombat_arma'
+    if 'комбат' in p or 'командир батальона' in p:
+        return 'kombat_arma'
+    if 'ветеран' in p:
+        return 'boec_veteran_arma'
+    return 'boec_arma'
+
+
+def compute_arma_role_keys(composition: str, position: str, active_warnings: int, active_reprimands: int):
+    """Возвращает:
+      None                         — состав неизвестен/ещё не заполнен на
+                                      сайте: роли НЕ трогаем вообще (иначе
+                                      пустой desired-набор привёл бы к
+                                      ошибочному снятию ВСЕХ ролей состава
+                                      у бойца, чей профиль просто не дозаполнен).
+      (managed_keys, guest_action) — managed_keys: set ключей ROLE_IDS,
+                                      которые должны быть у бойца ПРЯМО СЕЙЧАС
+                                      (остальные управляемые ключи будут сняты);
+                                      guest_action: 'add' — принудительно выдать
+                                      'Гость ArmA' (состав 'Отбор'), 'remove' —
+                                      принудительно снять его (Отставка/3+3
+                                      взыскания), None — эта функция роль
+                                      'Гость ArmA' не трогает (самостоятельный
+                                      выбору бойца — актуально ТОЛЬКО когда
+                                      сама функция вернула None целиком, т.е.
+                                      состав ещё не заполнен/неизвестен)."""
+    if active_warnings >= MAX_ACTIVE_WARNINGS and active_reprimands >= MAX_ACTIVE_REPRIMANDS:
+        return set(), 'remove'
+    if composition == 'Отставка':
+        return set(), 'remove'
+    if composition == 'Отбор':
+        return set(), 'add'
+    if composition == 'Запас':
+        return {'zapas_arma', 'boec_arma', 'klan_arma', 'klan_enemy'}, 'remove'
+    if composition == 'Личный состав':
+        pos_key = _map_lichny_sostav_position(position)
+        return {'lichnyj_sostav_arma', pos_key, 'klan_arma', 'klan_enemy'}, 'remove'
+    return None
 
 
 VOICE_CHANNEL_ID = 1284893513921728582
@@ -2165,6 +2229,91 @@ async def get_logging_thread_id():
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
     return anchors.get('logging_thread_id')
 
+# ============== САМОСТОЯТЕЛЬНЫЙ ВЫБОР ГОСТЕВЫХ РОЛЕЙ ==============
+
+SELF_ASSIGN_CHANNEL_ID = 1447222045539827876
+
+SELF_ASSIGN_ROLES = [
+    (1118882895524794378, "Гость SQUAD"),
+    (1250828979284213812, "Гость ArmA"),
+    (1492893978092113930, "Гость GTA"),
+    (908462339089641522, "DayZ"),
+    (1118883618375348316, "The Elder Scrolls"),
+]
+
+SELF_ASSIGN_DESCRIPTION = es(
+    "🎮 Бойцы, если желаете, можете выбрать себе гостевые роли в нашем сообществе!\n\n"
+    "Выберите нужные роли в меню ниже — они будут выданы сразу. Чтобы снять с себя "
+    "роль — откройте меню снова и просто не отмечайте её среди выбранных."
+)
+
+
+def build_self_assign_roles_embed():
+    return discord.Embed(title=es("🎮 Гостевые роли"), description=SELF_ASSIGN_DESCRIPTION, color=discord.Color.blurple())
+
+class SelfAssignRolesView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        options = [discord.SelectOption(label=name, value=str(role_id)) for role_id, name in SELF_ASSIGN_ROLES]
+        self.select = discord.ui.Select(
+            placeholder="🎮 Выберите гостевые роли, которые хотите иметь...",
+            options=options, min_values=0, max_values=len(options),
+            custom_id="self_assign_guest_roles"
+        )
+        self.select.callback = self._select_callback
+        self.add_item(self.select)
+
+    async def _select_callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        selected_ids = {int(v) for v in self.select.values}
+        member = interaction.user
+        guild = interaction.guild
+        to_add, to_remove = [], []
+        for role_id, name in SELF_ASSIGN_ROLES:
+            role = guild.get_role(role_id)
+            if not role:
+                continue
+            has_role = role in member.roles
+            wants_role = role_id in selected_ids
+            if wants_role and not has_role:
+                to_add.append(role)
+            elif not wants_role and has_role:
+                to_remove.append(role)
+        try:
+            if to_add:
+                await member.add_roles(*to_add, reason="Самостоятельный выбор гостевой роли")
+            if to_remove:
+                await member.remove_roles(*to_remove, reason="Самостоятельный отказ от гостевой роли")
+        except Exception as e:
+            await interaction.followup.send(f"❌ Ошибка изменения ролей: {e}", ephemeral=True)
+            return
+        parts = []
+        if to_add:
+            parts.append("Выданы: " + ", ".join(r.name for r in to_add))
+        if to_remove:
+            parts.append("Сняты: " + ", ".join(r.name for r in to_remove))
+        if not parts:
+            parts.append("Изменений нет — уже всё соответствует вашему выбору.")
+        await interaction.followup.send(es("✅ ") + " | ".join(parts), ephemeral=True)
+
+
+async def ensure_self_assign_roles_message():
+    """Находит (или создаёт при первом запуске) постоянное сообщение выбора
+    гостевых ролей — по аналогии с якорными сообщениями админ-канала."""
+    channel = await client.fetch_channel(SELF_ASSIGN_CHANNEL_ID)
+    anchors = load_json(ADMIN_ANCHORS_FILE, {})
+    msg, _ = await _find_or_create_anchor(
+        channel, es("🎮 Гостевые роли"), build_self_assign_roles_embed,
+        thread_name=None, view=SelfAssignRolesView(),
+        saved_message_id=anchors.get('self_assign_roles_message_id')
+    )
+    try:
+        await msg.edit(embed=build_self_assign_roles_embed(), view=SelfAssignRolesView())
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить сообщение гостевых ролей: {e}")
+    anchors['self_assign_roles_message_id'] = msg.id
+    save_json(ADMIN_ANCHORS_FILE, anchors)
+
 class VacationModal(discord.ui.Modal, title=es("🏖️ Оформление отпуска")):
     start_date = discord.ui.TextInput(label="Дата начала (ДД.ММ.ГГГГ)", placeholder="15.08.2026", required=True, max_length=10)
     end_date = discord.ui.TextInput(label="Дата окончания (ДД.ММ.ГГГГ)", placeholder="22.08.2026", required=True, max_length=10)
@@ -3603,6 +3752,81 @@ async def handle_profile_modified_watch(uid, data):
         finally:
             await asyncio.sleep(_ANKETA_EDIT_MIN_INTERVAL)
 
+async def sync_arma_member_state(uid: str, data: dict):
+    """Синхронизирует роли Discord и никнейм бойца с составом/должностью
+    в Firebase (направление Arma Reforger). Вызывается watcher'ом на КАЖДОЕ
+    ADDED/MODIFIED событие коллекции 'profiles' — благодаря тому, что
+    Firestore при первом подключении слушателя присылает ADDED для ВСЕХ уже
+    существующих документов, эта же функция автоматически выполняет полную
+    сверку ролей/никнеймов при каждом старте бота, без отдельного кода."""
+    games_interested = data.get('gamesInterested', []) or []
+    if CLAN_ROSTER_GAME not in games_interested:
+        return
+
+    discord_username = data.get('discordId') or ''
+    if not discord_username:
+        return
+    member = await find_member_by_discord_username(discord_username)
+    if not member:
+        return
+    guild = member.guild
+
+    game_role = (data.get('gameRoles') or {}).get(CLAN_ROSTER_GAME) or {}
+    composition = (game_role.get('composition') or '').strip()
+    position = (game_role.get('position') or '').strip()
+
+    now_ms = int(datetime.now(MSK).timestamp() * 1000)
+    game_da = (data.get('gameDisciplinaryActions') or {}).get(CLAN_ROSTER_GAME, []) or []
+    active_warnings = len([a for a in game_da if a.get('type') == 'Замечание' and a.get('expiresAtMs', 0) > now_ms])
+    active_reprimands = len([a for a in game_da if a.get('type') == 'Выговор' and a.get('expiresAtMs', 0) > now_ms])
+
+    result = compute_arma_role_keys(composition, position, active_warnings, active_reprimands)
+    if result is None:
+        return  # состав неизвестен/не заполнен — роли не трогаем
+    desired_keys, guest_action = result
+
+    desired_role_ids = {ROLE_IDS[k] for k in desired_keys if ROLE_IDS.get(k)}
+    managed_role_ids = {ROLE_IDS[k] for k in ARMA_MANAGED_ROLE_KEYS if ROLE_IDS.get(k)}
+    current_managed_roles = {r for r in member.roles if r.id in managed_role_ids}
+    desired_roles = {guild.get_role(rid) for rid in desired_role_ids}
+    desired_roles.discard(None)
+
+    to_add = desired_roles - current_managed_roles
+    to_remove = current_managed_roles - desired_roles
+
+    try:
+        if to_add:
+            await member.add_roles(*to_add, reason="Синхронизация состава/должности ArmA с сайтом")
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="Синхронизация состава/должности ArmA с сайтом")
+    except Exception as e:
+        print(f"⚠️ Не удалось синхронизировать роли ArmA для {member.display_name} (uid={uid}): {e}")
+
+    guest_role_id = ROLE_IDS.get(ARMA_GUEST_ROLE_KEY)
+    guest_role = guild.get_role(guest_role_id) if guest_role_id else None
+    if guest_role:
+        try:
+            if guest_action == 'add' and guest_role not in member.roles:
+                await member.add_roles(guest_role, reason="Автовыдача 'Гость ArmA' — состав 'Отбор'")
+            elif guest_action == 'remove' and guest_role in member.roles:
+                await member.remove_roles(guest_role, reason="Снятие 'Гость ArmA' — исключение/дисциплина")
+        except Exception as e:
+            print(f"⚠️ Не удалось обновить роль 'Гость ArmA' для {member.display_name} (uid={uid}): {e}")
+
+    # === Никнейм "[En-Y]Позывной" для составов "Запас" и выше ===
+    if composition in ACTIVE_CLAN_COMPOSITIONS:  # {"Личный состав", "Запас"}
+        callsign = (data.get('callsign') or '').strip()
+        if callsign:
+            desired_nick = f"{CLAN_TAG}{callsign}"[:32]  # лимит Discord на никнейм
+            if member.display_name != desired_nick:
+                try:
+                    await member.edit(nick=desired_nick, reason="Синхронизация позывного с сайтом")
+                except discord.Forbidden:
+                    print(f"⚠️ Недостаточно прав для смены ника {member.display_name} "
+                          f"(возможно, участник выше бота по иерархии ролей)")
+                except Exception as e:
+                    print(f"⚠️ Не удалось изменить никнейм для {member.display_name} (uid={uid}): {e}")
+
 
 async def handle_new_notification_watch(doc_id, data):
     if _watcher_dedup['notifications'].is_processed(doc_id):
@@ -3694,6 +3918,22 @@ async def setup_firestore_watchers():
         print("✅ Запущено live-слежение за изменениями профилей (для обновления анкет)")
     except Exception as e:
         print(f"❌ Не удалось запустить live-слежение за изменениями профилей: {e}")
+        
+    # Отдельный watcher: синхронизация ролей/никнейма ArmA (состав, должность,
+    # дисциплина). Слушает ВСЮ коллекцию 'profiles' БЕЗ фильтра по createdAt и
+    # реагирует на ADDED+MODIFIED — благодаря семантике Firestore, при первом
+    # подключении слушателя ВСЕ уже существующие документы придут как ADDED,
+    # то есть эта строчка одновременно даёт полную сверку ролей/никнеймов при
+    # каждом старте бота (устраняет рассинхронизацию, накопившуюся, пока бот
+    # был выключен) — без отдельной функции стартовой синхронизации.
+    try:
+        watch = fs_db.collection('profiles').on_snapshot(
+            _make_on_added_callback(sync_arma_member_state, watch_types=('ADDED', 'MODIFIED'))
+        )
+        FIRESTORE_WATCH_HANDLES.append(watch)
+        print("✅ Запущено live-слежение за составом/должностью бойцов ArmA (роли и никнейм)")
+    except Exception as e:
+        print(f"❌ Не удалось запустить слежение за составом/должностью ArmA: {e}")
 
 
 # ============== УЧЁТ ОТЫГРЫШЕЙ (GAMESTATS) ==============
@@ -7419,6 +7659,7 @@ async def on_ready():
     client.add_view(VacationRequestView())
     client.add_view(VacationApprovalView())
     client.add_view(VacationMessageView())
+    client.add_view(SelfAssignRolesView())
     register_persistent_event_views()
 
     await setup_firestore_watchers()
@@ -7427,6 +7668,11 @@ async def on_ready():
         await ensure_admin_channel_anchors()
     except Exception as e:
         print(f"⚠️ Не удалось инициализировать якорные сообщения админ-канала: {e}")
+    
+    try:
+        await ensure_self_assign_roles_message()
+    except Exception as e:
+        print(f"⚠️ Не удалось опубликовать сообщение выбора гостевых ролей: {e}")
 
     # Печатаем ЭТОТ лог последним — только после того, как ветка "🔧 Логирование"
     # уже гарантированно найдена/создана (ensure_admin_channel_anchors выше)
