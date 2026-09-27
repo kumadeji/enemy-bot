@@ -3767,7 +3767,6 @@ async def handle_profile_modified_watch(uid, data):
         finally:
             await asyncio.sleep(_ANKETA_EDIT_MIN_INTERVAL)
 
-
 async def sync_arma_member_state(uid: str, data: dict):
     """Синхронизирует роли Discord и никнейм бойца с составом/должностью
     в Firebase (направление Arma Reforger). Вызывается watcher'ом на КАЖДОЕ
