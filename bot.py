@@ -696,6 +696,15 @@ def _map_lichny_sostav_position(position: str) -> str:
         return 'boec_veteran_arma'
     return 'boec_arma'
 
+# Иерархия должностей "Личного состава" от низшей к высшей — используется
+# для определения "повышение" это или "понижение" при смене должности
+# внутри одного и того же состава (см. compute_membership_change_dm).
+_LICHNY_SOSTAV_POSITION_RANK = {
+    'boec_arma': 0,
+    'boec_veteran_arma': 1,
+    'zam_kombat_arma': 2,
+    'kombat_arma': 3,
+}
 
 def compute_arma_role_keys(composition: str, position: str, active_warnings: int, active_reprimands: int):
     """Возвращает:
@@ -760,6 +769,7 @@ CHECK_MESSAGES_FILE = os.path.join(BASE_DIR, 'check_messages.json')
 ADMIN_ANCHORS_FILE = os.path.join(BASE_DIR, 'admin_anchors.json')
 ANKETA_MESSAGES_FILE = os.path.join(BASE_DIR, 'anketa_messages.json')
 DISCORD_LINK_CACHE_FILE = os.path.join(BASE_DIR, 'discord_link_cache.json')
+PLAYER_DM_STATE_FILE = os.path.join(BASE_DIR, 'player_dm_state.json')
 
 # ============== FIREBASE ==============
 
@@ -797,6 +807,7 @@ FIREBASE_DATA_MAP = {
     ADMIN_ANCHORS_FILE: 'adminAnchors',
     ANKETA_MESSAGES_FILE: 'anketaMessages',
     DISCORD_LINK_CACHE_FILE: 'discordLinkCache',
+    PLAYER_DM_STATE_FILE: 'playerDmState',
 }
 
 
@@ -1427,6 +1438,25 @@ async def find_member_by_nickname(nickname: str):
         return None
 
 
+async def try_dm_member(member, text: str, context: str = "") -> bool:
+    """Отправляет личное сообщение с тихим fallback: если ЛС у пользователя
+    закрыты (discord.Forbidden) или он недоступен — просто логирует
+    предупреждение, не прерывая вызывающий код. Единая точка для всех
+    точечных ЛС-уведомлений бойцам (дисциплина, отпуска, отыгрыши, награды,
+    результаты проверки)."""
+    if not member:
+        return False
+    try:
+        await member.send(text)
+        return True
+    except discord.Forbidden:
+        print(f"ℹ️ Не удалось отправить ЛС {getattr(member, 'display_name', member)}"
+              f"{f' ({context})' if context else ''}: личные сообщения закрыты.")
+    except Exception as e:
+        print(f"⚠️ Ошибка отправки ЛС {getattr(member, 'display_name', member)}"
+              f"{f' ({context})' if context else ''}: {e}")
+    return False
+
 
 async def send_chunked(thread, text, user_name="") -> list:
     """Возвращает список ID отправленных сообщений (нужно для последующего удаления)."""
@@ -1488,6 +1518,35 @@ def build_user_message(discord_user, issues: list) -> str:
             parts.append(issue_line(issue))
         parts.append("")
     return "\n".join(parts).strip("\n")
+
+
+def build_user_message_dm(issues: list) -> str:
+    """Тот же список проблем, что и build_user_message, но без упоминания
+    (в ЛС упоминать самого получателя бессмысленно) — для дублирования
+    результатов проверки в личные сообщения."""
+    red_issues = [i for i in issues if i['severity'] == 'red']
+    yellow_issues = [i for i in issues if i['severity'] == 'yellow']
+    parts = [es("🔍 **По результатам автоматической проверки у вас найдены следующие проблемы:**"), ""]
+
+    def issue_line(issue):
+        text = issue['text'].strip()
+        if not text:
+            text = f"({issue['column']})"
+        return f"* {text}"
+
+    if red_issues:
+        parts.append(es("🔴 **Критические проблемы:**"))
+        for issue in red_issues:
+            parts.append(issue_line(issue))
+        parts.append("")
+    if yellow_issues:
+        parts.append(es("🟡 **Важные проблемы:**"))
+        for issue in yellow_issues:
+            parts.append(issue_line(issue))
+        parts.append("")
+    parts.append(es("⚠️ Пожалуйста, исправьте их как можно скорее — игнорирование приведёт к дисциплинарному взысканию."))
+    return "\n".join(parts).strip("\n")
+
 
 async def check_spreadsheet() -> bool:
     """Возвращает True при успешном завершении (независимо от того,
@@ -1570,6 +1629,7 @@ async def check_spreadsheet() -> bool:
                 for discord_user, issues in user_issues.items():
                     user_msg = build_user_message(discord_user, issues)
                     new_message_ids += await send_chunked(thread, user_msg, discord_user.display_name)
+                    await try_dm_member(discord_user, build_user_message_dm(issues), context="результаты проверки бойцов")
                 if users_not_found:
                     not_found_msg = ("\n\n" + es("⚠️ **Не удалось найти в Discord:**\n") + ", ".join(users_not_found))
                     new_message_ids += await send_chunked(thread, not_found_msg, "список ненайденных")
@@ -3881,6 +3941,173 @@ async def _handle_roster_membership_change(uid: str, composition: str):
     invalidate_clan_members_cache()
     await refresh_all_active_event_embeds()
 
+_player_dm_state_lock = asyncio.Lock()
+
+
+def _disc_word_verb_from_russian_type(type_str: str):
+    """('замечание','вынесено') / ('выговор','вынесен') — по русской строке
+    type из самого объекта взыскания ('Замечание'/'Выговор'), с правильным
+    грамматическим согласованием рода."""
+    if type_str == 'Выговор':
+        return 'выговор', 'вынесен'
+    return 'замечание', 'вынесено'
+
+
+def build_exclusion_dm_text(position: str) -> str:
+    """Текст ЛС в момент перехода состава в 'Отставка' — различается в
+    зависимости от должности."""
+    if position == 'Непринятый боец':
+        return es("📋 Ваша заявка на вступление в клан была рассмотрена командованием и, к сожалению, "
+                   "не была принята.")
+    if position == 'Уволенный боец':
+        return es("👋 Вы покинули клан. Спасибо за время, проведённое с нами! Вы всегда можете вернуться — "
+                   "для этого договоритесь с командованием.")
+    if position == 'Дезертир':
+        return es("🚫 Вы исключены из клана. Вы всегда можете вернуться — для этого договоритесь с командованием.")
+    return es("ℹ️ Ваш статус в клане изменён на 'Отставка'. Если это ошибка или вы хотите вернуться — "
+              "обратитесь к командованию.")
+
+def compute_membership_change_dm(previous_composition: str, previous_position: str,
+                                  composition: str, position: str):
+    """Возвращает текст ЛС о повышении/понижении состава или должности, либо
+    None, если это не один из специально отслеживаемых переходов. Переходы
+    В 'Отставка' сюда не входят — их обрабатывает build_exclusion_dm_text
+    (проверяется раньше, см. handle_player_dm_notifications)."""
+    if previous_composition == composition and previous_position == position:
+        return None
+
+    # Отбор -> Запас: кандидат стал полноценным членом клана
+    if previous_composition == 'Отбор' and composition == 'Запас':
+        return es("🎉 Поздравляем! Вы стали полноценным членом клана — переведены в состав «Запас»!")
+
+    # Внутри "Отбор": заявка успешно рассмотрена (Новобранец -> Принятый новобранец)
+    if previous_composition == 'Отбор' and composition == 'Отбор':
+        if previous_position == 'Новобранец' and position == 'Принятый новобранец':
+            return es("🎉 Ваша заявка успешно рассмотрена командованием! Вы стали принятым новобранцем, осталось только завершить все процедуры регистрации!")
+        return None
+
+    # Запас <-> Личный состав
+    if previous_composition == 'Запас' and composition == 'Личный состав':
+        return es("🎉 Поздравляем с повышением! Вы переведены из состава «Запас» в «Личный состав».")
+    if previous_composition == 'Личный состав' and composition == 'Запас':
+        return es("📋 Вы переведены из «Личного состава» в состав «Запас».")
+
+    # Внутри "Личный состав": изменение должности вверх/вниз
+    if previous_composition == 'Личный состав' and composition == 'Личный состав' and previous_position != position:
+        prev_rank = _LICHNY_SOSTAV_POSITION_RANK.get(_map_lichny_sostav_position(previous_position), 0)
+        new_rank = _LICHNY_SOSTAV_POSITION_RANK.get(_map_lichny_sostav_position(position), 0)
+        if new_rank > prev_rank:
+            return es(f"🎉 Поздравляем с повышением в должности! Новая должность: **{position}**.")
+        if new_rank < prev_rank:
+            return es(f"📋 Вы понижены в должности. Новая должность: **{position}**.")
+
+    return None
+
+async def handle_player_dm_notifications(uid: str, member, composition: str, position: str,
+                                          current_actions: list, data: dict):
+    """Единая точка диффа персонального состояния бойца для точечных ЛС:
+      - назначение/снятие дисциплинарных взысканий (Arma Reforger) —
+        неважно, вынесено ботом или вручную на сайте, диффится по факту
+        содержимого массива gameDisciplinaryActions;
+      - исключение из клана (переход composition -> 'Отставка'), текст
+        зависит от должности;
+      - новые награды (gameAwards по каждой игре + globalAwards).
+
+    При ПЕРВОЙ встрече с этим uid (первый запуск бота с этой фичей либо
+    первая ADDED-доставка документа) состояние только 'сеется' молча — без
+    единого уведомления, иначе включение фичи разослало бы ЛС всем бойцам
+    про их уже существующую историю.
+
+    Подавление (п.1): если боец УЖЕ был в составе 'Отставка' до этого вызова
+    И остаётся в нём сейчас — уведомления о взысканиях не отправляются.
+    Момент САМОГО перехода в 'Отставка' (например, взыскание, ставшее
+    причиной исключения) под это ограничение не подпадает."""
+    if not member:
+        return
+
+    async with _player_dm_state_lock:
+        state = load_json(PLAYER_DM_STATE_FILE, {})
+        entry = state.get(uid)
+        first_seen = entry is None
+        entry = entry or {}
+        previous_composition = entry.get('composition')
+        previous_position = entry.get('position')
+        previous_actions = entry.get('actions', {})
+        prev_award_counts = entry.get('award_counts', {'game': {}, 'global': 0})
+
+        current_actions_map = {a['id']: a for a in current_actions if a.get('id')}
+        game_awards = data.get('gameAwards', {}) or {}
+        global_awards = data.get('globalAwards', []) or []
+        new_game_counts = {game: len(awards or []) for game, awards in game_awards.items()}
+
+        if not first_seen:
+            # --- Дисциплина: назначение/снятие ---
+            suppress_discipline = (previous_composition == 'Отставка' and composition == 'Отставка')
+            if not suppress_discipline:
+                added_ids = set(current_actions_map) - set(previous_actions)
+                removed_ids = set(previous_actions) - set(current_actions_map)
+                now_ms = int(datetime.now(MSK).timestamp() * 1000)
+
+                for action_id in added_ids:
+                    action = current_actions_map[action_id]
+                    word, verb = _disc_word_verb_from_russian_type(action.get('type', 'Замечание'))
+                    expires_ts = int(action.get('expiresAtMs', 0) / 1000)
+                    text = (
+                        es(f"⚠️ Вам {verb} {word}") + f" ({action.get('type', '?')}):\n\n" +
+                        f"> {action.get('reason', '—')}\n\n" +
+                        (f"Действует до: <t:{expires_ts}:D>." if expires_ts else "")
+                    )
+                    await try_dm_member(member, text, context="новое дисциплинарное взыскание")
+
+                for action_id in removed_ids:
+                    old_action = previous_actions[action_id]
+                    word, _ = _disc_word_verb_from_russian_type(old_action.get('type', 'Замечание'))
+                    expired_naturally = old_action.get('expiresAtMs', 0) <= now_ms
+                    prefix = "истёк срок действия" if expired_naturally else "снято досрочно командованием"
+                    text = es(f"✅ С вас снято {word} ({prefix}):\n\n") + f"> {old_action.get('reason', '—')}"
+                    await try_dm_member(member, text, context="снятие дисциплинарного взыскания")
+
+            # --- Исключение из клана: ровно в момент перехода в 'Отставка' ---
+            if composition == 'Отставка' and previous_composition != 'Отставка':
+                await try_dm_member(member, build_exclusion_dm_text(position), context="исключение из клана")
+            elif previous_composition is not None and previous_position is not None:
+                # previous_position is not None — защита от миграции: если это
+                # первый прогон ПОСЛЕ добавления отслеживания должности, у
+                # старых записей previous_position ещё отсутствует, и сравнение
+                # с текущей должностью дало бы ложное "понижение" для ВСЕХ
+                # бойцов разом. При первом прогоне после патча состояние
+                # только доучивается (см. запись entry['position'] ниже),
+                # без единого сообщения.
+                membership_text = compute_membership_change_dm(previous_composition, previous_position, composition, position)
+                if membership_text:
+                    await try_dm_member(member, membership_text, context="изменение состава/должности")
+
+            # --- Награды: новые элементы по каждой игре + глобальные ---
+            for game, awards in game_awards.items():
+                awards = awards or []
+                old_count = prev_award_counts.get('game', {}).get(game, 0)
+                if len(awards) > old_count:
+                    for award in awards[old_count:]:
+                        text = (es(f"🏆 Новая награда ({game}): {award.get('icon', '')} **{award.get('name', '?')}**\n\n") +
+                                f"> {award.get('description', '—')}")
+                        await try_dm_member(member, text, context="новая награда")
+            old_global_count = prev_award_counts.get('global', 0)
+            if len(global_awards) > old_global_count:
+                for award in global_awards[old_global_count:]:
+                    text = (es(f"🏆 Новая награда: {award.get('icon', '')} **{award.get('name', '?')}**\n\n") +
+                            f"> {award.get('description', '—')}")
+                    await try_dm_member(member, text, context="новая награда")
+
+        entry['composition'] = composition
+        entry['position'] = position
+        entry['actions'] = {
+            aid: {'type': a.get('type'), 'reason': a.get('reason'), 'expiresAtMs': a.get('expiresAtMs', 0)}
+            for aid, a in current_actions_map.items()
+        }
+        entry['award_counts'] = {'game': new_game_counts, 'global': len(global_awards)}
+        state[uid] = entry
+        save_json(PLAYER_DM_STATE_FILE, state)
+
 
 async def sync_arma_member_state(uid: str, data: dict):
     """Синхронизирует роли Discord и никнейм бойца с составом/должностью
@@ -3914,6 +4141,8 @@ async def sync_arma_member_state(uid: str, data: dict):
     game_da = (data.get('gameDisciplinaryActions') or {}).get(CLAN_ROSTER_GAME, []) or []
     active_warnings = len([a for a in game_da if a.get('type') == 'Замечание' and a.get('expiresAtMs', 0) > now_ms])
     active_reprimands = len([a for a in game_da if a.get('type') == 'Выговор' and a.get('expiresAtMs', 0) > now_ms])
+
+    await handle_player_dm_notifications(uid, member, composition, position, game_da, data)
 
     result = compute_arma_role_keys(composition, position, active_warnings, active_reprimands)
     if result is None:
@@ -4425,6 +4654,8 @@ async def apply_attendance_to_gamestats(wizard, old_tally: dict = None):
         message = build_gamestats_notification_message(max(ko_delta, 0), max(ks_delta, 0), max(soldier_delta, 0))
         if message:
             await create_gamestats_notification(uid, message)
+            member_for_dm = await find_member_by_nickname(nickname)
+            await try_dm_member(member_for_dm, es("🏆 ") + message, context="зачтённый отыгрыш")
 
     return succeeded
 
@@ -5888,6 +6119,11 @@ async def approve_vacation(interaction, nickname):
     except Exception:
         pass
     await refresh_event_embeds_overlapping_period(vacation['start'], vacation['end'])
+    await try_dm_member(
+        member,
+        es("✅ Ваш отпуск утверждён командованием:\n\n") + format_vacation_period(vacation['start'], vacation['end']),
+        context="утверждение отпуска"
+    )
     await interaction.followup.send(f"✅ Отпуск {nickname} утверждён!", ephemeral=True)
 
 
@@ -5937,6 +6173,14 @@ async def reject_vacation(interaction, nickname):
             await message.edit(embed=embed, view=None)
     except Exception:
         pass
+    member = await find_member_by_nickname(nickname)
+    await try_dm_member(
+        member,
+        es("❌ Ваш запрос на отпуск отклонён командованием.\n\n") +
+        f"Причина отпуска: {vacation.get('reason', '—')}\n\n" +
+        "При необходимости уточните причину отказа у комбата или заместителя.",
+        context="отклонение отпуска"
+    )
     await interaction.followup.send(f"❌ Отпуск {nickname} отклонён.", ephemeral=True)
 
 
