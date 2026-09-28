@@ -8089,6 +8089,71 @@ async def setup_office_channel(guild):
 
     return channel
 
+
+# ============== ПРИНУДИТЕЛЬНО "ТОЛЬКО ЧТЕНИЕ" ДЛЯ КОНКРЕТНОГО КАНАЛА ==============
+
+READ_ONLY_CHANNEL_ID = 1553932674622693528
+READ_ONLY_CHANNEL_WRITER_ROLE_IDS = {1252277370711441429, 1470351490005729383}  # Комбат ArmA, Зам. комбата ArmA
+
+
+async def enforce_read_only_channel(guild):
+    """Гарантирует, что в READ_ONLY_CHANNEL_ID писать могут ТОЛЬКО роли из
+    READ_ONLY_CHANNEL_WRITER_ROLE_IDS — у всех, кто видит канал (включая
+    @everyone и ЛЮБЫЕ другие роли с уже существующими permission overwrite),
+    отправка сообщений принудительно запрещается, а чтение и история
+    сообщений остаются разрешены (view_channel НЕ трогается вообще — этим
+    управляет видимость канала, не входящая в эту задачу).
+
+    Идемпотентно: безопасно вызывать при каждом старте бота — если права
+    кто-то случайно сбросит вручную в Discord, при следующем рестарте бота
+    они будут восстановлены автоматически."""
+    channel = guild.get_channel(READ_ONLY_CHANNEL_ID)
+    if not channel:
+        print(f"⚠️ Канал {READ_ONLY_CHANNEL_ID} не найден — принудительное 'только чтение' не применено")
+        return
+
+    try:
+        # @everyone: запрет писать, разрешено читать историю (не трогаем
+        # view_channel — видимость канала определяется отдельно, не здесь).
+        everyone_overwrite = channel.overwrites_for(guild.default_role)
+        everyone_overwrite.send_messages = False
+        everyone_overwrite.read_message_history = True
+        await channel.set_permissions(guild.default_role, overwrite=everyone_overwrite,
+                                       reason="Принудительное 'только чтение' канала")
+
+        # Любая ДРУГАЯ роль/участник, у которых уже есть persistent overwrite
+        # на этом канале (не входящие в разрешённый список писать) — явно
+        # запрещаем send_messages, не трогая остальные их права.
+        for target, overwrite in list(channel.overwrites.items()):
+            if target.id == guild.default_role.id:
+                continue
+            if isinstance(target, discord.Role) and target.id in READ_ONLY_CHANNEL_WRITER_ROLE_IDS:
+                continue
+            if overwrite.send_messages is not False:
+                overwrite.send_messages = False
+                overwrite.read_message_history = True
+                await channel.set_permissions(target, overwrite=overwrite,
+                                               reason="Принудительное 'только чтение' канала")
+
+        # Разрешённые роли: явно разрешаем писать и читать историю.
+        for role_id in READ_ONLY_CHANNEL_WRITER_ROLE_IDS:
+            role = guild.get_role(role_id)
+            if not role:
+                continue
+            writer_overwrite = channel.overwrites_for(role)
+            writer_overwrite.send_messages = True
+            writer_overwrite.read_message_history = True
+            await channel.set_permissions(role, overwrite=writer_overwrite,
+                                           reason="Разрешение писать в 'только чтение' канал")
+
+        print(f"✅ Права канала {READ_ONLY_CHANNEL_ID} приведены в состояние 'только чтение' (кроме {len(READ_ONLY_CHANNEL_WRITER_ROLE_IDS)} ролей)")
+    except discord.Forbidden:
+        print(f"⚠️ Недостаточно прав для настройки канала {READ_ONLY_CHANNEL_ID} "
+              f"(роль бота должна быть выше затрагиваемых ролей и иметь право 'Manage Channels')")
+    except Exception as e:
+        print(f"⚠️ Ошибка настройки прав канала {READ_ONLY_CHANNEL_ID}: {e}")
+
+
 # ============== ВРЕМЕННЫЕ ГОЛОСОВЫЕ КОМНАТЫ ==============
 
 async def setup_voice_room_triggers(guild):
@@ -8522,6 +8587,7 @@ async def on_ready():
                   f"member_index поддерживает индекс только ПОСЛЕДНЕЙ гильдии из списка.")
         await setup_voice_room_triggers(guild)
         await sync_voice_rooms_on_startup(guild)
+        await enforce_read_only_channel(guild)
 
     try:
         await catch_up_weekly_events_on_startup()
