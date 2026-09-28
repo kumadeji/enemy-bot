@@ -532,7 +532,7 @@ _ES_REPLACEMENTS = {
     '🍻 ': '🍻ㅤ', '🚪 ': '🚪ㅤ', '➡️ ': '➡️ㅤ', '⏭️ ': '⏭️ㅤ',
     '🖼️ ': '🖼️ㅤ', '🚫 ': '🚫ㅤ', '🎖️ ': '🎖️ㅤ', '🧩 ': '🧩ㅤ',
     '🏁 ': '🏁ㅤ', '🚀 ': '🚀ㅤ', '🔁 ': '🔁ㅤ', '🧹 ': '🧹ㅤ',
-    '🎉 ': '🎉ㅤ', '👋 ': '👋ㅤ',
+    '🎉 ': '🎉ㅤ', '👋 ': '👋ㅤ', '🔒 ': '🔒ㅤ',
 }
 # Один скомпилированный regex вместо 64 последовательных str.replace()
 # на каждый вызов (раньше es() создавала словарь заново и делала 64 прохода
@@ -928,15 +928,21 @@ def _compute_marks_hidden_eligibility(image_key: str, start_time: datetime) -> b
 
 
 def is_marks_hidden_for_event(event: dict) -> bool:
-    """Эффективное решение 'скрыты ли списки отметок ПРЯМО СЕЙЧАС' для
-    конкретного мероприятия — глобальный переключатель И историческая
-    принадлежность мероприятия к эксперименту. Списки становятся видимыми
-    для ВСЕХ автоматически, как только мероприятие переходит в статус
-    'cancelled' или 'completed' — независимо от глобального переключателя
-    (эксперимент касается только ЕЩЁ ИДУЩИХ мероприятий)."""
+    """Эффективное решение 'скрыты ли списки отметок ПРЯМО СЕЙЧАС'. Раскрытие
+    (marks_revealed=True) происходит ОДИН РАЗ и НАВСЕГДА — по первому из:
+      1) публикация объявления о модах (кнопка 'Моды');
+      2) автоматическое напоминание за 15 минут ('зайдите в голосовой канал');
+      3) fallback — начало мероприятия (если 1/2 не сработали), а также
+         завершение/отмена (страховка на все случаи).
+    См. reveal_event_marks(). Проверка статуса ниже — ДОПОЛНИТЕЛЬНАЯ подстраховка
+    (на случай, если explicit-вызов reveal_event_marks почему-то не сработал)."""
+    if event.get('marks_revealed'):
+        return False
     if event.get('status', 'active') != 'active':
         return False
-    return EXPERIMENT_HIDE_MARKS_ENABLED and bool(event.get('marks_hidden_experiment'))
+    if not EXPERIMENT_HIDE_MARKS_ENABLED:
+        return False
+    return bool(event.get('marks_hidden_experiment'))
 
 
 def get_image_info(image_key: str):
@@ -1374,24 +1380,37 @@ async def get_commander_queue():
         return QUEUE_CACHE['current'] or []
 
 
-async def get_expected_squad_commander(event: dict, current_date: datetime, vacation_set: set = None):
-    """Следующий в очереди на командование отделением (Firebase queue/state),
-    пропуская тех, кто в отпуске или явно отказался от участия в мероприятии.
+async def compute_expected_squad_commanders() -> dict:
+    """Считает 'Ожидаемого командира отделения' СРАЗУ для ВСЕХ активных
+    мероприятий, а не для одного — это принципиально важно, так как
+    результат для более ПОЗДНЕГО (по дате) мероприятия зависит от того,
+    кто уже был 'условно назначен' на более РАННИЕ.
 
-    Если vacation_set не передан — строит его сам (обратная совместимость
-    для мест, где build_event_embed вызывается без предварительной
-    подготовки набора). Но при вызове из build_event_embed набор уже готов
-    заранее и передаётся сюда — иначе на каждого кандидата в очереди
-    отдельно вызывался бы is_on_vacation_dynamic(), который делает
-    load_json(VACATIONS_FILE) (полный deepcopy) + полный проход по всем
-    отпускам НА КАЖДОГО кандидата, то есть при очереди из 15+ человек —
-    15+ deepcopy на каждый рендер embed (а рендер вызывается на каждый
-    клик по кнопке мероприятия)."""
-    if vacation_set is None:
-        vacation_set = build_active_vacation_set(load_json(VACATIONS_FILE, {}), current_date)
+    Кандидат берётся СТРОГО из тех, кто отметился 'Приду' именно на этом
+    конкретном мероприятии (а не просто следующий в очереди Firebase,
+    пропускающий отказы/отпуск, как было раньше — из-за чего ВСЕ будущие
+    мероприятия ошибочно показывали одного и того же человека).
+
+    Мероприятия обрабатываются в порядке возрастания даты начала: как
+    только кандидат выбран для более раннего мероприятия, он ЛОКАЛЬНО (то
+    есть только в рамках этого расчёта, БЕЗ фактической записи в Firebase)
+    переставляется в конец очереди — и для следующего по дате мероприятия
+    учитывается уже следующий подходящий кандидат. Реальная очередь в
+    Firebase меняется, как и раньше, только при подаче отчёта о явке
+    (см. apply_squad_commander_queue_promotion).
+
+    Возвращает {event_id: nickname_или_None} только для мероприятий со
+    статусом 'active' — для cancelled/completed поле не показывается вообще
+    (см. build_event_embed), поэтому и не рассчитывается."""
+    events = read_json(EVENTS_FILE, {})
+    active_events = [
+        (event_id, event) for event_id, event in events.items()
+        if event.get('status', 'active') == 'active'
+    ]
+    active_events.sort(key=lambda item: item[1].get('start_time', 0))
 
     queue = await get_commander_queue()
-    declined = event.get('declined', {})
+    local_queue = []
     for entry in queue:
         uid = entry.get('uid')
         if not uid:
@@ -1399,13 +1418,31 @@ async def get_expected_squad_commander(event: dict, current_date: datetime, vaca
         callsign = await get_uid_callsign(uid)
         if not callsign:
             continue
-        nickname = f"{CLAN_TAG}{callsign}"
-        if nickname in declined:
-            continue
-        if nickname.strip().lower() in vacation_set:
-            continue
-        return nickname
-    return None
+        local_queue.append(f"{CLAN_TAG}{callsign}")
+
+    vacations = read_json(VACATIONS_FILE, {})
+    result = {}
+    for event_id, event in active_events:
+        accepted = set(event.get('accepted', {}).keys())
+        event_start_dt = datetime.fromtimestamp(event['start_time'], MSK)
+        vacation_set = build_vacation_set_for_date(vacations, event_start_dt)
+
+        chosen = None
+        chosen_index = None
+        for idx, nickname in enumerate(local_queue):
+            if nickname not in accepted:
+                continue
+            if nickname.strip().lower() in vacation_set:
+                continue
+            chosen = nickname
+            chosen_index = idx
+            break
+
+        result[event_id] = chosen
+        if chosen_index is not None:
+            local_queue.append(local_queue.pop(chosen_index))
+
+    return result
 
 
 class MemberIndex:
@@ -3284,6 +3321,28 @@ class EmbedRefresher:
 embed_refresher = EmbedRefresher(delay=1.5)
 
 
+async def reveal_event_marks(event_id: str, reason: str):
+    """Помечает, что список отметок мероприятия должен стать видимым ВСЕМ
+    (а кнопка '📋 Отметки' — исчезнуть), и запускает перерисовку embed'а.
+    Идемпотентно: повторный вызов для уже раскрытого мероприятия не делает
+    ничего. Флаг сохраняется НАВСЕГДА — благодаря этому реактивация
+    отменённого мероприятия НЕ прячет отметки обратно (важно: полагаться
+    только на статус 'active'/'cancelled' было бы недостаточно именно
+    из-за этого сценария)."""
+    revealed_now = False
+    async with _events_write_lock:
+        events = load_json(EVENTS_FILE, {})
+        event = events.get(event_id)
+        if not event or event.get('marks_revealed'):
+            return
+        event['marks_revealed'] = True
+        event['marks_revealed_reason'] = reason
+        event['marks_revealed_at'] = int(datetime.now(MSK).timestamp())
+        save_json(EVENTS_FILE, events)
+        revealed_now = True
+    if revealed_now:
+        embed_refresher.schedule(event_id)
+
 
 # --- Коллбэки кнопок (standalone-функции, чтобы работать в разных сочетаниях View) ---
 
@@ -3480,6 +3539,9 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление д
                                    extra={'server_name': server_name, 'password': password,
                                           'server_ip': server_ip, 'server_port': server_port})
             save_json(EVENTS_FILE, events_fresh)
+        # Эксперимент (п.2): публикация объявления о модах — один из
+        # триггеров раскрытия списка отметок для всех.
+        await reveal_event_marks(self.event_id, 'mods_announcement')
         await interaction.response.send_message(es("✅ Объявление для скачивания модов отправлено!"), ephemeral=True)
 
 
@@ -3493,6 +3555,11 @@ def make_accept_button():
 def make_decline_button():
     b = discord.ui.Button(label=es("❌ Не приду"), style=discord.ButtonStyle.danger, custom_id="event_decline", row=0)
     b.callback = on_decline_button
+    return b
+
+def make_marks_button():
+    b = discord.ui.Button(label=es("📋 Отметки"), style=discord.ButtonStyle.secondary, custom_id="event_marks", row=0)
+    b.callback = on_marks_button
     return b
 
 def make_edit_button():
@@ -3523,11 +3590,6 @@ def make_delete_button():
 def make_mods_button():
     b = discord.ui.Button(label=es("🧩 Моды"), style=discord.ButtonStyle.primary, custom_id="event_mods", row=1)
     b.callback = on_mods_button
-    return b
-
-def make_marks_button():
-    b = discord.ui.Button(label=es("📋 Отметки"), style=discord.ButtonStyle.secondary, custom_id="event_marks", row=2)
-    b.callback = on_marks_button
     return b
 
 
@@ -6290,6 +6352,9 @@ async def handle_vacation_request(interaction, nickname, start_str, end_str, rea
                 await update_vacation_role(member, True)
 
             await refresh_event_embeds_overlapping_period(start_date.isoformat(), end_date.isoformat())
+            # Полный пересчёт активных мероприятий: отпуск может повлиять на
+            # 'Ожидаемого командира отделения' не только в период отпуска.
+            await refresh_all_active_event_embeds()
 
             await interaction.followup.send(es(f"✅ Отпуск для {nickname} оформлен и сразу активирован!"), ephemeral=True)
             return
@@ -6413,6 +6478,7 @@ async def approve_vacation(interaction, nickname):
     except Exception:
         pass
     await refresh_event_embeds_overlapping_period(vacation['start'], vacation['end'])
+    await refresh_all_active_event_embeds()
     await try_dm_member(
         member,
         es("✅ Ваш отпуск утверждён командованием:\n\n") + format_vacation_period(vacation['start'], vacation['end']),
@@ -6523,6 +6589,7 @@ async def close_vacation(interaction, nickname, early=False, by_admin=False):
     # (должны по-прежнему корректно его исключать), и те, что впереди
     # (боец должен снова появиться в списке "Не отметились").
     await refresh_event_embeds_overlapping_period(vacation['start'], vacation['end'])
+    await refresh_all_active_event_embeds()
     try:
         channel = await client.fetch_channel(vacation['channel_id'])
         message = await channel.fetch_message(vacation['message_id'])
@@ -6641,6 +6708,8 @@ async def check_expired_vacations():
     # ручном закрытии (см. close_vacation), но для автоматического истечения срока.
     for start_iso, end_iso in actually_closed_periods:
         await refresh_event_embeds_overlapping_period(start_iso, end_iso)
+    if actually_closed_periods:
+        await refresh_all_active_event_embeds()
 
 
 async def check_vacation_ending_soon():
@@ -6802,7 +6871,10 @@ async def handle_event_response(interaction, event_id, response_type):
     else:
         await interaction.followup.send(es("❌ Вы отказались от участия!"), ephemeral=True)
 
-    embed_refresher.schedule(event_id)
+    # Полный пересчёт ВСЕХ активных мероприятий, а не только текущего:
+    # изменение отметки здесь может сдвинуть 'Ожидаемого командира отделения'
+    # и на ЛЮБЫХ последующих по дате мероприятиях (см. compute_expected_squad_commanders).
+    await refresh_all_active_event_embeds()
 
 
 async def open_edit_modal(interaction, event_id, image_key=None, num_games=None, mandatory=None):
@@ -6902,6 +6974,8 @@ async def cancel_event(interaction, event_id):
         return
 
     await refresh_event_message(event_id)
+    # Эксперимент (п.2): страховочное раскрытие отметок при отмене мероприятия.
+    await reveal_event_marks(event_id, 'event_cancelled_fallback')
     if event.get('thread_id'):
         try:
             thread = await client.fetch_channel(event['thread_id'])
@@ -7118,11 +7192,22 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     if status == 'active' and current_date <= event_end:
         time_value += f"\nНачнется: <t:{start_ts}:R>"
 
+    # === ОТВЕТСТВЕННЫЙ ЗА МЕРОПРИЯТИЕ (только для мероприятий, созданных
+    # игроками через "🔵канцелярия-arma") — постоянная строка, показывается
+    # ВСЕГДА, независимо от статуса мероприятия (в отличие от "Ожидаемого
+    # командира отделения", который скрывается для cancelled/completed). ===
+    creator_id = event.get('created_by_discord_id')
+    if creator_id is not None:
+        creator_member = member_index.guild.get_member(creator_id) if member_index.guild else None
+        creator_value = creator_member.mention if creator_member else f"<@{creator_id}>"
+        embed.add_field(name=es("🪖 Ответственный за мероприятие"), value=creator_value, inline=False)
+
     # === ОЖИДАЕМЫЙ КОМАНДИР ОТДЕЛЕНИЯ (очередь Firebase) (п.4) ===
+    # Поле показывается ТОЛЬКО для активных мероприятий (для cancelled/
+    # completed — не рассчитывается и не отображается вообще).
     if status == 'active':
-        # vacation_set построен на дату мероприятия — командир не должен
-        # назначаться тому, кто на эту дату в отпуске.
-        expected_commander = await get_expected_squad_commander(event, event_start_dt, vacation_set=vacation_set)
+        expected_commanders = await compute_expected_squad_commanders()
+        expected_commander = expected_commanders.get(event_id)
         embed.add_field(
             name=es("🪖 Ожидаемый командир отделения"),
             value=expected_commander if expected_commander else "Не определён",
@@ -7160,9 +7245,8 @@ async def build_event_embed(event_id: str) -> discord.Embed:
 
     if is_marks_hidden_for_event(event):
         embed.add_field(
-            name=es("🔒 Отметки"),
-            value=es("Список отметившихся временно скрыт в рамках эксперимента внутри клана. "
-                     "Отмечаться по-прежнему можно и нужно — ваши отметки сохраняются как обычно."),
+            name=es("🔒 Список отметок"),
+            value=es("Список для еженедельных мероприятий скрыт в качестве эксперимента. Отмечаться по-прежнему можно и нужно — ваши отметки сохраняются как обычно. Проверить, отмечались ли вы, можно по кнопке 'Отметки'. Список будет автоматически раскрыт в день проведения мероприятия."),
             inline=False
         )
     else:
@@ -7506,13 +7590,24 @@ async def check_event_reminders():
                         if should_send:
                             msg = await thread.send(render_reminder_15min_message(mention_block, event))
                             record_thread_message(event, msg.id, 'reminder_15min', mention_block=mention_block)
+                            # Эксперимент (п.2): напоминание за 15 минут — один
+                            # из триггеров раскрытия списка отметок для всех.
+                            await reveal_event_marks(event_id, 'reminder_15min')
                     event['reminder_15min_sent'] = True
                     changed = True
                     
             elif event.get('mandatory', True) and not event.get('reminder_15min_sent', False) and time_until_start < timedelta(minutes=-10):
                 event['reminder_15min_sent'] = True
                 changed = True
-                    
+
+            # === Эксперимент (п.2): fallback-раскрытие отметок, если
+            # мероприятие уже НАЧАЛОСЬ, а раскрытия по сценариям 'Моды'/
+            # '15-минутное напоминание' по какой-то причине не произошло
+            # (например, никто не отметился 'Приду', поэтому напоминание
+            # выше не было отправлено вовсе). ===
+            if is_marks_hidden_for_event(event) and time_until_start <= timedelta(0):
+                await reveal_event_marks(event_id, 'event_start_fallback')
+
         except Exception:
             pass
     if changed:
@@ -7587,6 +7682,11 @@ async def check_event_completion():
             if event is None:
                 continue
             await refresh_event_message(event_id)
+            # Эксперимент (п.2): страховочное раскрытие при завершении —
+            # ВАЖНО делать это явно (а не полагаться только на смену статуса),
+            # иначе при случайной реактивации мероприятие могло бы снова
+            # "спрятать" уже показанные всем отметки.
+            await reveal_event_marks(event_id, 'event_completed_fallback')
             thread = None
             if event.get('thread_id'):
                 try:
