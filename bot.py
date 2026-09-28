@@ -759,12 +759,15 @@ VOICE_ROOM_CATEGORY_ARMY = 1284893244878098464
 VOICE_ROOM_CATEGORY_PUBLIC = 1116656512677445693
 
 OFFICE_CHANNEL_NAME = "🔵канцелярия-arma"
+# Каждый элемент: (текст с эмодзи, ссылка, номер ряда). Ряды 0 и 1 содержат
+# по 2 кнопки, ряд 2 — одну, ряд 3 зарезервирован под кнопку создания
+# мероприятия (добавляется отдельно в OfficeMenuView, см. ниже).
 OFFICE_SITE_LINKS = [
-    ("🍻 Состав клана", "https://mis-enemy.ru/roster"),
-    ("📝 Устав и манифест клана", "https://mis-enemy.ru/charter"),
-    ("🎯 Клановая статистика", "https://mis-enemy.ru/hq/arma/stats"),
-    ("👥 Очередь на командира отделения", "https://mis-enemy.ru/queue"),
-    ("📭 Моё личное дело", "https://mis-enemy.ru/profile"),
+    ("🍻 Состав клана", "https://mis-enemy.ru/roster", 0),
+    ("📝 Устав и манифест клана", "https://mis-enemy.ru/charter", 0),
+    ("🎯 Клановая статистика", "https://mis-enemy.ru/hq/arma/stats", 1),
+    ("👥 Очередь на командира отделения", "https://mis-enemy.ru/queue", 1),
+    ("📭 Моё личное дело", "https://mis-enemy.ru/profile", 2),
 ]
 
 EVENTS_FILE = os.path.join(BASE_DIR, 'events_data.json')
@@ -2231,7 +2234,7 @@ LOGGING_ANCHOR_DESCRIPTION = (
 BOT_STARTED_AT = datetime.now(MSK)
 
 def build_admin_panel_embed():
-    embed = discord.Embed(title=es("🛠️ Панель управления комбата и заместителей"),
+    embed = discord.Embed(title=es("🛠️ Панель бота для комбата и заместителей"),
                            description=ADMIN_PANEL_DESCRIPTION, color=ANCHOR_EMBED_COLOR)
     started_str = BOT_STARTED_AT.strftime('%d.%m.%Y %H:%M')
     embed.set_footer(text=f"Последний запуск бота: {started_str} МСК")
@@ -2318,7 +2321,7 @@ async def ensure_admin_channel_anchors():
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
 
     panel_msg, _ = await _find_or_create_anchor(
-        channel, es("🛠️ Панель управления комбата и заместителей"),
+        channel, es("🛠️ Панель бота для комбата и заместителей"),
         build_admin_panel_embed, thread_name=None, view=AdminMainMenuView(),
         saved_message_id=anchors.get('panel_message_id')
     )
@@ -6074,7 +6077,7 @@ async def ensure_vacation_rules_message():
 
 def build_office_embed():
     embed = discord.Embed(
-        title=es("🔵 Канцелярия ArmA"),
+        title=es("🛠️ Панель бота для бойцов клана"),
         description=es("Здесь собраны полезные ссылки на сайт клана, а также возможность "
                         "самостоятельно создать мероприятие."),
         color=discord.Color.blue()
@@ -6085,12 +6088,12 @@ def build_office_embed():
 class OfficeMenuView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
-        for label, url in OFFICE_SITE_LINKS:
-            self.add_item(discord.ui.Button(label=label, style=discord.ButtonStyle.link, url=url))
+        for label, url, row in OFFICE_SITE_LINKS:
+            self.add_item(discord.ui.Button(label=es(label), style=discord.ButtonStyle.link, url=url, row=row))
 
         create_btn = discord.ui.Button(
-            label=es("📅 Создание единоразового мероприятия"),
-            style=discord.ButtonStyle.success, custom_id="office_create_event", row=2
+            label=es("📅 Создание мероприятия"),
+            style=discord.ButtonStyle.success, custom_id="office_create_event", row=3
         )
         create_btn.callback = self._create_event_callback
         self.add_item(create_btn)
@@ -6118,7 +6121,7 @@ async def ensure_office_message():
         return
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
     msg, _ = await _find_or_create_anchor(
-        channel, es("🔵 Канцелярия ArmA"), build_office_embed,
+        channel, es("🛠️ Панель бота для бойцов клана"), build_office_embed,
         thread_name=None, view=OfficeMenuView(),
         saved_message_id=anchors.get('office_message_id')
     )
