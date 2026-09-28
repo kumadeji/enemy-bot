@@ -532,13 +532,13 @@ _ES_REPLACEMENTS = {
     '🍻 ': '🍻ㅤ', '🚪 ': '🚪ㅤ', '➡️ ': '➡️ㅤ', '⏭️ ': '⏭️ㅤ',
     '🖼️ ': '🖼️ㅤ', '🚫 ': '🚫ㅤ', '🎖️ ': '🎖️ㅤ', '🧩 ': '🧩ㅤ',
     '🏁 ': '🏁ㅤ', '🚀 ': '🚀ㅤ', '🔁 ': '🔁ㅤ', '🧹 ': '🧹ㅤ',
+    '🎉 ': '🎉ㅤ', '👋 ': '👋ㅤ',
 }
 # Один скомпилированный regex вместо 64 последовательных str.replace()
 # на каждый вызов (раньше es() создавала словарь заново и делала 64 прохода
 # по строке при КАЖДОМ вызове — а вызывается она сотни раз за один рендер
 # embed'а/сообщения).
 _ES_PATTERN = re.compile('|'.join(re.escape(k) for k in sorted(_ES_REPLACEMENTS, key=len, reverse=True)))
-
 
 def es(text):
     """Заменяет обычный пробел после эмодзи на символ ㅤ (U+3164)"""
@@ -758,6 +758,15 @@ VOICE_CHANNEL_ID = 1284893513921728582
 VOICE_ROOM_CATEGORY_ARMY = 1284893244878098464
 VOICE_ROOM_CATEGORY_PUBLIC = 1116656512677445693
 
+OFFICE_CHANNEL_NAME = "🔵канцелярия-arma"
+OFFICE_SITE_LINKS = [
+    ("🍻 Состав клана", "https://mis-enemy.ru/roster"),
+    ("📝 Устав и манифест клана", "https://mis-enemy.ru/charter"),
+    ("🎯 Клановая статистика", "https://mis-enemy.ru/hq/arma/stats"),
+    ("👥 Очередь на командира отделения", "https://mis-enemy.ru/queue"),
+    ("📭 Моё личное дело", "https://mis-enemy.ru/profile"),
+]
+
 EVENTS_FILE = os.path.join(BASE_DIR, 'events_data.json')
 VACATIONS_FILE = os.path.join(BASE_DIR, 'vacations.json')
 VACATION_ARCHIVE_FILE = os.path.join(BASE_DIR, 'vacations_archive.json')
@@ -883,6 +892,49 @@ EVENT_IMAGES = {
     'vylazka': {'file': 'vylazka-rounded.png', 'title': 'Клановая вылазка'},
     'mangust': {'file': 'mangust-rounded.png', 'title': 'Операция «Мангуст»'},
 }
+
+# Картинки, наличие которых делает доступной кнопку "📝 Явка" под мероприятием
+# (см. build_event_view). Также используется для ограничения выбора картинки
+# при создании мероприятия ИГРОКАМИ (состав "Запас"+) — эти три варианта
+# зарезервированы за официальными клановыми матчами, создаваемыми командованием.
+ATTENDANCE_ELIGIBLE_IMAGE_KEYS = {'echo', 'asvdv', 'tt'}
+
+# ============== ЭКСПЕРИМЕНТ: ВРЕМЕННОЕ СКРЫТИЕ СПИСКОВ ОТМЕТОК ==============
+# МОДУЛЬНОСТЬ: единственный переключатель ниже управляет ВСЕМИ мероприятиями,
+# которые уже были помечены как участвующие в эксперименте (см.
+# _compute_marks_hidden_eligibility) — чтобы вернуть старое поведение
+# (списки снова видимы для всех таких мероприятий), достаточно поставить
+# EXPERIMENT_HIDE_MARKS_ENABLED = False и один раз нажать кнопку
+# "Обновление оформления сообщений бота" (она перерисует embed'ы заново
+# с учётом нового значения переключателя). Само "членство" конкретного
+# мероприятия в эксперименте (marks_hidden_experiment) фиксируется НАВСЕГДА
+# в момент его создания и не меняется переключателем — это лишь исторический
+# факт "это мероприятие подпадало под условия эксперимента на момент
+# создания", а переключатель решает, действует ли это сейчас.
+EXPERIMENT_HIDE_MARKS_ENABLED = True
+EXPERIMENT_HIDE_MARKS_CUTOFF = MSK.localize(datetime(2026, 9, 29, 0, 0, 0))
+
+
+def _compute_marks_hidden_eligibility(image_key: str, start_time: datetime) -> bool:
+    """Мероприятие 'подпадает' под эксперимент, если картинка echo/asvdv/tt
+    И дата НАЧАЛА мероприятия >= EXPERIMENT_HIDE_MARKS_CUTOFF. Вызывается
+    ТОЛЬКО в момент создания мероприятия (create_event) — уже существующие
+    (созданные до применения этого патча) мероприятия таким образом
+    гарантированно не затрагиваются задним числом, как и требовалось."""
+    return image_key in ATTENDANCE_ELIGIBLE_IMAGE_KEYS and start_time >= EXPERIMENT_HIDE_MARKS_CUTOFF
+
+
+def is_marks_hidden_for_event(event: dict) -> bool:
+    """Эффективное решение 'скрыты ли списки отметок ПРЯМО СЕЙЧАС' для
+    конкретного мероприятия — глобальный переключатель И историческая
+    принадлежность мероприятия к эксперименту. Списки становятся видимыми
+    для ВСЕХ автоматически, как только мероприятие переходит в статус
+    'cancelled' или 'completed' — независимо от глобального переключателя
+    (эксперимент касается только ЕЩЁ ИДУЩИХ мероприятий)."""
+    if event.get('status', 'active') != 'active':
+        return False
+    return EXPERIMENT_HIDE_MARKS_ENABLED and bool(event.get('marks_hidden_experiment'))
+
 
 def get_image_info(image_key: str):
     if image_key == 'none' or image_key not in EVENT_IMAGES:
@@ -2455,11 +2507,12 @@ class ExtractMessageModal(discord.ui.Modal, title=es("🔍 Извлечь код
 
 
 class EventCreateModal(discord.ui.Modal):
-    def __init__(self, image_key='none', num_games=0, mandatory=True):
+    def __init__(self, image_key='none', num_games=0, mandatory=True, created_by_discord_id=None):
         super().__init__(title=es("📅 Создание мероприятия"))
         self.image_key = image_key
         self.num_games = num_games
         self.mandatory = mandatory
+        self.created_by_discord_id = created_by_discord_id
         self.event_title = discord.ui.TextInput(label="Название мероприятия", required=True, max_length=100)
         self.event_description = discord.ui.TextInput(label="Описание", style=discord.TextStyle.paragraph, required=True, max_length=1000)
         self.event_date = discord.ui.TextInput(label="Дата мероприятия (ДД.ММ.ГГГГ)", placeholder="01.12.2026", required=True, max_length=10)
@@ -2480,7 +2533,8 @@ class EventCreateModal(discord.ui.Modal):
             if end <= start:
                 end += timedelta(days=1)  # мероприятие переходит через полночь
             await create_event(self.event_title.value, self.event_description.value, start, end,
-                                image_key=self.image_key, num_games=self.num_games, mandatory=self.mandatory)
+                                image_key=self.image_key, num_games=self.num_games, mandatory=self.mandatory,
+                                created_by_discord_id=self.created_by_discord_id)
             await interaction.followup.send(es("✅ Мероприятие создано!"), ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
@@ -2518,37 +2572,47 @@ class EventEditModal(discord.ui.Modal):
         except Exception as e:
             await interaction.followup.send(f"❌ Ошибка: {e}", ephemeral=True)
 
-
 class EventSetupView(discord.ui.View):
     """Шаг настройки перед созданием мероприятия: картинка, количество игр,
     обязательность отметок — вынесены сюда из модалки (Select вместо текстовых
     полей), чтобы освободить место для разделения даты/времени на 3 поля,
-    не превышая лимит Discord в 5 текстовых полей на одну модалку."""
-    def __init__(self):
+    не превышая лимит Discord в 5 текстовых полей на одну модалку.
+
+    player_mode=True — используется для мероприятий, создаваемых игроками
+    (состав "Запас"+) через раздел "🔵канцелярия-arma": скрывает выбор
+    количества игр (всегда 0) и обязательности отметок (всегда необязательны),
+    а также исключает из выбора картинки echo/asvdv/tt (зарезервированы за
+    официальными клановыми матчами, создаваемыми только командованием)."""
+    def __init__(self, player_mode: bool = False, created_by_discord_id: int = None):
         super().__init__(timeout=180)
+        self.player_mode = player_mode
+        self.created_by_discord_id = created_by_discord_id
         self.image_key = 'none'
         self.num_games = 0
-        self.mandatory = True
+        self.mandatory = not player_mode
 
         image_options = [discord.SelectOption(label="Без картинки", value="none", emoji="🚫", default=True)]
         for key, data in EVENT_IMAGES.items():
+            if player_mode and key in ATTENDANCE_ELIGIBLE_IMAGE_KEYS:
+                continue
             image_options.append(discord.SelectOption(label=data['title'], value=key, emoji="🖼️"))
         self.image_select = discord.ui.Select(placeholder="🖼️ Картинка (необязательно)...", options=image_options, row=0)
         self.image_select.callback = self._image_cb
         self.add_item(self.image_select)
 
-        games_options = [discord.SelectOption(label=f"{n} {pluralize_games(n)}", value=str(n), default=(n == 0)) for n in range(MAX_GAMES + 1)]
-        self.games_select = discord.ui.Select(placeholder="🎮 Количество игр...", options=games_options, row=1)
-        self.games_select.callback = self._games_cb
-        self.add_item(self.games_select)
+        if not player_mode:
+            games_options = [discord.SelectOption(label=f"{n} {pluralize_games(n)}", value=str(n), default=(n == 0)) for n in range(MAX_GAMES + 1)]
+            self.games_select = discord.ui.Select(placeholder="🎮 Количество игр...", options=games_options, row=1)
+            self.games_select.callback = self._games_cb
+            self.add_item(self.games_select)
 
-        mandatory_options = [
-            discord.SelectOption(label="Отметки обязательны", value="yes", emoji="✅", default=True),
-            discord.SelectOption(label="Отметки необязательны", value="no", emoji="🚫"),
-        ]
-        self.mandatory_select = discord.ui.Select(placeholder="📌 Обязательность отметок...", options=mandatory_options, row=2)
-        self.mandatory_select.callback = self._mandatory_cb
-        self.add_item(self.mandatory_select)
+            mandatory_options = [
+                discord.SelectOption(label="Отметки обязательны", value="yes", emoji="✅", default=True),
+                discord.SelectOption(label="Отметки необязательны", value="no", emoji="🚫"),
+            ]
+            self.mandatory_select = discord.ui.Select(placeholder="📌 Обязательность отметок...", options=mandatory_options, row=2)
+            self.mandatory_select.callback = self._mandatory_cb
+            self.add_item(self.mandatory_select)
 
         next_btn = discord.ui.Button(label=es("➡️ Далее"), style=discord.ButtonStyle.primary, row=3)
         next_btn.callback = self._next_cb
@@ -2568,17 +2632,28 @@ class EventSetupView(discord.ui.View):
 
     async def _next_cb(self, interaction):
         self.stop()
-        await interaction.response.send_modal(EventCreateModal(image_key=self.image_key, num_games=self.num_games, mandatory=self.mandatory))
+        await interaction.response.send_modal(EventCreateModal(
+            image_key=self.image_key, num_games=self.num_games, mandatory=self.mandatory,
+            created_by_discord_id=self.created_by_discord_id
+        ))
 
 
 class EventEditSetupView(discord.ui.View):
     """Аналог EventSetupView, но для редактирования — с предзаполнением
-    текущих значений картинки/количества игр/обязательности."""
+    текущих значений картинки/количества игр/обязательности.
+
+    Флаг is_player_event определяется по самому мероприятию
+    (created_by_discord_id is not None) — а не передаётся отдельно через
+    цепочку вызовов кнопок, чтобы не приходилось прокидывать player_mode
+    через on_edit_button/каждый обработчик. Для таких мероприятий скрыты
+    выборы количества игр/обязательности (навсегда 0/False, как и при
+    создании) и из выбора картинки исключены echo/asvdv/tt."""
     def __init__(self, event_id):
         super().__init__(timeout=180)
         self.event_id = event_id
         events = load_json(EVENTS_FILE, {})
         event = events.get(event_id, {})
+        self.is_player_event = event.get('created_by_discord_id') is not None
         self.image_key = "__keep__"
         self.num_games = event.get('num_games', 0)
         self.mandatory = event.get('mandatory', True)
@@ -2586,23 +2661,26 @@ class EventEditSetupView(discord.ui.View):
         image_options = [discord.SelectOption(label="⏮️ Оставить текущую", value="__keep__", emoji="✅", default=True)]
         image_options.append(discord.SelectOption(label="Без картинки", value="none", emoji="🚫"))
         for key, data in EVENT_IMAGES.items():
+            if self.is_player_event and key in ATTENDANCE_ELIGIBLE_IMAGE_KEYS:
+                continue
             image_options.append(discord.SelectOption(label=data['title'], value=key, emoji="🖼️"))
         self.image_select = discord.ui.Select(placeholder="🖼️ Картинка (по умолчанию — текущая)...", options=image_options, row=0)
         self.image_select.callback = self._image_cb
         self.add_item(self.image_select)
 
-        games_options = [discord.SelectOption(label=f"{n} {pluralize_games(n)}", value=str(n), default=(n == self.num_games)) for n in range(MAX_GAMES + 1)]
-        self.games_select = discord.ui.Select(placeholder="🎮 Количество игр...", options=games_options, row=1)
-        self.games_select.callback = self._games_cb
-        self.add_item(self.games_select)
+        if not self.is_player_event:
+            games_options = [discord.SelectOption(label=f"{n} {pluralize_games(n)}", value=str(n), default=(n == self.num_games)) for n in range(MAX_GAMES + 1)]
+            self.games_select = discord.ui.Select(placeholder="🎮 Количество игр...", options=games_options, row=1)
+            self.games_select.callback = self._games_cb
+            self.add_item(self.games_select)
 
-        mandatory_options = [
-            discord.SelectOption(label="Отметки обязательны", value="yes", emoji="✅", default=self.mandatory),
-            discord.SelectOption(label="Отметки необязательны", value="no", emoji="🚫", default=(not self.mandatory)),
-        ]
-        self.mandatory_select = discord.ui.Select(placeholder="📌 Обязательность отметок...", options=mandatory_options, row=2)
-        self.mandatory_select.callback = self._mandatory_cb
-        self.add_item(self.mandatory_select)
+            mandatory_options = [
+                discord.SelectOption(label="Отметки обязательны", value="yes", emoji="✅", default=self.mandatory),
+                discord.SelectOption(label="Отметки необязательны", value="no", emoji="🚫", default=(not self.mandatory)),
+            ]
+            self.mandatory_select = discord.ui.Select(placeholder="📌 Обязательность отметок...", options=mandatory_options, row=2)
+            self.mandatory_select.callback = self._mandatory_cb
+            self.add_item(self.mandatory_select)
 
         next_btn = discord.ui.Button(label=es("➡️ Далее"), style=discord.ButtonStyle.primary, row=3)
         next_btn.callback = self._next_cb
@@ -3052,6 +3130,29 @@ def get_event_id_by_message_id(message_id):
             return event_id
     return None
 
+def user_can_manage_event(user_id: int, event: dict) -> bool:
+    """Комбат/заместитель — всегда; либо автор мероприятия (боец состава
+    'Запас'+, создавший его через раздел '🔵канцелярия-arma') — только для
+    СВОИХ мероприятий. created_by_discord_id отсутствует (None) у всех
+    мероприятий, созданных командованием/еженедельными шаблонами — для них
+    доступ остаётся строго административным."""
+    if user_id in ADMIN_USER_IDS:
+        return True
+    creator_id = event.get('created_by_discord_id')
+    return creator_id is not None and creator_id == user_id
+
+
+def user_can_manage_event_id(user_id: int, event_id: str) -> bool:
+    events = read_json(EVENTS_FILE, {})
+    event = events.get(event_id)
+    if not event:
+        return False
+    return user_can_manage_event(user_id, event)
+
+
+def user_can_manage_wizard(user_id: int, wizard) -> bool:
+    return user_can_manage_event_id(user_id, wizard.event_id)
+
 
 def event_created_late(event: dict) -> bool:
     """True, если мероприятие было создано менее чем за 24 часа до начала (п.12, п.13)."""
@@ -3169,12 +3270,12 @@ async def on_decline_button(interaction: discord.Interaction):
 
 
 async def on_edit_button(interaction: discord.Interaction):
-    if interaction.user.id not in ADMIN_USER_IDS:
-        await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-        return
     event_id = get_event_id_by_message_id(interaction.message.id)
     if not event_id:
         await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        return
+    if not user_can_manage_event_id(interaction.user.id, event_id):
+        await interaction.response.send_message(es("⛔ Редактировать это мероприятие может только командование или его создатель!"), ephemeral=True)
         return
     await interaction.response.send_message(
         es("✏️ Измените параметры (или оставьте как есть) и нажмите Далее:"), view=EventEditSetupView(event_id), ephemeral=True
@@ -3193,34 +3294,34 @@ async def on_attendance_button(interaction: discord.Interaction):
 
 
 async def on_cancel_button(interaction: discord.Interaction):
-    if interaction.user.id not in ADMIN_USER_IDS:
-        await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-        return
     event_id = get_event_id_by_message_id(interaction.message.id)
     if not event_id:
         await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        return
+    if not user_can_manage_event_id(interaction.user.id, event_id):
+        await interaction.response.send_message(es("⛔ Отменить это мероприятие может только командование или его создатель!"), ephemeral=True)
         return
     await cancel_event(interaction, event_id)
 
 
 async def on_reactivate_button(interaction: discord.Interaction):
-    if interaction.user.id not in ADMIN_USER_IDS:
-        await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-        return
     event_id = get_event_id_by_message_id(interaction.message.id)
     if not event_id:
         await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        return
+    if not user_can_manage_event_id(interaction.user.id, event_id):
+        await interaction.response.send_message(es("⛔ Активировать это мероприятие может только командование или его создатель!"), ephemeral=True)
         return
     await reactivate_event(interaction, event_id)
 
 
 async def on_delete_button(interaction: discord.Interaction):
-    if interaction.user.id not in ADMIN_USER_IDS:
-        await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-        return
     event_id = get_event_id_by_message_id(interaction.message.id)
     if not event_id:
         await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        return
+    if not user_can_manage_event_id(interaction.user.id, event_id):
+        await interaction.response.send_message(es("⛔ Удалить это мероприятие может только командование или его создатель!"), ephemeral=True)
         return
     await interaction.response.send_message(
         es("⚠️ Вы уверены, что хотите **полностью удалить** мероприятие? Это действие необратимо!"),
@@ -3229,14 +3330,51 @@ async def on_delete_button(interaction: discord.Interaction):
 
 
 async def on_mods_button(interaction: discord.Interaction):
-    if interaction.user.id not in ADMIN_USER_IDS:
-        await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-        return
     event_id = get_event_id_by_message_id(interaction.message.id)
     if not event_id:
         await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
+    if not user_can_manage_event_id(interaction.user.id, event_id):
+        await interaction.response.send_message(es("⛔ Опубликовать объявление о модах для этого мероприятия может только командование или его создатель!"), ephemeral=True)
+        return
     await interaction.response.send_modal(ModsAnnounceModal(event_id))
+
+
+def build_personal_mark_status_text(event: dict, nickname: str) -> str:
+    """Персональный статус отметки конкретного бойца на мероприятии —
+    базовая часть ответа кнопки '📋 Отметки', доступная всем без исключения."""
+    if nickname in (event.get('accepted') or {}):
+        return es("✅ Вы отметились: **Приду**")
+    if nickname in (event.get('declined') or {}):
+        return es("❌ Вы отметились: **Не приду**")
+    return es("❓ Вы пока не отметились на этом мероприятии")
+
+
+async def on_marks_button(interaction: discord.Interaction):
+    event_id = get_event_id_by_message_id(interaction.message.id)
+    if not event_id:
+        await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        return
+    events = load_json(EVENTS_FILE, {})
+    event = events.get(event_id)
+    if not event:
+        await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        return
+
+    personal_status = build_personal_mark_status_text(event, interaction.user.display_name)
+
+    # Для обычных бойцов — только их личный статус, без доступа к общему
+    # (пока скрытому в рамках эксперимента) списку отметок остальных.
+    if interaction.user.id not in ADMIN_USER_IDS:
+        await interaction.response.send_message(personal_status, ephemeral=True)
+        return
+
+    # Для командования — личный статус ДОПОЛНИТЕЛЬНО к полному списку отметок.
+    embed = await build_marks_report_embed(event_id)
+    if not embed:
+        await interaction.response.send_message(personal_status, ephemeral=True)
+        return
+    await interaction.response.send_message(content=personal_status, embed=embed, ephemeral=True)
 
 
 class ConfirmDeleteView(discord.ui.View):
@@ -3353,45 +3491,109 @@ def make_mods_button():
     b.callback = on_mods_button
     return b
 
+def make_marks_button():
+    b = discord.ui.Button(label=es("📋 Отметки"), style=discord.ButtonStyle.secondary, custom_id="event_marks", row=2)
+    b.callback = on_marks_button
+    return b
 
-def build_event_view(event: dict, event_id: str = None) -> discord.ui.View:
+
+async def build_marks_report_embed(event_id: str):
+    """Отчёт по всем отметкам мероприятия НА МОМЕНТ ЗАПРОСА — используется
+    кнопкой '📋 Отметки', которая показывается только тогда, когда обычные
+    списки в embed'е скрыты экспериментом (is_marks_hidden_for_event)."""
+    events = load_json(EVENTS_FILE, {})
+    event = events.get(event_id)
+    if not event:
+        return None
+
+    event_start_dt = datetime.fromtimestamp(event['start_time'], MSK)
+    vacation_set = build_vacation_set_for_date(load_json(VACATIONS_FILE, {}), event_start_dt)
+    active_members = await get_active_members(event_start_dt, registered_before=event_start_dt, vacation_set=vacation_set)
+    accepted = list(event.get('accepted', {}).keys())
+    declined = list(event.get('declined', {}).keys())
+    unmarked = [m for m in active_members if m not in accepted and m not in declined]
+
+    embed = discord.Embed(title=es(f"📋 Отметки: {build_display_title(event)}"), color=discord.Color.blurple())
+
+    def add_field(prefix, names):
+        if not names:
+            embed.add_field(name=es(f"{prefix} (0)"), value="—", inline=False)
+            return
+        chunks, current, current_len = [], [], 0
+        for name in names:
+            line_len = len(name) + 1
+            if current and current_len + line_len > 1000:
+                chunks.append(current)
+                current, current_len = [], 0
+            current.append(name)
+            current_len += line_len
+        if current:
+            chunks.append(current)
+        total = len(chunks)
+        for idx, chunk in enumerate(chunks, start=1):
+            suffix = f" ({idx}/{total})" if total > 1 else ""
+            embed.add_field(name=es(f"{prefix} ({len(names)}){suffix}"), value=">>> " + "\n".join(chunk), inline=False)
+
+    add_field("✅ Придут", accepted)
+    add_field("❌ Не придут", declined)
+    add_field("❓ Не отметились", unmarked)
+    embed.set_footer(text=f"Запрошено: {datetime.now(MSK).strftime('%d.%m.%Y %H:%M')} МСК")
+    return embed
+
+
+def build_event_view(event: dict, event_id: str = None, _force_register: bool = False) -> discord.ui.View:
     """Строит нужный набор кнопок в зависимости от текущего статуса мероприятия.
-    Кнопка '📝 Явка' ВСЕГДА доступна (даже если отчёт уже подан) — повторное
-    заполнение позволяет исправить данные; пересчёт gameStats и очереди
-    на командование корректно учитывает только изменения (см. finalize_attendance),
-    а старое сообщение отчёта удаляется перед публикацией нового."""
+    Кнопка '📝 Явка' показывается ТОЛЬКО для мероприятий с картинкой из
+    ATTENDANCE_ELIGIBLE_IMAGE_KEYS (echo/asvdv/tt). Кнопка '📋 Отметки'
+    показывается ТОЛЬКО когда обычные списки отметок скрыты экспериментом
+    (см. is_marks_hidden_for_event).
+
+    _force_register=True используется ИСКЛЮЧИТЕЛЬНО при регистрации
+    персистентных views (register_persistent_event_views) — гарантирует,
+    что custom_id 'event_marks' зарегистрирован и будет отвечать на клик
+    независимо от того, в каком состоянии находится глобальный
+    переключатель EXPERIMENT_HIDE_MARKS_ENABLED на момент старта бота
+    (иначе, если бот перезапущен при выключенном переключателе, клик по
+    кнопке 'Отметки' на СТАРЫХ, ещё не перерисованных сообщениях перестал
+    бы отвечать вообще, до следующего вызова 'Обновление оформления
+    сообщений бота')."""
     status = event.get('status', 'active')
+    show_attendance = event.get('image_key') in ATTENDANCE_ELIGIBLE_IMAGE_KEYS
+    show_marks = _force_register or is_marks_hidden_for_event(event)
     view = discord.ui.View(timeout=None)
     if status == 'active':
         view.add_item(make_accept_button())
         view.add_item(make_decline_button())
         view.add_item(make_edit_button())
-        view.add_item(make_attendance_button())
+        if show_attendance:
+            view.add_item(make_attendance_button())
         view.add_item(make_cancel_button())
         view.add_item(make_delete_button())
         view.add_item(make_mods_button())
     elif status == 'cancelled':
         view.add_item(make_edit_button())
-        view.add_item(make_attendance_button())
+        if show_attendance:
+            view.add_item(make_attendance_button())
         view.add_item(make_reactivate_button())
         view.add_item(make_delete_button())
     elif status == 'completed':
         view.add_item(make_edit_button())
-        view.add_item(make_attendance_button())
+        if show_attendance:
+            view.add_item(make_attendance_button())
         view.add_item(make_delete_button())
+    if show_marks:
+        view.add_item(make_marks_button())
     return view
 
 
 def register_persistent_event_views():
     """Регистрирует персистентные callback'и кнопок мероприятий раздельными View
-    по каждому статусу — гарантированно без риска превысить лимит Discord
-    (максимум 5 виджетов в строке, максимум 5 строк на одно View).
-    custom_id совпадают между разными View (например, 'event_delete' есть
-    во всех трёх) — это не проблема: discord.py просто резолвит клик
-    по custom_id независимо от того, какое View изначально его зарегистрировало,
-    а сама функция-колбэк у одинаковых custom_id всегда одна и та же."""
+    по каждому статусу. image_key='echo' — ИСКУССТВЕННО, чтобы гарантированно
+    зарегистрировать custom_id 'event_attendance'. _force_register=True —
+    аналогично, для 'event_marks' (см. docstring build_event_view)."""
     for status in ('active', 'cancelled', 'completed'):
-        client.add_view(build_event_view({'status': status}))
+        client.add_view(build_event_view({'status': status, 'image_key': 'echo'}, _force_register=True))
+
 
 # ============== REALTIME-СЛЕЖЕНИЕ ЗА FIREBASE (анкеты / changeLog / уведомления) ==============
 
@@ -5870,6 +6072,64 @@ async def ensure_vacation_rules_message():
         print(f"⚠️ Не удалось обновить сообщение с правилами отпусков: {e}")
 
 
+def build_office_embed():
+    embed = discord.Embed(
+        title=es("🔵 Канцелярия ArmA"),
+        description=es("Здесь собраны полезные ссылки на сайт клана, а также возможность "
+                        "самостоятельно создать мероприятие."),
+        color=discord.Color.blue()
+    )
+    return embed
+
+
+class OfficeMenuView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+        for label, url in OFFICE_SITE_LINKS:
+            self.add_item(discord.ui.Button(label=label, style=discord.ButtonStyle.link, url=url))
+
+        create_btn = discord.ui.Button(
+            label=es("📅 Создание единоразового мероприятия"),
+            style=discord.ButtonStyle.success, custom_id="office_create_event", row=2
+        )
+        create_btn.callback = self._create_event_callback
+        self.add_item(create_btn)
+
+    async def _create_event_callback(self, interaction: discord.Interaction):
+        if not member_has_klan_arma_role(interaction.user):
+            await interaction.response.send_message(
+                es("⛔ Создание мероприятий доступно только бойцам состава 'Запас' и выше!"), ephemeral=True
+            )
+            return
+        view = EventSetupView(player_mode=True, created_by_discord_id=interaction.user.id)
+        await interaction.response.send_message(
+            es("📅 Настройте параметры мероприятия и нажмите Далее:"), view=view, ephemeral=True
+        )
+
+
+async def ensure_office_message():
+    """Находит (или создаёт при первом запуске) постоянное сообщение
+    с меню канцелярии — по аналогии с якорными сообщениями админ-канала."""
+    guild = member_index.guild
+    if not guild:
+        return
+    channel = await setup_office_channel(guild)
+    if not channel:
+        return
+    anchors = load_json(ADMIN_ANCHORS_FILE, {})
+    msg, _ = await _find_or_create_anchor(
+        channel, es("🔵 Канцелярия ArmA"), build_office_embed,
+        thread_name=None, view=OfficeMenuView(),
+        saved_message_id=anchors.get('office_message_id')
+    )
+    try:
+        await msg.edit(embed=build_office_embed(), view=OfficeMenuView())
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить сообщение канцелярии: {e}")
+    anchors['office_message_id'] = msg.id
+    save_json(ADMIN_ANCHORS_FILE, anchors)
+
+
 async def publish_vacation_info(interaction):
     try:
         channel = await client.fetch_channel(VACATION_CHANNEL_ID)
@@ -6864,9 +7124,17 @@ async def build_event_embed(event_id: str) -> discord.Embed:
             field_name = es(f"{name_prefix} ({len(names)}){suffix}")
             embed.add_field(name=field_name, value=">>> " + "\n".join(chunk), inline=inline)
 
-    add_names_field("✅ Придут", accepted, inline=True)
-    add_names_field("❌ Не придут", declined, inline=True)
-    add_names_field("❓ Не отметились", unmarked, inline=False)
+    if is_marks_hidden_for_event(event):
+        embed.add_field(
+            name=es("🔒 Отметки"),
+            value=es("Список отметившихся временно скрыт в рамках эксперимента внутри клана. "
+                     "Отмечаться по-прежнему можно и нужно — ваши отметки сохраняются как обычно."),
+            inline=False
+        )
+    else:
+        add_names_field("✅ Придут", accepted, inline=True)
+        add_names_field("❌ Не придут", declined, inline=True)
+        add_names_field("❓ Не отметились", unmarked, inline=False)
 
     image_key = event.get('image_key', 'none')
     if image_key != 'none' and image_key in EVENT_IMAGES:
@@ -6931,7 +7199,7 @@ async def get_or_create_thread(event, event_id, title):
 
 
 async def create_event(title, description, start_time, end_time, image_key='none', num_games=0, color=15844367,
-                        mandatory=True, weekly_id=None, week_key=None):
+                        mandatory=True, weekly_id=None, week_key=None, created_by_discord_id=None):
     event_id = str(uuid.uuid4())
     events = load_json(EVENTS_FILE, {})
     events[event_id] = {
@@ -6946,6 +7214,12 @@ async def create_event(title, description, start_time, end_time, image_key='none
         'created_at': int(datetime.now(MSK).timestamp()),
         'weekly_id': weekly_id,   # используется для идемпотентности catch-up (см. post_weekly_events)
         'week_key': week_key,
+        # None — мероприятие создано командованием/шаблоном (управлять могут
+        # только ADMIN_USER_IDS). Discord user ID — мероприятие создано
+        # игроком через "🔵канцелярия-arma" (см. user_can_manage_event).
+        'created_by_discord_id': created_by_discord_id,
+        # Зафиксировано НАВСЕГДА в момент создания — см. is_marks_hidden_for_event.
+        'marks_hidden_experiment': _compute_marks_hidden_eligibility(image_key, start_time),
     }
     save_json(EVENTS_FILE, events)
     try:
@@ -7722,6 +7996,66 @@ async def extract_message_structure(interaction, channel_id, message_id):
         return None
 
 
+OFFICE_CATEGORY_ID = 1284893244878098464
+# Канал, НАД которым должен встать новый канал канцелярии (т.е. канцелярия
+# будет отображаться непосредственно ПЕРЕД ним в списке каналов категории).
+OFFICE_CHANNEL_AFTER_ID = 1297102560305614891
+
+def member_has_klan_arma_role(member) -> bool:
+    """Надёжный маркер 'состав Запас или выше' — роль 'Клан ArmA' выдаётся
+    автоматически именно и только составам 'Запас'/'Личный состав'
+    (см. compute_arma_role_keys), поэтому проверка её наличия эквивалентна
+    проверке состава на сайте, но не требует обращения к Firebase."""
+    if not member:
+        return False
+    role_id = ROLE_IDS.get('klan_arma')
+    if not role_id:
+        return False
+    return any(r.id == role_id for r in member.roles)
+
+
+async def setup_office_channel(guild):
+    """Создаёт (при первом запуске) текстовый канал '🔵канцелярия-arma' в
+    категории OFFICE_CATEGORY_ID, доступный только составу 'Запас' и выше
+    (по роли 'Клан ArmA'), и располагает его сразу после канала отпусков."""
+    category = guild.get_channel(OFFICE_CATEGORY_ID)
+    if not category:
+        print(f"⚠️ Категория {OFFICE_CATEGORY_ID} не найдена — канал '{OFFICE_CHANNEL_NAME}' не создан")
+        return None
+
+    existing = discord.utils.get(category.text_channels, name=OFFICE_CHANNEL_NAME)
+    if existing:
+        return existing
+
+    klan_role = guild.get_role(ROLE_IDS.get('klan_arma')) if ROLE_IDS.get('klan_arma') else None
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(view_channel=False),
+    }
+    if klan_role:
+        overwrites[klan_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
+    else:
+        print("⚠️ Роль 'Клан ArmA' не найдена на сервере — канал канцелярии будет создан без ограничения доступа!")
+
+    try:
+        channel = await category.create_text_channel(name=OFFICE_CHANNEL_NAME, overwrites=overwrites)
+        print(f"✅ Создан канал '{OFFICE_CHANNEL_NAME}' (ID: {channel.id})")
+    except Exception as e:
+        print(f"❌ Ошибка создания канала '{OFFICE_CHANNEL_NAME}': {e}")
+        return None
+
+    try:
+        anchor_channel = guild.get_channel(OFFICE_CHANNEL_AFTER_ID)
+        if anchor_channel:
+            # position = anchor.position (а не +1) — новый канал ЗАНИМАЕТ эту
+            # позицию, а якорный канал и всё, что идёт после него, сдвигается
+            # на один пункт вниз. Таким образом канцелярия оказывается СРАЗУ
+            # НАД якорным каналом.
+            await channel.edit(position=anchor_channel.position)
+    except Exception as e:
+        print(f"⚠️ Не удалось расположить канал '{OFFICE_CHANNEL_NAME}' на нужную позицию: {e}")
+
+    return channel
+
 # ============== ВРЕМЕННЫЕ ГОЛОСОВЫЕ КОМНАТЫ ==============
 
 async def setup_voice_room_triggers(guild):
@@ -8199,6 +8533,7 @@ async def on_ready():
     client.add_view(VacationApprovalView())
     client.add_view(VacationMessageView())
     client.add_view(SelfAssignRolesView())
+    client.add_view(OfficeMenuView())
     register_persistent_event_views()
 
     await setup_firestore_watchers()
@@ -8216,6 +8551,10 @@ async def on_ready():
         await ensure_vacation_rules_message()
     except Exception as e:
         print(f"⚠️ Не удалось опубликовать/найти сообщение с правилами отпусков: {e}")
+    try:
+        await ensure_office_message()
+    except Exception as e:
+        print(f"⚠️ Не удалось создать/обновить канал канцелярии для игроков: {e}")
 
     # Печатаем ЭТОТ лог последним — только после того, как ветка "🔧 Логирование"
     # уже гарантированно найдена/создана (ensure_admin_channel_anchors выше)
