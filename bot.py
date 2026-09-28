@@ -2304,33 +2304,64 @@ async def _find_or_create_anchor(channel, title: str, embed_builder, thread_name
     return message, thread
 
 
+# Известный ID уже существующего сообщения с панелью управления — используется
+# КАК ПРИОРИТЕТНЫЙ fallback, если ADMIN_ANCHORS_FILE ещё не содержит
+# сохранённый panel_message_id, ИЛИ если заголовок эмбеда с тех пор менялся
+# (например, "Панель управления комбата и заместителей" -> "Панель бота для
+# комбата и заместителей") — старый _find_or_create_anchor сверял заголовок
+# СОХРАНЁННОГО сообщения с ТЕКУЩИМ (новым) заголовком из build_admin_panel_embed
+# и, не найдя совпадения (естественно — заголовок ведь и должен был смениться
+# именно РЕДАКТИРОВАНИЕМ этого сообщения, а не поиском по старому тексту),
+# создавал НОВОЕ сообщение вместо обновления старого.
+KNOWN_ADMIN_PANEL_MESSAGE_ID = 1545844848815505439
+
+
+async def find_or_create_admin_panel_message(channel):
+    """Ищет якорь панели управления: сначала по сохранённому ID, затем по
+    известному захардкоженному ID (см. выше) — БЕЗ сверки заголовка эмбеда
+    (заголовок мог и должен был меняться), проверяется только то, что автор
+    сообщения — сам бот. Скан истории — последний fallback, и только потом
+    создание нового сообщения."""
+    anchors = load_json(ADMIN_ANCHORS_FILE, {})
+    candidate_id = anchors.get('panel_message_id') or KNOWN_ADMIN_PANEL_MESSAGE_ID
+    if candidate_id:
+        try:
+            message = await channel.fetch_message(candidate_id)
+            if message.author.id == client.user.id:
+                anchors['panel_message_id'] = message.id
+                save_json(ADMIN_ANCHORS_FILE, anchors)
+                return message
+        except Exception:
+            pass  # сообщение удалено/недоступно — переходим к скану истории
+
+    async for message in channel.history(limit=50):
+        if message.author.id != client.user.id:
+            continue
+        if message.embeds and message.embeds[0].title == es("🛠️ Панель управления комбата и заместителей"):
+            anchors['panel_message_id'] = message.id
+            save_json(ADMIN_ANCHORS_FILE, anchors)
+            return message
+
+    message = await channel.send(embed=build_admin_panel_embed(), view=AdminMainMenuView())
+    anchors['panel_message_id'] = message.id
+    save_json(ADMIN_ANCHORS_FILE, anchors)
+    return message
+
+
 async def ensure_admin_channel_anchors():
     """Находит (или создаёт при самом первом запуске) три якорных сообщения
     в ADMIN_CHANNEL_ID. Панель управления ОБНОВЛЯЕТСЯ при каждом старте бота
     (актуализация embed+view); уведомления/логирование — только создаются
-    один раз, их оформление актуализируется через синхронизацию шаблонов.
-
-    ВАЖНО: теперь передаём уже сохранённые message_id из ADMIN_ANCHORS_FILE
-    в _find_or_create_anchor как saved_message_id — раньше поиск ВСЕГДА
-    шёл сканом последних 50 сообщений канала, игнорируя эти сохранённые ID.
-    При активном админ-канале (много сообщений после якоря, например от
-    команды 'Список мероприятий' или уведомлений) скан истории мог не
-    найти старый якорь за пределами 50 последних сообщений и создать
-    ДУБЛИКАТ панели/анкоры при каждом рестарте бота."""
+    один раз, их оформление актуализируется через синхронизацию шаблонов."""
     channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
 
-    panel_msg, _ = await _find_or_create_anchor(
-        channel, es("🛠️ Панель бота для комбата и заместителей"),
-        build_admin_panel_embed, thread_name=None, view=AdminMainMenuView(),
-        saved_message_id=anchors.get('panel_message_id')
-    )
+    panel_msg = await find_or_create_admin_panel_message(channel)
     try:
         await panel_msg.edit(embed=build_admin_panel_embed(), view=AdminMainMenuView())
     except Exception as e:
         print(f"⚠️ Не удалось обновить панель управления: {e}")
     anchors['panel_message_id'] = panel_msg.id
-
     notif_msg, notif_thread = await _find_or_create_anchor(
         channel, es("ℹ️ Уведомления"),
         build_notifications_anchor_embed, thread_name="ℹ️ Уведомления",
@@ -7620,13 +7651,12 @@ async def update_all_templates():
         anchors = load_json(ADMIN_ANCHORS_FILE, {})
         admin_channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
 
-        if anchors.get('panel_message_id'):
-            try:
-                msg = await admin_channel.fetch_message(anchors['panel_message_id'])
-                await msg.edit(embed=build_admin_panel_embed(), view=AdminMainMenuView())
-                anchors_fixed += 1
-            except Exception as e:
-                print(f"⚠️ Не удалось обновить якорь 'Панель управления': {e}")
+        try:
+            panel_msg = await find_or_create_admin_panel_message(admin_channel)
+            await panel_msg.edit(embed=build_admin_panel_embed(), view=AdminMainMenuView())
+            anchors_fixed += 1
+        except Exception as e:
+            print(f"⚠️ Не удалось обновить якорь 'Панель управления': {e}")
 
         if anchors.get('notifications_message_id'):
             try:
