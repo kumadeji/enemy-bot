@@ -906,6 +906,7 @@ EVENT_IMAGES = {
     'echo': {'file': 'echo-rounded.png', 'title': 'Матчи на ECHO'},
     'asvdv': {'file': 'asvdv-rounded.png', 'title': 'Матчи на AS VDV'},
     'tt': {'file': 'tt-rounded.png', 'title': 'Матчи на Triad Tactics'},
+    'ts': {'file': 'ts-rounded.png', 'title': 'Тренировка на Tactical Shift'},
     'mezhklan': {'file': 'mezhklan-rounded.png', 'title': 'Межклановое мероприятие'},
     'vnutriklan': {'file': 'vnutriklan-rounded.png', 'title': 'Внутриклановое мероприятие'},
     'vylazka': {'file': 'vylazka-rounded.png', 'title': 'Клановая вылазка'},
@@ -7275,7 +7276,14 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     else:
         add_names_field("✅ Придут", accepted, inline=True)
         add_names_field("❌ Не придут", declined, inline=True)
-        add_names_field("❓ Не отметились", unmarked, inline=False)
+        # Список "Не отметились" ПОСТОЯННО визуально скрыт для мероприятий
+        # с необязательными отметками (mandatory=False) — данные по-прежнему
+        # считаются и хранятся в базе как обычно (см. unmarked выше,
+        # используется дисциплиной/командиром отделения/пр.), просто не
+        # отображаются в самом посте. Никаких пояснений/раскрытия не требуется —
+        # поле просто отсутствует в embed'е.
+        if event.get('mandatory', True):
+            add_names_field("❓ Не отметились", unmarked, inline=False)
 
     image_key = event.get('image_key', 'none')
     if image_key != 'none' and image_key in EVENT_IMAGES:
@@ -7849,6 +7857,8 @@ async def update_all_templates():
                 image_key = 'echo'
             elif 'межклан' in title:
                 image_key = 'mezhklan'
+            elif 'tactical shift' in title:
+                image_key = 'ts'
             elif 'внутриклан' in title:
                 image_key = 'vnutriklan'
             elif 'вылазка' in title:
