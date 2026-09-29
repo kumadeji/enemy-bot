@@ -1423,6 +1423,7 @@ async def compute_expected_squad_commanders() -> dict:
     active_events = [
         (event_id, event) for event_id, event in events.items()
         if event.get('status', 'active') == 'active'
+        and event.get('image_key') in ATTENDANCE_ELIGIBLE_IMAGE_KEYS
     ]
     active_events.sort(key=lambda item: item[1].get('start_time', 0))
 
@@ -7227,9 +7228,12 @@ async def build_event_embed(event_id: str) -> discord.Embed:
         embed.add_field(name=es("🪖 Ответственный за мероприятие"), value=creator_value, inline=False)
 
     # === ОЖИДАЕМЫЙ КОМАНДИР ОТДЕЛЕНИЯ (очередь Firebase) (п.4) ===
-    # Поле показывается ТОЛЬКО для активных мероприятий (для cancelled/
-    # completed — не рассчитывается и не отображается вообще).
-    if status == 'active':
+    # Поле показывается ТОЛЬКО для активных мероприятий с картинкой из
+    # ATTENDANCE_ELIGIBLE_IMAGE_KEYS (echo/asvdv/tt) — для остальных форматов
+    # (в т.ч. ЛЮБЫХ мероприятий, созданных игроками через "🔵канцелярия-arma",
+    # у которых такая картинка недоступна по правилам создания) понятие
+    # "командир отделения" неприменимо и поле не отображается вовсе.
+    if status == 'active' and event.get('image_key') in ATTENDANCE_ELIGIBLE_IMAGE_KEYS:
         expected_commanders = await compute_expected_squad_commanders()
         expected_commander = expected_commanders.get(event_id)
         embed.add_field(
