@@ -96,6 +96,10 @@ _original_print = print  # сохраняем оригинальный print Д�
 
 # ============== SYSTEMD WATCHDOG ==============
 
+# INVOCATION_ID устанавливается systemd для ЛЮБОГО управляемого юнита
+# (не только с Type=notify) — надёжный признак "процесс запущен systemd".
+RUNNING_UNDER_SYSTEMD = bool(os.environ.get('INVOCATION_ID'))
+
 _systemd_watchdog_task = None
 
 _discord_connection_watchdog_task = None
@@ -605,6 +609,10 @@ ROLE_IDS = {
     'klan_arma': 1284456321005129778,           # было 'boets_arma' — переименовано, ID тот же ("Клан ArmA")
     'klan_enemy': 1549047492555833425,          # БЫЛ 1048133924645240903 (устарел) — актуализирован ("КЛАН ENEMY")
     'gost_arma': 1250828979284213812,           # "Гость ArmA" — авто для состава "Отбор" + самостоятельный выбор (п.3)
+    'otbor_arma': 1548661103406358588,          # "Отбор ArmA" — состав "Отбор"
+    'prinyaty_novobranets_arma': 1548661262894895104,  # "Принятый новобранец ArmA"
+    'novobranets_arma': 1548661447788339271,           # "Новобранец ArmA"
+}
     # Роли специализаций (миномётчик/БТВ/пилот/КО и т.д.) удалены из реестра —
     # соответствующие роли в Discord больше не существуют.
 }
@@ -678,6 +686,7 @@ ARMA_MANAGED_ROLE_KEYS = {
     'kombat_arma', 'zam_kombat_arma', 'lichnyj_sostav_arma',
     'boec_veteran_arma', 'boec_arma', 'zapas_arma',
     'klan_arma', 'klan_enemy',
+    'otbor_arma', 'prinyaty_novobranets_arma', 'novobranets_arma',
 }
 ARMA_GUEST_ROLE_KEY = 'gost_arma'
 
@@ -695,6 +704,13 @@ def _map_lichny_sostav_position(position: str) -> str:
     if 'ветеран' in p:
         return 'boec_veteran_arma'
     return 'boec_arma'
+
+def _map_otbor_position(position: str) -> str:
+    """Сопоставляет должность состава 'Отбор' с ключом роли."""
+    p = (position or '').lower()
+    if 'принят' in p:
+        return 'prinyaty_novobranets_arma'
+    return 'novobranets_arma'
 
 # Иерархия должностей "Личного состава" от низшей к высшей — используется
 # для определения "повышение" это или "понижение" при смене должности
@@ -729,7 +745,8 @@ def compute_arma_role_keys(composition: str, position: str, active_warnings: int
     if composition == 'Отставка':
         return set(), 'remove'
     if composition == 'Отбор':
-        return set(), 'add'
+        pos_key = _map_otbor_position(position)
+        return {'otbor_arma', pos_key}, 'add'
     if composition == 'Запас':
         return {'zapas_arma', 'boec_arma', 'klan_arma', 'klan_enemy'}, 'remove'
     if composition == 'Личный состав':
@@ -2503,11 +2520,17 @@ class SelfAssignRolesView(discord.ui.View):
             parts.append("Сняты: " + ", ".join(r.name for r in to_remove))
         if not parts:
             parts.append("Изменений нет — уже всё соответствует вашему выбору.")
+
+        # Основная строка (результат добавления/снятия ролей) и предупреждение
+        # про недоступность 'Гость ArmA' — раньше склеивались в одну строку
+        # через " | ", из-за чего при одновременном наличии обоих сообщений
+        # текст выглядел нечитаемо слитным. Теперь это два отдельных абзаца.
+        message_lines = [es("✅ ") + " | ".join(parts)]
         if blocked_guest_attempt:
-            parts.append(es("⚠️ Роль 'Гость ArmA' вам не может быть выдана: вы уже состоите "
-                             "в клане. Она предназначена только для тех, кто "
-                             "ещё не входит в клан."))
-        await interaction.response.send_message(es("✅ ") + " | ".join(parts), ephemeral=True)
+            message_lines.append(es("⚠️ Роль 'Гость ArmA' вам не нужна и не может быть выдана: вы уже состоите "
+                                     "в клане (состав 'Запас' или выше). Она предназначена только для тех, кто "
+                                     "ещё не входит в клан."))
+        await interaction.response.send_message("\n".join(message_lines), ephemeral=True)
 
 
 async def ensure_self_assign_roles_message():
@@ -3963,7 +3986,8 @@ async def build_anketa_embed(uid, data, is_new: bool = True) -> discord.Embed:
     how_found = data.get('howFound') or ''
     if not how_found and referrer:
         how_found = "Приглашён бойцом (см. выше)"
-    embed.add_field(name="Откуда узнал?", value=_safe_field_value(how_found), inline=False)
+    embed.add_field(name="Откуда узнали?", value=_safe_field_value(how_found), inline=False)
+    embed.add_field(name="Почему хотите вступить?", value=_safe_field_value(data.get('whyJoin')), inline=False)
 
     games = data.get('gamesInterested', []) or []
     game_roles = data.get('gameRoles', {}) or {}
@@ -4148,7 +4172,7 @@ _ANKETA_RELEVANT_FIELDS = (
     'callsign', 'email', 'fullName', 'age', 'timezone', 'birthDate',
     'discordId', 'steamId', 'steamProfileUrl', 'armaId', 'extraContacts',
     'telegramUrl', 'vkUrl', 'referrerCallsign', 'referredByText',
-    'availability', 'howFound', 'gamesInterested', 'gameRoles',
+    'availability', 'howFound', 'whyJoin', 'gamesInterested', 'gameRoles',
     'experienceByGame', 'hoursByGame',
 )
 _LAST_ANKETA_RAW_FINGERPRINT: dict[str, str] = {}
@@ -8497,11 +8521,34 @@ async def sweep_empty_voice_rooms():
         await cleanup_empty_temp_room(channel_id)
 
 async def force_restart_bot():
-    """Освобождает lock-файл, поднимает НОВЫЙ независимый процесс бота
-    и завершает текущий процесс. Вызывается кнопкой '🔄 Принудительный
-    перезапуск' в админ-панели. Специального логирования самого факта
-    перезапуска не ведётся — единственный лог о готовности бота
-    печатается новым процессом при его старте (см. on_ready)."""
+    """Освобождает lock-файл и перезапускает бота. Способ перезапуска
+    зависит от окружения:
+
+      - Под systemd (RUNNING_UNDER_SYSTEMD=True): процесс завершается с
+        НЕНУЛЕВЫМ кодом выхода (os._exit(1)) — НИКАКОЙ новый процесс
+        вручную не поднимается. systemd воспринимает ненулевой код как
+        сбой и сам перезапускает юнит согласно 'Restart=on-failure'
+        (или 'Restart=always') в файле enemy-bot.service. Раньше здесь
+        ВСЕГДА поднимался независимый subprocess.Popen и процесс выходил
+        с кодом 0 — под systemd это давало ДВОЙНОЙ вред: (1) новый процесс
+        оказывался полностью вне управления systemd (лишний процесс,
+        которым нельзя управлять как обычным юнитом), и (2) выход с кодом
+        0 воспринимался как штатная остановка, из-за чего Restart=on-failure
+        НЕ срабатывал вообще — юнит просто останавливался.
+
+      - Вне systemd (Windows, ручной запуск 'python bot.py'):
+        RUNNING_UNDER_SYSTEMD=False, поведение прежнее — поднимается
+        независимый дочерний процесс, текущий процесс завершается с кодом 0.
+
+    ВАЖНО: чтобы автоматический перезапуск под systemd реально работал,
+    в /etc/systemd/system/enemy-bot.service должно быть настроено:
+        [Service]
+        Restart=on-failure
+        RestartSec=3
+    Без этого директива просто отсутствует, и процесс, завершившийся с
+    кодом 1, НЕ будет перезапущен автоматически — ни этим кодом, ни каким-либо
+    другим способом изнутри процесса (перезапуск управляемого юнита из него
+    самого без участия systemd невозможен в принципе)."""
     try:
         await flush_log_buffer_to_discord()
     except Exception:
@@ -8527,6 +8574,20 @@ async def force_restart_bot():
         pass
 
     try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+    if RUNNING_UNDER_SYSTEMD:
+        print("🔧 Перезапуск через systemd: выхожу с кодом 1, дальнейшее — на стороне Restart=on-failure.")
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+        os._exit(1)
+
+    try:
         kwargs = {}
         if os.name == 'nt':
             kwargs['creationflags'] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
@@ -8538,12 +8599,6 @@ async def force_restart_bot():
             cwd=BASE_DIR, stdin=subprocess.DEVNULL,
             **kwargs
         )
-    except Exception:
-        pass
-
-    try:
-        sys.stdout.flush()
-        sys.stderr.flush()
     except Exception:
         pass
 
