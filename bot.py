@@ -2559,7 +2559,7 @@ class SelfAssignRolesView(discord.ui.View):
         super().__init__(timeout=None)
         options = [discord.SelectOption(label=name, value=str(role_id)) for role_id, name in SELF_ASSIGN_ROLES]
         self.select = discord.ui.Select(
-            placeholder="🎮 Выберите гостевые роли",
+            placeholder="🎮 Роли",
             options=options, min_values=0, max_values=len(options),
             custom_id="self_assign_guest_roles"
         )
@@ -2626,7 +2626,7 @@ async def ensure_self_assign_roles_message():
     channel = await client.fetch_channel(SELF_ASSIGN_CHANNEL_ID)
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
     msg, _ = await _find_or_create_anchor(
-        channel, es("🎮 Гостевые роли"), build_self_assign_roles_embed,
+        channel, es("🎮 Роли"), build_self_assign_roles_embed,
         thread_name=None, view=SelfAssignRolesView(),
         saved_message_id=anchors.get('self_assign_roles_message_id')
     )
