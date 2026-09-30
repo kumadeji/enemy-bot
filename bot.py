@@ -1637,7 +1637,7 @@ def build_user_message(discord_user, issues: list) -> str:
             parts.append(issue_line(issue))
         parts.append("")
     if yellow_issues:
-        parts.append(es("🟡 **Важные проблемы:**"))
+        parts.append(es("🟡 **Значимые проблемы:**"))
         for issue in yellow_issues:
             parts.append(issue_line(issue))
         parts.append("")
@@ -1664,7 +1664,7 @@ def build_user_message_dm(issues: list) -> str:
             parts.append(issue_line(issue))
         parts.append("")
     if yellow_issues:
-        parts.append(es("🟡 **Важные проблемы:**"))
+        parts.append(es("🟡 **Значимые проблемы:**"))
         for issue in yellow_issues:
             parts.append(issue_line(issue))
         parts.append("")
