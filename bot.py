@@ -2545,96 +2545,192 @@ SELF_ASSIGN_ROLES = [
     (1118883618375348316, "The Elder Scrolls"),
 ]
 
-SELF_ASSIGN_DESCRIPTION = es(
-    "Бойцы, если желаете, можете выбрать себе роли в нашем сообществе!\n\n"
-    "Они дают доступ к публичным направлениям сервера. Некоторые направления могут быть неактивными.\n\nЕсли в названии есть 'Гость', это значит, что направление закрытое, и доступ даётся только к ограниченному числу каналов.\n\nНаиболее активное направление сегодня - ArmA. Но это закрытое направление, а значит попасть в него можно только по заявке на сайте.\n\n"
+SERVER_INTRO_IMAGE_FILENAME = "enemy-rounded.png"   # лежит в IMAGES_DIR (папка images рядом с bot.py)
+SERVER_ADMIN_MENTIONS = "<@316641571284058113> и <@328581459998801920>"  # BURBON и MORTA
+
+SERVER_INTRO_TEXT = (
+    "## Мультиигровое сообщество ENEMY\n"
+    "Добро пожаловать на площадку для любителей военных и исторических игр: от средневековых сражений "
+    "в Mount & Blade до современных операций в Arma Reforger. Это клан-сообщество единомышленников, "
+    "где можно найти не только напарников или целые команды по играм, но и делиться видео, проводить "
+    "стримы и узнавать о новостях из мира компьютерных игр.\n\n"
+    "Наш лозунг: ***\"С мечом в руке и кланом в сердце!\"***\n\n"
+    f"Администраторы: {SERVER_ADMIN_MENTIONS}."
 )
 
-def build_self_assign_roles_embed():
-    return discord.Embed(title=es("🎮 Роли"), description=SELF_ASSIGN_DESCRIPTION, color=discord.Color.blurple())
+SERVER_DIRECTIONS_TEXT = (
+    "## Игровые направления\n"
+    "Наше сообщество состоит из **открытых** и **закрытых** направлений (кланов):\n"
+    "* **Открытые** направления доступны каждому без ограничений.\n"
+    "* **Закрытые** направления доступны только по заявке с принятием устава и манифеста.\n"
+    "Чтобы попасть в **открытое** направление, достаточно взять роль под этим сообщением, а в "
+    "**закрытое** - подать заявку на нашем сайте.\n"
+    "Каждый член сообщества вправе создать **новое** направление и быть его лидером. Чтобы создать "
+    "**новое** направление, необходимо обратиться к основателю сообщества."
+)
 
-class SelfAssignRolesView(discord.ui.View):
+SERVER_INTRO_LINKS = [
+    ("## **Сайт**", "https://mis-enemy.ru/"),
+    ("## **Паблик в ВКонтакте**", "https://vk.com/mis_enemy"),
+    ("## **Канал в Telegram**", "https://t.me/mis_enemy"),
+    ("## **Канал в TikTok**", "https://www.tiktok.com/@mis_enemy"),
+    ("## **Канал в Instagram**", "https://www.instagram.com/mis_enemy"),
+]
+
+
+async def process_self_assign_selection(interaction: discord.Interaction, selected_values):
+    """Общая логика выдачи/снятия гостевых ролей по выбору в меню."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    selected_ids = {int(v) for v in selected_values}
+    member = interaction.user
+    guild = interaction.guild
+
+    # Роль 'Клан ArmA' автоматически есть у всех, чей состав "Запас" или выше,
+    # поэтому её наличие надёжно говорит "этот человек уже в клане".
+    guest_role_id = ROLE_IDS.get('gost_arma')
+    klan_arma_role = guild.get_role(ROLE_IDS['klan_arma']) if ROLE_IDS.get('klan_arma') else None
+    is_already_clan_member = bool(klan_arma_role and klan_arma_role in member.roles)
+    blocked_guest_attempt = bool(guest_role_id and is_already_clan_member and guest_role_id in selected_ids)
+    if blocked_guest_attempt:
+        selected_ids.discard(guest_role_id)
+
+    to_add, to_remove = [], []
+    for role_id, name in SELF_ASSIGN_ROLES:
+        role = guild.get_role(role_id)
+        if not role:
+            continue
+        has_role = role in member.roles
+        wants_role = role_id in selected_ids
+        if wants_role and not has_role:
+            to_add.append(role)
+        elif not wants_role and has_role:
+            to_remove.append(role)
+    try:
+        if to_add:
+            await member.add_roles(*to_add, reason="Самостоятельный выбор гостевой роли")
+        if to_remove:
+            await member.remove_roles(*to_remove, reason="Самостоятельный отказ от гостевой роли")
+    except Exception as e:
+        await interaction.followup.send(f"❌ Ошибка изменения ролей: {e}", ephemeral=True)
+        return
+
+    parts = []
+    if to_add:
+        parts.append("Выданы: " + ", ".join(r.name for r in to_add))
+    if to_remove:
+        parts.append("Сняты: " + ", ".join(r.name for r in to_remove))
+    if not parts:
+        parts.append("Изменений нет — уже всё соответствует вашему выбору.")
+
+    message_lines = [es("✅ ") + " | ".join(parts)]
+    if blocked_guest_attempt:
+        message_lines.append(es("⚠️ Роль 'Гость ArmA' вам не нужна и не может быть выдана: вы уже состоите "
+                                 "в клане (состав 'Запас' или выше). Она предназначена только для тех, кто "
+                                 "ещё не входит в клан."))
+    await interaction.followup.send("\n".join(message_lines), ephemeral=True)
+
+
+class ServerIntroLayoutView(discord.ui.LayoutView):
+    """Постоянное приветственное сообщение сервера (Components V2): описание
+    сообщества, ссылки на платформы, игровые направления и меню выбора
+    гостевых ролей. Заменяет прежнее отдельное embed-сообщение с выбором ролей."""
     def __init__(self):
         super().__init__(timeout=None)
+
         options = [discord.SelectOption(label=name, value=str(role_id)) for role_id, name in SELF_ASSIGN_ROLES]
-        self.select = discord.ui.Select(
-            placeholder="🎮 Роли",
+        roles_select = discord.ui.Select(
+            placeholder="Выберите гостевые роли (чтобы снять — уберите из выбора)",
             options=options, min_values=0, max_values=len(options),
             custom_id="self_assign_guest_roles"
         )
-        self.select.callback = self._select_callback
-        self.add_item(self.select)
 
-    async def _select_callback(self, interaction: discord.Interaction):
-        selected_ids = {int(v) for v in self.select.values}
-        member = interaction.user
-        guild = interaction.guild
+        async def _select_callback(interaction: discord.Interaction):
+            await process_self_assign_selection(interaction, roles_select.values)
+        roles_select.callback = _select_callback
 
-        # Роль 'Клан ArmA' автоматически есть у всех, чей состав "Запас"
-        # или выше (см. compute_arma_role_keys) — поэтому её наличие
-        # надёжно говорит "этот человек уже в клане", без обращения к Firebase.
-        guest_role_id = ROLE_IDS.get('gost_arma')
-        klan_arma_role = guild.get_role(ROLE_IDS['klan_arma']) if ROLE_IDS.get('klan_arma') else None
-        is_already_clan_member = bool(klan_arma_role and klan_arma_role in member.roles)
-        blocked_guest_attempt = bool(guest_role_id and is_already_clan_member and guest_role_id in selected_ids)
-        if blocked_guest_attempt:
-            selected_ids.discard(guest_role_id)
-
-        to_add, to_remove = [], []
-        for role_id, name in SELF_ASSIGN_ROLES:
-            role = guild.get_role(role_id)
-            if not role:
-                continue
-            has_role = role in member.roles
-            wants_role = role_id in selected_ids
-            if wants_role and not has_role:
-                to_add.append(role)
-            elif not wants_role and has_role:
-                to_remove.append(role)
-        try:
-            if to_add:
-                await member.add_roles(*to_add, reason="Самостоятельный выбор гостевой роли")
-            if to_remove:
-                await member.remove_roles(*to_remove, reason="Самостоятельный отказ от гостевой роли")
-        except Exception as e:
-            await interaction.followup.send(f"❌ Ошибка изменения ролей: {e}", ephemeral=True)
-            return
-        parts = []
-        if to_add:
-            parts.append("Выданы: " + ", ".join(r.name for r in to_add))
-        if to_remove:
-            parts.append("Сняты: " + ", ".join(r.name for r in to_remove))
-        if not parts:
-            parts.append("Изменений нет — уже всё соответствует вашему выбору.")
-
-        # Основная строка (результат добавления/снятия ролей) и предупреждение
-        # про недоступность 'Гость ArmA' — раньше склеивались в одну строку
-        # через " | ", из-за чего при одновременном наличии обоих сообщений
-        # текст выглядел нечитаемо слитным. Теперь это два отдельных абзаца.
-        message_lines = [es("✅ ") + " | ".join(parts)]
-        if blocked_guest_attempt:
-            message_lines.append(es("⚠️ Роль 'Гость ArmA' вам не нужна и не может быть выдана: вы уже состоите "
-                                     "в клане (состав 'Запас' или выше). Она предназначена только для тех, кто "
-                                     "ещё не входит в клан."))
-        await interaction.response.send_message("\n".join(message_lines), ephemeral=True)
+        children = [
+            discord.ui.MediaGallery(discord.MediaGalleryItem(f"attachment://{SERVER_INTRO_IMAGE_FILENAME}")),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
+            discord.ui.TextDisplay(SERVER_INTRO_TEXT),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
+            discord.ui.TextDisplay("## Платформы"),
+        ]
+        for text, url in SERVER_INTRO_LINKS:
+            children.append(discord.ui.Section(
+                text,
+                accessory=discord.ui.Button(style=discord.ButtonStyle.link, url=url, label="Открыть")
+            ))
+        children += [
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
+            discord.ui.TextDisplay(SERVER_DIRECTIONS_TEXT),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay("### Открытые направления:\n* **DayZ**\n* **Squad**\n* **Серия The Elder Scrolls**"),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay("### Закрытые направления:\n* **Серия ArmA**. Действующая игра направления - **ArmA Reforger**"),
+            # Блок ролей: разделитель -> подзаголовок -> меню выбора
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay("### Роли"),
+            discord.ui.ActionRow(roles_select),
+        ]
+        self.add_item(discord.ui.Container(*children, accent_color=9881319))
 
 
 async def ensure_self_assign_roles_message():
-    """Находит (или создаёт при первом запуске) постоянное сообщение выбора
-    гостевых ролей — по аналогии с якорными сообщениями админ-канала."""
+    """Публикует (или обновляет) приветственное сообщение сервера с выбором
+    ролей в SELF_ASSIGN_CHANNEL_ID. Старое embed-сообщение с выбором ролей
+    удаляется: сообщение Components V2 нельзя получить редактированием
+    обычного сообщения. Имя функции сохранено, чтобы не менять on_ready."""
     channel = await client.fetch_channel(SELF_ASSIGN_CHANNEL_ID)
+    image_path = os.path.join(IMAGES_DIR, SERVER_INTRO_IMAGE_FILENAME)
+    if not os.path.exists(image_path):
+        print(f"⚠️ Файл {image_path} не найден — приветственное сообщение сервера не опубликовано.")
+        return
+
+    no_mentions = discord.AllowedMentions.none()  # упоминания отображаются, но уведомлений не шлют
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
-    msg, _ = await _find_or_create_anchor(
-        channel, es("🎮 Роли"), build_self_assign_roles_embed,
-        thread_name=None, view=SelfAssignRolesView(),
-        saved_message_id=anchors.get('self_assign_roles_message_id')
-    )
+
+    # 1) Новое сообщение уже есть — просто обновляем его (текст, вид, картинку).
+    saved_id = anchors.get('server_intro_message_id')
+    if saved_id:
+        try:
+            msg = await channel.fetch_message(saved_id)
+            await msg.edit(
+                view=ServerIntroLayoutView(),
+                attachments=[discord.File(image_path, filename=SERVER_INTRO_IMAGE_FILENAME)],
+                allowed_mentions=no_mentions
+            )
+            return
+        except discord.NotFound:
+            pass  # удалено вручную — создадим заново ниже
+        except Exception as e:
+            print(f"⚠️ Не удалось обновить приветственное сообщение сервера: {e}")
+            return
+
+    # 2) Удаляем старое embed-сообщение с выбором ролей (по сохранённому ID, затем сканом истории).
+    old_id = anchors.get('self_assign_roles_message_id')
+    if old_id:
+        try:
+            old_msg = await channel.fetch_message(old_id)
+            await old_msg.delete()
+        except Exception:
+            pass
     try:
-        await msg.edit(embed=build_self_assign_roles_embed(), view=SelfAssignRolesView())
+        async for m in channel.history(limit=50):
+            if m.author.id == client.user.id and m.embeds and m.embeds[0].title == es("🎮 Гостевые роли"):
+                await m.delete()
     except Exception as e:
-        print(f"⚠️ Не удалось обновить сообщение гостевых ролей: {e}")
-    anchors['self_assign_roles_message_id'] = msg.id
+        print(f"⚠️ Не удалось просканировать канал на старое сообщение выбора ролей: {e}")
+    anchors.pop('self_assign_roles_message_id', None)
+
+    # 3) Публикуем новое.
+    msg = await channel.send(
+        view=ServerIntroLayoutView(),
+        file=discord.File(image_path, filename=SERVER_INTRO_IMAGE_FILENAME),
+        allowed_mentions=no_mentions
+    )
+    anchors['server_intro_message_id'] = msg.id
     save_json(ADMIN_ANCHORS_FILE, anchors)
+    print(f"✅ Опубликовано приветственное сообщение сервера (ID: {msg.id})")
 
 class IgnoringCommandButtonView(discord.ui.View):
     """Кнопка на еженедельном отчёте проверки бойцов (см. check_spreadsheet) —
@@ -9210,7 +9306,7 @@ async def on_ready():
     client.add_view(VacationRequestView())
     client.add_view(VacationApprovalView())
     client.add_view(VacationMessageView())
-    client.add_view(SelfAssignRolesView())
+    client.add_view(ServerIntroLayoutView())
     client.add_view(OfficeMenuView())
     client.add_view(IgnoringCommandButtonView())
     register_persistent_event_views()
