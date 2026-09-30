@@ -569,6 +569,7 @@ SPREADSHEET_URL = 'https://docs.google.com/spreadsheets/d/1QGc-SRkWnFCaSx56_46UJ
 MSK = pytz.timezone('Europe/Moscow')
 
 NICKNAME_COLUMN = 'Discord клана (с клантегом)'
+JOIN_DATE_COLUMN = 'Дата вступления в клан'
 SHEET_NAME = 'Основная таблица'
 
 COLUMNS_TO_CHECK = [
@@ -633,7 +634,12 @@ MAX_ACTIVE_WARNINGS = 3
 MAX_ACTIVE_REPRIMANDS = 3
 WARNING_DURATION = timedelta(days=30)
 REPRIMAND_DURATION = timedelta(days=90)
-
+# Кнопка "Подтвердить неоднократное нарушение" (см. check_spreadsheet) —
+# появляется только если боец был отмечен с проблемами регистрации минимум
+# 2 раза ДО текущей проверки (т.е. текущая — уже 3-я и далее), и состоит
+# в клане не менее этого количества дней (столбец 'Дата вступления в клан').
+MIN_PRIOR_FLAGS_FOR_IGNORING_BUTTON = 2
+MIN_DAYS_IN_CLAN_FOR_IGNORING_BUTTON = 30
 
 def get_role_mention_by_id(guild, role_key: str):
     """Mention роли по ключу из ROLE_IDS, либо None, если роли нет на сервере
@@ -773,6 +779,7 @@ VOICE_CHANNEL_ID = 1284893513921728582
 
 VOICE_ROOM_CATEGORY_ARMY = 1284893244878098464
 VOICE_ROOM_CATEGORY_PUBLIC = 1116656512677445693
+VOICE_ROOM_CATEGORY_DAYZ = 908305448552251392
 
 OFFICE_CHANNEL_NAME = "🔵канцелярия-arma"
 # Каждый элемент: (текст с эмодзи, ссылка, номер ряда). Ряды 0 и 1 содержат
@@ -798,6 +805,8 @@ ADMIN_ANCHORS_FILE = os.path.join(BASE_DIR, 'admin_anchors.json')
 ANKETA_MESSAGES_FILE = os.path.join(BASE_DIR, 'anketa_messages.json')
 DISCORD_LINK_CACHE_FILE = os.path.join(BASE_DIR, 'discord_link_cache.json')
 PLAYER_DM_STATE_FILE = os.path.join(BASE_DIR, 'player_dm_state.json')
+CHECK_HISTORY_FILE = os.path.join(BASE_DIR, 'check_history.json')
+PENDING_DISCIPLINE_FILE = os.path.join(BASE_DIR, 'pending_discipline.json')
 
 # ============== FIREBASE ==============
 
@@ -836,6 +845,8 @@ FIREBASE_DATA_MAP = {
     ANKETA_MESSAGES_FILE: 'anketaMessages',
     DISCORD_LINK_CACHE_FILE: 'discordLinkCache',
     PLAYER_DM_STATE_FILE: 'playerDmState',
+    CHECK_HISTORY_FILE: 'checkHistory',
+    PENDING_DISCIPLINE_FILE: 'pendingDiscipline',
 }
 
 
@@ -1064,8 +1075,10 @@ _ROSTER_UNAVAILABLE_WARNED = False
 VOICE_ROOMS = {}
 TRIGGER_CHANNEL_ARMY = None
 TRIGGER_CHANNEL_PUBLIC = None
+TRIGGER_CHANNEL_DAYZ = None
 # Блокировки по member.id для защиты от двойного создания временных комнат
 VOICE_ROOM_CREATION_LOCKS = {}
+
 
 VACATION_RULES = es("""
 
@@ -1115,6 +1128,8 @@ _events_write_lock = asyncio.Lock()
 _attendance_write_lock = asyncio.Lock()
 _vacations_write_lock = asyncio.Lock()
 _anketa_write_lock = asyncio.Lock()
+_check_write_lock = asyncio.Lock()
+_pending_discipline_lock = asyncio.Lock()
 
 
 class MessageDeduplicator:
@@ -1657,6 +1672,42 @@ def build_user_message_dm(issues: list) -> str:
     parts.append(es("⚠️ Пожалуйста, исправьте их как можно скорее — игнорирование приведёт к дисциплинарному взысканию."))
     return "\n".join(parts).strip("\n")
 
+def _load_check_history() -> dict:
+    return load_json(CHECK_HISTORY_FILE, {})
+
+
+def _increment_check_history(user_ids: list):
+    """Увеличивает счётчик 'сколько раз этого бойца уже фиксировали с
+    проблемами регистрации' — НЕЗАВИСИМО от того, нажималась ли кнопка
+    взыскания. Именно этот счётчик определяет, появится ли кнопка на
+    СЛЕДУЮЩЕЙ проверке (начиная с 3-й фиксации, т.е. когда prior >= 2)."""
+    if not user_ids:
+        return
+    history = load_json(CHECK_HISTORY_FILE, {})
+    now_iso = datetime.now(MSK).isoformat()
+    for uid in user_ids:
+        key = str(uid)
+        entry = history.get(key, {'times_flagged': 0})
+        entry['times_flagged'] = entry.get('times_flagged', 0) + 1
+        entry['last_flagged_at'] = now_iso
+        history[key] = entry
+    save_json(CHECK_HISTORY_FILE, history)
+
+
+def parse_join_date_for_check(raw: str):
+    """Разбирает столбец 'Дата вступления в клан': либо 'ДД.ММ.ГГГГ', либо
+    произвольная строка вида 'До 2026 года' (трактуется как заведомо давняя
+    дата — условие '>= 30 дней в клане' в любом случае выполняется).
+    Возвращает datetime с tzinfo (MSK) либо None, если распознать не удалось."""
+    raw = (raw or '').strip()
+    if not raw:
+        return None
+    if raw.lower().startswith('до'):
+        return MSK.localize(datetime(2000, 1, 1))
+    try:
+        return MSK.localize(datetime.strptime(raw, '%d.%m.%Y'))
+    except Exception:
+        return None
 
 async def check_spreadsheet() -> bool:
     """Возвращает True при успешном завершении (независимо от того,
@@ -1671,15 +1722,11 @@ async def check_spreadsheet() -> bool:
 
             thread = await client.fetch_channel(THREAD_ID)
 
-            # ВАЖНО: сначала получаем и полностью готовим новые данные,
-            # и ТОЛЬКО ПОСЛЕ этого удаляем старый отчёт. Раньше порядок был
-            # обратным: старый отчёт стирался ДО обращения к Google Sheets,
-            # и если API оказывалось временно недоступно (или вернуло
-            # неполные/пустые данные) — ветка оставалась ПУСТОЙ: ни старого
-            # отчёта, ни нового.
             loop = asyncio.get_running_loop()
             sheet = await loop.run_in_executor(EXECUTOR, _open_worksheet_sync, SPREADSHEET_URL, SHEET_NAME)
-            data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:J35')
+            # Диапазон расширен до колонки K — там теперь читается
+            # 'Дата вступления в клан' (см. JOIN_DATE_COLUMN).
+            data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:K35')
             if not data_with_colors or len(data_with_colors) < 2:
                 print("⚠️ Проверка бойцов: Google Sheets вернул пустые/неполные данные — публикация отменена, старый отчёт сохранён.")
                 return False
@@ -1687,13 +1734,14 @@ async def check_spreadsheet() -> bool:
             headers = [cell['value'] for cell in data_with_colors[0]]
             rows = data_with_colors[1:]
             current_time = datetime.now(MSK)
-            # Строим множество активных отпусков ОДИН РАЗ на весь прогон
-            # проверки, а не заново на каждую из ~34 строк таблицы —
-            # раньше is_on_vacation_dynamic() делала полный deepcopy
-            # VACATIONS_FILE и полный проход по нему на КАЖДУЮ строку.
             vacation_set = build_active_vacation_set(load_json(VACATIONS_FILE, {}), current_time)
+            join_date_idx = headers.index(JOIN_DATE_COLUMN) if JOIN_DATE_COLUMN in headers else None
+
             user_issues = {}
             users_not_found = []
+            nickname_by_user = {}
+            join_date_raw_by_user = {}
+
             for row in rows:
                 raw_nickname = ''
                 if NICKNAME_COLUMN in headers:
@@ -1705,6 +1753,11 @@ async def check_spreadsheet() -> bool:
                     continue
                 if nickname.strip().lower() in vacation_set:
                     continue
+
+                join_date_raw = ''
+                if join_date_idx is not None and join_date_idx < len(row):
+                    join_date_raw = row[join_date_idx]['value'].strip()
+
                 issues = []
                 for col_name in COLUMNS_TO_CHECK:
                     if col_name in headers:
@@ -1718,6 +1771,8 @@ async def check_spreadsheet() -> bool:
                     discord_user = await find_discord_user(nickname, thread)
                     if discord_user:
                         user_issues[discord_user] = issues
+                        nickname_by_user[discord_user.id] = nickname
+                        join_date_raw_by_user[discord_user.id] = join_date_raw
                     else:
                         users_not_found.append(nickname)
 
@@ -1731,28 +1786,60 @@ async def check_spreadsheet() -> bool:
                 except Exception:
                     pass
 
+            check_history = _load_check_history()
             new_message_ids = []
+            button_targets = {}
+
             if user_issues or users_not_found:
                 intro = build_intro_message(current_time)
                 if len(intro) <= EXPECTED_INTRO_MAX_LEN:
                     new_message_ids += await send_chunked(thread, intro, "вводное сообщение")
+
                 for discord_user, issues in user_issues.items():
                     user_msg = build_user_message(discord_user, issues)
                     new_message_ids += await send_chunked(thread, user_msg, discord_user.display_name)
                     await try_dm_member(discord_user, build_user_message_dm(issues), context="результаты проверки бойцов")
+
+                    # === Кнопка "Подтвердить неоднократное нарушение" ===
+                    nickname = nickname_by_user.get(discord_user.id)
+                    join_date_raw = join_date_raw_by_user.get(discord_user.id, '')
+                    prior_flags = check_history.get(str(discord_user.id), {}).get('times_flagged', 0)
+                    join_date_dt = parse_join_date_for_check(join_date_raw)
+                    days_in_clan_ok = bool(join_date_dt) and (current_time - join_date_dt).days >= MIN_DAYS_IN_CLAN_FOR_IGNORING_BUTTON
+                    show_button = bool(nickname) and prior_flags >= MIN_PRIOR_FLAGS_FOR_IGNORING_BUTTON and days_in_clan_ok
+
+                    if show_button:
+                        btn_msg = await thread.send(
+                            content=f"{discord_user.mention}\n\n" +
+                                    es("⚠️ Этот боец уже неоднократно предупреждался о проблемах с регистрацией "
+                                       "и состоит в клане достаточно долго."),
+                            view=IgnoringCommandButtonView()
+                        )
+                        new_message_ids.append(btn_msg.id)
+                        button_targets[str(btn_msg.id)] = {'discord_user_id': discord_user.id, 'nickname': nickname}
+                        await asyncio.sleep(0.5)
+
                 if users_not_found:
                     not_found_msg = ("\n\n" + es("⚠️ **Не удалось найти в Discord:**\n") + ", ".join(users_not_found))
                     new_message_ids += await send_chunked(thread, not_found_msg, "список ненайденных")
+
                 print(f"✅ Проверка бойцов опубликована: {len(user_issues)} с проблемами, "
-                      f"{len(users_not_found)} не найдено в Discord, {len(new_message_ids)} сообщений отправлено.")
+                      f"{len(users_not_found)} не найдено в Discord, {len(new_message_ids)} сообщений отправлено, "
+                      f"{len(button_targets)} кнопок взыскания показано.")
             else:
                 print("✅ Проверка бойцов выполнена: проблем не обнаружено, публикация не потребовалась.")
 
-            save_json(CHECK_MESSAGES_FILE, {'message_ids': new_message_ids, 'thread_id': THREAD_ID})
+            async with _check_write_lock:
+                save_json(CHECK_MESSAGES_FILE, {
+                    'message_ids': new_message_ids, 'thread_id': THREAD_ID, 'button_targets': button_targets
+                })
+
+            _increment_check_history([u.id for u in user_issues.keys()])
             return True
         except Exception as e:
             print(f"Ошибка при проверке: {e}")
             return False
+
 
 async def scheduled_check_spreadsheet():
     """Обёртка над check_spreadsheet исключительно для планировщика.
@@ -2453,20 +2540,19 @@ async def get_logging_thread_id():
 SELF_ASSIGN_CHANNEL_ID = 1447222045539827876
 
 SELF_ASSIGN_ROLES = [
-    (1118882895524794378, "Гость SQUAD"),
     (1250828979284213812, "Гость ArmA"),
-    (1492893978092113930, "Гость GTA"),
     (908462339089641522, "DayZ"),
+    (908461959794532404, "SQUAD"),
     (1118883618375348316, "The Elder Scrolls"),
 ]
 
 SELF_ASSIGN_DESCRIPTION = es(
-    "Бойцы, если желаете, можете выбрать себе гостевые роли в нашем сообществе!\n\n"
-    "Гостевые роли дают доступ к публичным, но малоактивным каналам. Основная активность — в закрытых каналах.\n\nВы можете получить полный доступ по запросу (для открытых направлений) или при регистрации на сайте (для закрытых направлений).\n\n"
+    "Бойцы, если желаете, можете выбрать себе роли в нашем сообществе!\n\n"
+    "Они дают доступ к публичным направлениям сервера. Некоторые направления могут быть неактивными.\n\nНаиболее активное направление сегодня - ArmA. Но это закрытое направление, попасть в которое можно только по заявке на сайте.\n\Если в названии есть 'Гость', это значит, что направление закрытое, и доступ даётся только к ограниченному числу каналов.\n\n"
 )
 
 def build_self_assign_roles_embed():
-    return discord.Embed(title=es("🎮 Гостевые роли"), description=SELF_ASSIGN_DESCRIPTION, color=discord.Color.blurple())
+    return discord.Embed(title=es("🎮 Роли"), description=SELF_ASSIGN_DESCRIPTION, color=discord.Color.blurple())
 
 class SelfAssignRolesView(discord.ui.View):
     def __init__(self):
@@ -2550,6 +2636,74 @@ async def ensure_self_assign_roles_message():
         print(f"⚠️ Не удалось обновить сообщение гостевых ролей: {e}")
     anchors['self_assign_roles_message_id'] = msg.id
     save_json(ADMIN_ANCHORS_FILE, anchors)
+
+class IgnoringCommandButtonView(discord.ui.View):
+    """Кнопка на еженедельном отчёте проверки бойцов (см. check_spreadsheet) —
+    доступна только комбату/заместителям (ADMIN_USER_IDS), показывается
+    только для бойцов с >= 2 прошлыми фиксациями проблем и >= 30 дней
+    в клане (см. MIN_PRIOR_FLAGS_FOR_IGNORING_BUTTON/MIN_DAYS_IN_CLAN_FOR_IGNORING_BUTTON).
+    Целевой боец резолвится по message.id через CHECK_MESSAGES_FILE['button_targets']."""
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label=es("⚠️ Подтвердить неоднократное нарушение"),
+                        style=discord.ButtonStyle.danger, custom_id="check_ignoring_command_confirm")
+    async def confirm_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+            return
+
+        check_messages = load_json(CHECK_MESSAGES_FILE, {})
+        target = (check_messages.get('button_targets') or {}).get(str(interaction.message.id))
+        if not target:
+            await interaction.response.send_message(
+                es("❌ Не удалось определить бойца для этой кнопки (возможно, уже обработана ранее)."), ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        nickname = target['nickname']
+        discord_user_id = target['discord_user_id']
+
+        uid = await get_uid_by_nickname(nickname)
+        if uid:
+            result = await apply_ignoring_command_discipline(uid)
+            status = result.get('status') if result else 'retryable_error'
+            if status == 'retryable_error':
+                await interaction.followup.send(es("⚠️ Временный сбой, попробуйте ещё раз позже."), ephemeral=True)
+                return
+            if status == 'profile_not_found':
+                await interaction.followup.send(es("⚠️ Профиль на сайте не найден (возможно, был удалён)."), ephemeral=True)
+            elif result and result.get('action'):
+                word, verb = _disc_action_word_and_verb(result['action'])
+                await interaction.followup.send(es(f"✅ Бойцу {nickname} {verb} {word}."), ephemeral=True)
+            else:
+                await interaction.followup.send(
+                    es(f"ℹ️ Дисциплинарный лимит для {nickname} уже исчерпан (3 замечания и 3 выговора), "
+                       "новое взыскание не добавлено."), ephemeral=True
+                )
+        else:
+            applied = await apply_pending_ignoring_command_violation(discord_user_id, nickname)
+            if applied.get('action_word'):
+                extra = " Боец достиг порога исключения — роли в Discord сняты (discord-only режим)." if applied.get('expelled') else ""
+                await interaction.followup.send(
+                    es(f"✅ Боец {nickname} ещё не зарегистрирован на сайте — {applied['action_word']} сохранено "
+                       f"и будет автоматически применено на сайте после его регистрации.{extra}"), ephemeral=True
+                )
+            else:
+                await interaction.followup.send(
+                    es(f"ℹ️ Дисциплинарный лимит (discord-only) для {nickname} уже исчерпан."), ephemeral=True
+                )
+
+        try:
+            await interaction.message.edit(view=None)
+        except Exception:
+            pass
+        async with _check_write_lock:
+            fresh = load_json(CHECK_MESSAGES_FILE, {})
+            fresh.get('button_targets', {}).pop(str(interaction.message.id), None)
+            save_json(CHECK_MESSAGES_FILE, fresh)
+
 
 class VacationModal(discord.ui.Modal, title=es("🏖️ Оформление отпуска")):
     start_date = discord.ui.TextInput(label="Дата начала (ДД.ММ.ГГГГ)", placeholder="15.08.2026", required=True, max_length=10)
@@ -4448,11 +4602,16 @@ async def sync_arma_member_state(uid: str, data: dict):
         return
     member = await find_member_by_discord_username(discord_username)
     if not member:
-        print(f"⚠️ Не найден участник Discord по discordId='{discord_username}' "
+        print(f"⚠️ sync_arma_member_state: не найден участник Discord по discordId='{discord_username}' "
               f"(uid={uid}, callsign='{data.get('callsign', '?')}') — роли/никнейм НЕ синхронизированы. "
               f"Проверьте, что это поле в профиле соответствует реальному username в Discord.")
         return
     guild = member.guild
+
+    # Если для этого Discord-аккаунта накоплены discord-only взыскания
+    # 'ignoring_command' (боец получал их ДО регистрации на сайте) —
+    # переносим их на сайт прямо сейчас, с сохранением исходных дат.
+    await apply_pending_discipline_on_registration(uid, member)
 
     game_role = (data.get('gameRoles') or {}).get(CLAN_ROSTER_GAME) or {}
     composition = (game_role.get('composition') or '').strip()
@@ -5038,6 +5197,15 @@ def _build_false_acceptance_reason(action_type: str, number: int) -> str:
         "хотя ставит отметки, что придёт. Нарушение п. 9.2 и 9.4 Устава",
     )
 
+def _build_ignoring_command_reason(action_type: str, number: int) -> str:
+    """action_type: 'Замечание' или 'Выговор'. Источник: боец игнорировал
+    неоднократные указания командования исправить проблемы регистрации
+    (см. check_spreadsheet, кнопка 'Подтвердить неоднократное нарушение').
+    В отличие от других источников — здесь ОДИН неизменный шаблон текста
+    для любого номера (без 3-уровневой эскалации формулировки)."""
+    return (f"Игнорирование командования. {action_type} #{number}. Боец игнорировал неоднократные указания "
+            "исправить проблемы с регистрацией и не находился в отпуске. Нарушение п. 1 и 3 Устава")
+
 def _build_disc_entry(entry_type: str, reason: str, duration: timedelta, now_ms: int, source: str = 'auto_inactivity') -> dict:
     return {
         'id': f"{now_ms}-{uuid.uuid4().hex[:6]}",
@@ -5175,6 +5343,25 @@ async def apply_false_acceptance_discipline(uid):
         print(f"❌ Ошибка применения дисциплинарного взыскания за ложную отметку (uid={uid}): {e}")
         return {'action': None, 'status': 'retryable_error'}
 
+async def apply_ignoring_command_discipline(uid):
+    """То же самое, но для источника 'ignoring_command' — боец (уже
+    зарегистрированный на сайте) игнорирует неоднократные указания
+    исправить проблемы регистрации (кнопка 'Подтвердить неоднократное
+    нарушение' на еженедельной проверке)."""
+    if not fs_db:
+        return {'action': None, 'status': 'retryable_error'}
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(
+            EXECUTOR, _apply_disciplinary_action_sync, uid, 'ignoring_command', _build_ignoring_command_reason
+        )
+        if 'status' not in result:
+            result['status'] = 'success'
+        return result
+    except Exception as e:
+        print(f"❌ Ошибка применения дисциплинарного взыскания за игнорирование командования (uid={uid}): {e}")
+        return {'action': None, 'status': 'retryable_error'}
+
 
 async def announce_and_apply_expulsion_effects(member, nickname, thread, context_label: str):
     """Общая часть логики при достижении 3 действующих выговоров (любого
@@ -5202,6 +5389,193 @@ async def announce_and_apply_expulsion_effects(member, nickname, thread, context
             )
         except Exception:
             pass
+
+async def strip_roles_for_unregistered_exclusion(member, nickname, thread):
+    """Discord-only исключение: боец ещё НЕ зарегистрирован на сайте
+    (профиля в Firebase физически не существует), поэтому composition/
+    position НИГДЕ не меняются — снимаются ТОЛЬКО роли Discord. Как только
+    боец зарегистрируется, все накопленные (ещё не истёкшие) взыскания
+    будут перенесены на сайт автоматически, см. apply_pending_discipline_on_registration."""
+    if member:
+        guild = member.guild
+        roles_to_check = [guild.get_role(ROLE_IDS[key]) for key in EXPULSION_ROLE_KEYS]
+        present_roles = [r for r in roles_to_check if r and r in member.roles]
+        if present_roles:
+            try:
+                await member.remove_roles(
+                    *present_roles,
+                    reason="3 действующих выговора за игнорирование командования (боец не зарегистрирован на сайте)"
+                )
+            except Exception as e:
+                print(f"⚠️ Не удалось снять роли у {nickname}: {e}")
+    if thread:
+        mention = member.mention if member else f"**{nickname}**"
+        try:
+            await thread.send(
+                f"{mention}\n\n" +
+                es("🚫 Вы достигли 3 действующих выговоров за игнорирование командования. Поскольку вы ещё не "
+                   "зарегистрированы на сайте клана, соответствующие роли на сервере сняты (статус на сайте не "
+                   "менялся — профиля пока не существует). Все накопленные взыскания будут перенесены на сайт "
+                   "автоматически сразу после регистрации. Если хотите вернуться в клан — обратитесь к командованию.")
+            )
+        except Exception:
+            pass
+
+
+def _active_pending_violations(entry: dict, now_ms: int) -> list:
+    return [v for v in entry.get('violations', []) if v.get('expiresAtMs', 0) > now_ms]
+
+
+async def apply_pending_ignoring_command_violation(discord_user_id: int, nickname: str) -> dict:
+    """Discord-only накопление взыскания 'ignoring_command' для бойца, ещё
+    НЕ зарегистрированного на сайте (get_uid_by_nickname не находит uid).
+    Хранится в PENDING_DISCIPLINE_FILE до момента регистрации, после чего
+    переносится на сайт целиком (см. apply_pending_discipline_on_registration).
+
+    Возвращает {'action_word': 'замечание'/'выговор'/None, 'expelled': bool}."""
+    now_ms = int(datetime.now(MSK).timestamp() * 1000)
+    result = {'action_word': None, 'expelled': False}
+    should_strip = False
+
+    async with _pending_discipline_lock:
+        state = load_json(PENDING_DISCIPLINE_FILE, {})
+        key = str(discord_user_id)
+        entry = state.get(key) or {'nickname': nickname, 'violations': [], 'roles_stripped': False}
+        entry['nickname'] = nickname  # на случай смены ника с прошлого раза
+
+        active = _active_pending_violations(entry, now_ms)
+        active_warnings = [v for v in active if v['type'] == 'Замечание']
+        active_reprimands = [v for v in active if v['type'] == 'Выговор']
+        number = len(active) + 1  # единый (общий) счётчик номера для этого источника
+
+        if len(active_warnings) < MAX_ACTIVE_WARNINGS:
+            action_type, duration = 'Замечание', WARNING_DURATION
+        elif len(active_reprimands) < MAX_ACTIVE_REPRIMANDS:
+            action_type, duration = 'Выговор', REPRIMAND_DURATION
+        else:
+            action_type, duration = None, None
+
+        if action_type:
+            reason = _build_ignoring_command_reason(action_type, number)
+            entry['violations'].append({
+                'type': action_type,
+                'number': number,
+                'issuedAtMs': now_ms,
+                'expiresAtMs': now_ms + int(duration.total_seconds() * 1000),
+                'reason': reason,
+            })
+            result['action_word'] = 'замечание' if action_type == 'Замечание' else 'выговор'
+
+        active_after = _active_pending_violations(entry, now_ms)
+        warnings_after = [v for v in active_after if v['type'] == 'Замечание']
+        reprimands_after = [v for v in active_after if v['type'] == 'Выговор']
+        should_strip = (
+            len(warnings_after) >= MAX_ACTIVE_WARNINGS
+            and len(reprimands_after) >= MAX_ACTIVE_REPRIMANDS
+            and not entry.get('roles_stripped')
+        )
+        if should_strip:
+            entry['roles_stripped'] = True
+
+        state[key] = entry
+        save_json(PENDING_DISCIPLINE_FILE, state)
+
+    if should_strip:
+        member = await find_member_by_nickname(nickname)
+        thread = None
+        try:
+            thread = await client.fetch_channel(THREAD_ID)
+        except Exception:
+            pass
+        await strip_roles_for_unregistered_exclusion(member, nickname, thread)
+        result['expelled'] = True
+
+    return result
+
+
+def _apply_backdated_disciplinary_records_sync(uid: str, records: list):
+    """Переносит ранее накопленные (в discord-only режиме) записи взысканий
+    на сайт — С СОХРАНЕНИЕМ исходных дат вынесения/истечения (а не 'сейчас'),
+    чтобы срок действия отсчитывался от РЕАЛЬНОГО момента нарушения. Если
+    итоговое количество действующих выговоров достигает 3 — переводит
+    в 'Отставка'/'Дезертир' (та же логика, что и в _apply_disciplinary_action_sync)."""
+    profile_ref = fs_db.collection('profiles').document(uid)
+    roster_ref = fs_db.collection('rosterPublic').document(uid)
+    transaction = fs_db.transaction()
+
+    @firestore.transactional
+    def _txn(transaction):
+        snap = profile_ref.get(transaction=transaction)
+        if not snap.exists:
+            return
+        data = snap.to_dict() or {}
+        game_da = data.get('gameDisciplinaryActions', {}) or {}
+        actions = list(game_da.get(GAMESTATS_GAME_NAME, []) or [])
+
+        for rec in records:
+            actions.append({
+                'id': f"{rec['issuedAtMs']}-{uuid.uuid4().hex[:6]}",
+                'type': rec['type'],
+                'reason': rec['reason'],
+                'scope': GAMESTATS_GAME_NAME,
+                'issuedAtMs': rec['issuedAtMs'],
+                'expiresAtMs': rec['expiresAtMs'],
+                'source': 'ignoring_command',
+            })
+
+        now_ms = int(datetime.now(MSK).timestamp() * 1000)
+
+        def active(a, t):
+            return a.get('expiresAtMs', 0) > now_ms and a.get('type') == t
+
+        current_composition = ((data.get('gameRoles') or {}).get(GAMESTATS_GAME_NAME) or {}).get('composition', '')
+        final_active_reprimands = [a for a in actions if active(a, 'Выговор')]
+        should_expel = len(final_active_reprimands) >= MAX_ACTIVE_REPRIMANDS and current_composition != 'Отставка'
+
+        updates = {f'gameDisciplinaryActions.{GAMESTATS_GAME_NAME}': actions}
+        roster_updates = {'gameDisciplinaryActions': {GAMESTATS_GAME_NAME: actions}}
+        if should_expel:
+            updates[f'gameRoles.{GAMESTATS_GAME_NAME}.composition'] = 'Отставка'
+            updates[f'gameRoles.{GAMESTATS_GAME_NAME}.position'] = 'Дезертир'
+            roster_updates['gameRoles'] = {GAMESTATS_GAME_NAME: {'composition': 'Отставка', 'position': 'Дезертир'}}
+
+        transaction.update(profile_ref, updates)
+        transaction.set(roster_ref, roster_updates, merge=True)
+
+    _txn(transaction)
+
+
+async def apply_pending_discipline_on_registration(uid: str, member):
+    """Вызывается при обнаружении/изменении профиля (см. sync_arma_member_state).
+    Если для этого Discord-участника накоплены discord-only взыскания
+    'ignoring_command' — переносит их на сайт одним пакетом, ПРОПУСКАЯ уже
+    истёкшие (если 1/3-месячный срок действия уже прошёл — такое взыскание
+    выдавать не нужно). Идемпотентно: очередь потребляется (pop) сразу же,
+    повторный вызов для того же uid не найдёт уже ничего."""
+    if not member:
+        return
+    async with _pending_discipline_lock:
+        state = load_json(PENDING_DISCIPLINE_FILE, {})
+        key = str(member.id)
+        entry = state.get(key)
+        if not entry or not entry.get('violations'):
+            return
+        violations = entry['violations']
+        state.pop(key, None)
+        save_json(PENDING_DISCIPLINE_FILE, state)
+
+    now_ms = int(datetime.now(MSK).timestamp() * 1000)
+    still_valid = [v for v in violations if v.get('expiresAtMs', 0) > now_ms]
+    if not still_valid:
+        return
+
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(EXECUTOR, _apply_backdated_disciplinary_records_sync, uid, still_valid)
+        print(f"✅ Перенесено {len(still_valid)} отложенных (discord-only) взысканий 'ignoring_command' "
+              f"на сайт для uid={uid} после регистрации")
+    except Exception as e:
+        print(f"❌ Не удалось перенести отложенные взыскания на сайт для uid={uid}: {e}")
 
 
 async def apply_false_acceptance_punishments(wizard, thread):
@@ -8294,7 +8668,7 @@ async def enforce_read_only_channel(guild):
 # ============== ВРЕМЕННЫЕ ГОЛОСОВЫЕ КОМНАТЫ ==============
 
 async def setup_voice_room_triggers(guild):
-    global TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC
+    global TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC, TRIGGER_CHANNEL_DAYZ
     
     try:
         category = guild.get_channel(VOICE_ROOM_CATEGORY_ARMY)
@@ -8361,6 +8735,44 @@ async def setup_voice_room_triggers(guild):
     except Exception as e:
         print(f"❌ Ошибка создания 🍻 триггер-канала: {e}")
 
+    try:
+        category = guild.get_channel(VOICE_ROOM_CATEGORY_DAYZ)
+        if not category:
+            print(f"⚠️ Категория {VOICE_ROOM_CATEGORY_DAYZ} не найдена")
+        else:
+            existing = None
+            for ch in category.voice_channels:
+                if ch.name == "🧟 Создать голосовую комнату":
+                    existing = ch
+                    break
+
+            if existing:
+                TRIGGER_CHANNEL_DAYZ = existing.id
+                print(f"✅ Найден существующий 🧟 триггер-канал: {existing.id}")
+            else:
+                # Открытый доступ, по аналогии с публичной категорией — DayZ
+                # не является закрытым военным разделом клана.
+                overwrites = {
+                    guild.default_role: discord.PermissionOverwrite(
+                        view_channel=True,
+                        connect=True,
+                        speak=True,
+                        stream=True,
+                        use_voice_activation=True
+                    )
+                }
+
+                new_channel = await guild.create_voice_channel(
+                    name="🧟 Создать голосовую комнату",
+                    category=category,
+                    overwrites=overwrites,
+                    user_limit=0
+                )
+                TRIGGER_CHANNEL_DAYZ = new_channel.id
+                print(f"✅ Создан 🧟 триггер-канал: {new_channel.id}")
+    except Exception as e:
+        print(f"❌ Ошибка создания 🧟 триггер-канала: {e}")
+
 
 async def create_temp_voice_room(member, trigger_channel):
     global VOICE_ROOMS
@@ -8368,7 +8780,7 @@ async def create_temp_voice_room(member, trigger_channel):
     guild = member.guild
     category = trigger_channel.category
     
-    is_public = (trigger_channel.id == TRIGGER_CHANNEL_PUBLIC)
+    is_public = (trigger_channel.id in (TRIGGER_CHANNEL_PUBLIC, TRIGGER_CHANNEL_DAYZ))
     
     if is_public:
         overwrites = {
@@ -8490,12 +8902,12 @@ async def sync_voice_rooms_on_startup(guild):
 
     # 2. Сканируем сами категории на предмет "бесхозных" комнат,
     #    о которых бот вообще не знает (например, если voice_rooms.json ещё не существовал)
-    for category_id in (VOICE_ROOM_CATEGORY_ARMY, VOICE_ROOM_CATEGORY_PUBLIC):
+    for category_id in (VOICE_ROOM_CATEGORY_ARMY, VOICE_ROOM_CATEGORY_PUBLIC, VOICE_ROOM_CATEGORY_DAYZ):
         category = guild.get_channel(category_id)
         if not category:
             continue
         for ch in category.voice_channels:
-            if ch.id in (TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC):
+            if ch.id in (TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC, TRIGGER_CHANNEL_DAYZ):
                 continue
             if not ch.name.startswith(TEMP_ROOM_NAME_PREFIX):
                 continue
@@ -8519,7 +8931,7 @@ async def sync_voice_rooms_on_startup(guild):
                 VOICE_ROOMS[ch.id] = {
                     'owner_id': owner_id,
                     'created_at': datetime.now(MSK).isoformat(),
-                    'is_public': (category_id == VOICE_ROOM_CATEGORY_PUBLIC)
+                    'is_public': (category_id in (VOICE_ROOM_CATEGORY_PUBLIC, VOICE_ROOM_CATEGORY_DAYZ))
                 }
                 print(f"♻️ [Синхронизация] Восстановлено отслеживание непустой комнаты '{ch.name}' (ID: {ch.id})")
 
@@ -8662,7 +9074,7 @@ async def on_voice_state_update(member, before, after):
         return
     
     # === СЛУЧАЙ 1: Пользователь подключился к триггер-каналу ===
-    if after.channel and after.channel.id in [TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC]:
+    if after.channel and after.channel.id in [TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC, TRIGGER_CHANNEL_DAYZ]:
         # Получаем или создаём lock для этого пользователя (защита от race condition)
         if member.id not in VOICE_ROOM_CREATION_LOCKS:
             VOICE_ROOM_CREATION_LOCKS[member.id] = asyncio.Lock()
@@ -8764,9 +9176,9 @@ async def on_ready():
 
     if not scheduler.get_job('spreadsheet_check'):
         scheduler.add_job(
-            scheduled_check_spreadsheet, 'cron', day='*/2', hour=18, minute=0,
+            scheduled_check_spreadsheet, 'cron', day_of_week='sat', hour=12, minute=0,
             id='spreadsheet_check', replace_existing=True,
-            max_instances=1, coalesce=True, misfire_grace_time=1800
+            max_instances=1, coalesce=True, misfire_grace_time=3600 * 6
         )
     if not scheduler.get_job('weekly_events'):
         scheduler.add_job(post_weekly_events, 'cron', day_of_week='mon', hour=8, minute=0, id='weekly_events', replace_existing=True)
@@ -8801,6 +9213,7 @@ async def on_ready():
     client.add_view(VacationMessageView())
     client.add_view(SelfAssignRolesView())
     client.add_view(OfficeMenuView())
+    client.add_view(IgnoringCommandButtonView())
     register_persistent_event_views()
 
     await setup_firestore_watchers()
