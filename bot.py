@@ -2639,7 +2639,7 @@ class ServerIntroLayoutView(discord.ui.LayoutView):
 
         options = [discord.SelectOption(label=name, value=str(role_id)) for role_id, name in SELF_ASSIGN_ROLES]
         roles_select = discord.ui.Select(
-            placeholder="Выберите гостевые роли (чтобы снять — уберите из выбора)",
+            placeholder="Роли (чтобы снять - уберите галочку)",
             options=options, min_values=0, max_values=len(options),
             custom_id="self_assign_guest_roles"
         )
