@@ -575,6 +575,7 @@ SHEET_NAME = 'Основная таблица'
 COLUMNS_TO_CHECK = [
     'Discord клана (с клантегом)', 'Discord ECHO (с клантегом)',
     'Discord AS VDV (с клантегом)', 'Discord Triad Tactics (с клантегом)',
+    'Discord Tactical Shift (с клантегом)',
     'Steam (с клантегом)', 'Steam (в друзьях у BURBON?)',
     'Сайт клана (без клантега)', 'Сайт ECHO (без клантега)',
     'Сайт AS VDV (без клантега)', 'Сайт Triad Tactics (без клантега)'
@@ -1374,6 +1375,44 @@ def _firebase_read_profile_callsign_sync(uid):
         return None
     return ((doc.to_dict() or {}).get('callsign') or '').strip() or None
 
+def _firebase_read_email_verified_by_nickname_sync(nickname: str):
+    """Ищет профиль по позывному (без клантега) и возвращает emailVerified
+    (bool). Возвращает None, если профиль не найден вообще (в этом случае
+    считать проблему почты не нужно — скорее всего это игрок без аккаунта
+    на сайте, что уже отдельно покрывается проверкой таблицы)."""
+    callsign = nickname
+    if callsign.startswith(CLAN_TAG):
+        callsign = callsign[len(CLAN_TAG):]
+    docs = fs_db.collection('profiles').where(filter=FieldFilter('callsign', '==', callsign)).limit(1).stream()
+    for doc in docs:
+        data = doc.to_dict() or {}
+        return bool(data.get('emailVerified', False))
+    return None
+
+
+EMAIL_VERIFIED_CACHE = {}
+EMAIL_VERIFIED_CACHE_TIME = {}
+EMAIL_VERIFIED_CACHE_TTL = 1800  # 30 минут — проверка бойцов идёт раз в неделю, кэш не критичен
+
+
+async def get_email_verified_status(nickname: str):
+    """None — профиль на сайте не найден (проверка почты не применяется).
+    True/False — статус подтверждения почты."""
+    now = datetime.now().timestamp()
+    cached_time = EMAIL_VERIFIED_CACHE_TIME.get(nickname, 0)
+    if nickname in EMAIL_VERIFIED_CACHE and (now - cached_time) < EMAIL_VERIFIED_CACHE_TTL:
+        return EMAIL_VERIFIED_CACHE[nickname]
+    if not fs_db:
+        return EMAIL_VERIFIED_CACHE.get(nickname)
+    try:
+        loop = asyncio.get_event_loop()
+        status = await loop.run_in_executor(EXECUTOR, _firebase_read_email_verified_by_nickname_sync, nickname)
+        EMAIL_VERIFIED_CACHE[nickname] = status
+        EMAIL_VERIFIED_CACHE_TIME[nickname] = now
+        return status
+    except Exception as e:
+        print(f"⚠️ Не удалось получить статус подтверждения почты для '{nickname}': {e}")
+        return EMAIL_VERIFIED_CACHE.get(nickname)
 
 async def get_uid_callsign(uid: str):
     now = datetime.now().timestamp()
@@ -1725,7 +1764,7 @@ async def check_spreadsheet() -> bool:
             sheet = await loop.run_in_executor(EXECUTOR, _open_worksheet_sync, SPREADSHEET_URL, SHEET_NAME)
             # Диапазон расширен до колонки K — там теперь читается
             # 'Дата вступления в клан' (см. JOIN_DATE_COLUMN).
-            data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:K35')
+            data_with_colors = await get_sheet_data_with_colors(sheet, 'A1:L35')
             if not data_with_colors or len(data_with_colors) < 2:
                 print("⚠️ Проверка бойцов: Google Sheets вернул пустые/неполные данные — публикация отменена, старый отчёт сохранён.")
                 return False
@@ -1766,6 +1805,20 @@ async def check_spreadsheet() -> bool:
                             color = get_color_category(cell_data['bg'])
                             if color in ['red', 'yellow']:
                                 issues.append({'column': col_name, 'text': cell_data['value'].strip(), 'severity': color})
+
+                # Проверка подтверждения почты — источник Firebase, а не
+                # таблица. None означает "профиля на сайте не найдено" —
+                # в этом случае проблему не добавляем (это отдельная история,
+                # уже покрытая проверкой "Сайт клана (без клантега)").
+                if USE_FIREBASE_BACKEND:
+                    email_verified = await get_email_verified_status(nickname)
+                    if email_verified is False:
+                        issues.append({
+                            'column': 'Подтверждение почты',
+                            'text': 'Не подтверждена электронная почта на сайте клана',
+                            'severity': 'red'
+                        })
+
                 if issues:
                     discord_user = await find_discord_user(nickname, thread)
                     if discord_user:
@@ -6672,15 +6725,32 @@ def build_office_embed():
     return embed
 
 
+# Прямая ссылка на якорное сообщение с правилами отпусков и кнопкой
+# "Оформить отпуск" (VACATION_CHANNEL_ID). Если сообщение будет пересоздано
+# (например, вручную удалено администрацией) — ID в этой ссылке придётся
+# обновить тоже; автоматически подхватить новый ID сюда нельзя, так как
+# discord.ui.Button(style=link) требует готовый URL на этапе создания View,
+# а не динамический lookup при каждом рендере.
+VACATION_RULES_MESSAGE_LINK = (
+    f"https://discord.com/channels/734494109032513699/{VACATION_CHANNEL_ID}/1536512525535944726"
+)
+
+
 class OfficeMenuView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
         for label, url, row in OFFICE_SITE_LINKS:
             self.add_item(discord.ui.Button(label=es(label), style=discord.ButtonStyle.link, url=url, row=row))
 
+        vacation_btn = discord.ui.Button(
+            label=es("🏖️ Оформление отпуска"),
+            style=discord.ButtonStyle.link, url=VACATION_RULES_MESSAGE_LINK, row=3
+        )
+        self.add_item(vacation_btn)
+
         create_btn = discord.ui.Button(
             label=es("📅 Создание мероприятия"),
-            style=discord.ButtonStyle.success, custom_id="office_create_event", row=3
+            style=discord.ButtonStyle.success, custom_id="office_create_event", row=4
         )
         create_btn.callback = self._create_event_callback
         self.add_item(create_btn)
