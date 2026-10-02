@@ -1758,6 +1758,12 @@ async def check_spreadsheet() -> bool:
             if not gc:
                 return False
 
+            # Отмечаем ISO-неделю, на которую пришёлся этот прогон — неважно,
+            # ручной он или плановый. Используется scheduled_check_spreadsheet
+            # ниже, чтобы не дублировать проверку в течение одной и той же
+            # недели, если ручная проверка уже прошла раньше планового времени.
+            await mark_check_week_done(datetime.now(MSK))
+
             thread = await client.fetch_channel(THREAD_ID)
 
             loop = asyncio.get_running_loop()
@@ -1898,12 +1904,24 @@ async def scheduled_check_spreadsheet():
     Защищает от повторного постинга, если по какой-то причине окажется
     запущено больше одного процесса бота одновременно.
 
+    Дополнительно: если на ТЕКУЩЕЙ ISO-неделе проверка уже выполнялась
+    ВРУЧНУЮ (через кнопку в админ-панели или команду !check) — плановый
+    еженедельный запуск пропускается целиком, повторная проверка состоится
+    только на следующей неделе (см. mark_check_week_done/get_last_check_week).
+
     ВАЖНО: слот помечается выполненным ТОЛЬКО ПОСЛЕ успешного завершения
     check_spreadsheet(). Раньше слот помечался ДО вызова — если проверка
     падала (например, Google API был временно недоступен), следующая
     попытка была возможна только через 2 суток (следующий плановый запуск),
     а не при ближайшей возможности."""
     now = datetime.now(MSK)
+
+    current_week = _iso_week_key(now)
+    if get_last_check_week() == current_week:
+        print(f"ℹ️ Проверка бойцов за неделю {current_week} уже была выполнена вручную — "
+              f"плановый еженедельный запуск пропущен.")
+        return
+
     slot_key = now.strftime('%Y-%m-%d %H:%M')
     last = load_json(LAST_SCHEDULED_CHECK_FILE, {})
     if last.get('slot') == slot_key and last.get('status') == 'completed':
@@ -7978,6 +7996,18 @@ async def create_event(title, description, start_time, end_time, image_key='none
                 fresh_events.pop(event_id, None)
                 save_json(EVENTS_FILE, fresh_events)
                 print(f"🧹 Черновик несозданного мероприятия удалён (event_id={event_id}).")
+
+async def mark_check_week_done(dt: datetime):
+    """Запоминает ISO-неделю, на которую пришёлся последний прогон проверки
+    бойцов (check_spreadsheet) — неважно, ручной он или плановый."""
+    history = load_json(CHECK_HISTORY_FILE, {})
+    history['_last_check_week'] = _iso_week_key(dt)
+    save_json(CHECK_HISTORY_FILE, history)
+
+
+def get_last_check_week() -> str:
+    history = read_json(CHECK_HISTORY_FILE, {})
+    return history.get('_last_check_week')
 
 
 def _iso_week_key(dt: datetime) -> str:
