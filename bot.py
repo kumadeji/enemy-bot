@@ -5333,44 +5333,47 @@ def _disc_action_word_and_verb(action: str):
     return "выговор", "вынесен"
 
 
-def _build_inactivity_reason(action_type: str, number: int) -> str:
-    """action_type: 'Замечание' или 'Выговор' — формулировка идентична по
-    смыслу для обоих, отличается только словом и номером."""
-    return _disc_reason_tier(
-        number,
-        f"Неактивность. {action_type} #1. Боец не отметился на мероприятии с обязательной "
-        "записью и не находился в отпуске. Нарушение п. 9 Устава",
-        f"Неактивность. {action_type} #2. Боец повторно не отметился на мероприятии с обязательной "
-        "записью для всех бойцов и не находился в отпуске. Нарушение п. 9 Устава",
-        f"Неактивность. {action_type} #{number}. Боец игнорирует неоднократные замечания о "
-        "необходимости отметок на мероприятия с обязательной записью и не находится в отпуске. "
-        "Нарушение п. 9 Устава",
-    )
+def _build_inactivity_reason(action_type: str, display_number: int, tier_count: int) -> str:
+    """display_number — ГЛОБАЛЬНЫЙ порядковый номер (с учётом АБСОЛЮТНО
+    всех действующих записей этого типа, независимо от причины и от того,
+    кто их выдал — бот или сайт) — именно он показывается в тексте как '#N'.
+
+    tier_count — количество ДЕЙСТВУЮЩИХ записей ЭТОГО ЖЕ ТИПА и ИМЕННО
+    ЭТОЙ причины ('auto_inactivity') — используется ТОЛЬКО для выбора
+    формулировки (первый раз / повторно / систематическое игнорирование),
+    сам по себе нигде не отображается."""
+    tier1 = (f"Неактивность. {action_type} #{display_number}. Боец не отметился на мероприятии с обязательной "
+             "записью и не находился в отпуске. Нарушение п. 9 Устава")
+    tier2 = (f"Неактивность. {action_type} #{display_number}. Боец повторно не отметился на мероприятии с "
+             "обязательной записью для всех бойцов и не находился в отпуске. Нарушение п. 9 Устава")
+    tier3 = (f"Неактивность. {action_type} #{display_number}. Боец игнорирует неоднократные замечания о "
+             "необходимости отметок на мероприятия с обязательной записью и не находится в отпуске. "
+             "Нарушение п. 9 Устава")
+    return _disc_reason_tier(tier_count, tier1, tier2, tier3)
 
 
-def _build_false_acceptance_reason(action_type: str, number: int) -> str:
-    """action_type: 'Замечание' или 'Выговор'. Источник: боец отметился
-    'Приду' на мероприятии, но не явился и не предупредил командование
-    (выбирается вручную на финальном шаге мастера явки)."""
-    return _disc_reason_tier(
-        number,
-        f"Неявка при запланированной явке. {action_type} #1. Боец не явился на мероприятие, "
-        "хотя поставил отметку, что придёт, и не предупредил командование. Нарушение п. 9.2 и 9.4 Устава",
-        f"Неявка при запланированной явке. {action_type} #2. Боец повторно не явился на мероприятие, "
-        "хотя поставил отметку, что придёт, и не предупредил командование. Нарушение п. 9.2 и 9.4 Устава",
-        f"Неявка при запланированной явке. {action_type} #{number}. Боец игнорирует неоднократные "
-        "замечания о необходимости предупреждать командование о невозможности явиться на мероприятие, "
-        "хотя ставит отметки, что придёт. Нарушение п. 9.2 и 9.4 Устава",
-    )
+def _build_false_acceptance_reason(action_type: str, display_number: int, tier_count: int) -> str:
+    """Та же логика display_number/tier_count, что и в _build_inactivity_reason —
+    см. её docstring. Источник: боец отметился 'Приду' на мероприятии, но не
+    явился и не предупредил командование."""
+    tier1 = (f"Неявка при запланированной явке. {action_type} #{display_number}. Боец не явился на мероприятие, "
+             "хотя поставил отметку, что придёт, и не предупредил командование. Нарушение п. 9.2 и 9.4 Устава")
+    tier2 = (f"Неявка при запланированной явке. {action_type} #{display_number}. Боец повторно не явился на "
+             "мероприятие, хотя поставил отметку, что придёт, и не предупредил командование. "
+             "Нарушение п. 9.2 и 9.4 Устава")
+    tier3 = (f"Неявка при запланированной явке. {action_type} #{display_number}. Боец игнорирует неоднократные "
+             "замечания о необходимости предупреждать командование о невозможности явиться на мероприятие, "
+             "хотя ставит отметки, что придёт. Нарушение п. 9.2 и 9.4 Устава")
+    return _disc_reason_tier(tier_count, tier1, tier2, tier3)
 
-def _build_ignoring_command_reason(action_type: str, number: int) -> str:
-    """action_type: 'Замечание' или 'Выговор'. Источник: боец игнорировал
-    неоднократные указания командования исправить проблемы регистрации
-    (см. check_spreadsheet, кнопка 'Подтвердить неоднократное нарушение').
-    В отличие от других источников — здесь ОДИН неизменный шаблон текста
-    для любого номера (без 3-уровневой эскалации формулировки)."""
-    return (f"Игнорирование командования. {action_type} #{number}. Боец игнорировал неоднократные указания "
-            "исправить проблемы с регистрацией и не находился в отпуске. Нарушение п. 1 и 3 Устава")
+
+def _build_ignoring_command_reason(action_type: str, display_number: int, tier_count: int = None) -> str:
+    """display_number — глобальный номер (см. docstring _build_inactivity_reason).
+    tier_count не используется — текст этого источника не эскалируется по
+    формулировке; параметр принимается только для единообразия сигнатуры
+    reason_builder со всеми остальными построителями."""
+    return (f"Игнорирование командования. {action_type} #{display_number}. Боец игнорировал неоднократные "
+            "указания исправить проблемы с регистрацией и не находился в отпуске. Нарушение п. 1 и 3 Устава")
 
 def _build_disc_entry(entry_type: str, reason: str, duration: timedelta, now_ms: int, source: str = 'auto_inactivity') -> dict:
     return {
@@ -5417,31 +5420,40 @@ def _apply_disciplinary_action_sync(uid, source='auto_inactivity', reason_builde
 
         active_warnings = [a for a in actions if active(a, 'Замечание')]
         active_reprimands = [a for a in actions if active(a, 'Выговор')]
-        # Единый (общий для замечаний и выговоров) счётчик номера нарушения
-        # ИМЕННО ЭТОГО источника. Просроченные записи (expiresAtMs <= now_ms)
-        # сюда не попадают — поэтому по истечении срока действия взыскание
-        # для бота "как будто никогда не было", и счёт сам начнётся заново
-        # (это же справедливо и для порогов active_warnings/active_reprimands выше).
-        same_source_active_count = len([
-            a for a in actions if _is_active_entry(a, now_ms) and a.get('source') == source
-        ])
 
         result = {'action': None, 'expelled': False}
 
+        # ГЛАВНОЕ ПРАВИЛО: "Может быть вынесено не более 3 [замечаний],
+        # далее — только выговоры" + "Может быть вынесено не более 3
+        # [выговоров], далее — только исключение". Свободные слоты
+        # ЗАМЕЧАНИЙ заполняются В ПЕРВУЮ ОЧЕРЕДЬ, даже если у бойца уже
+        # есть выговоры, выданные В ОБХОД замечаний вручную (например,
+        # 0 активных замечаний + 2 активных выговора — следующее
+        # автоматическое взыскание ВСЁ РАВНО будет замечанием, а не
+        # третьим выговором).
         if len(active_warnings) < MAX_ACTIVE_WARNINGS:
-            number = same_source_active_count + 1
-            reason = reason_builder('Замечание', number)
+            # display_number — ГЛОБАЛЬНЫЙ номер, независимо от причины и от
+            # того, кем выдано (ботом или вручную на сайте). Именно он
+            # показывается бойцу как "#N".
+            display_number = len(active_warnings) + 1
+            # tier_count — только для выбора формулировки (см. docstring
+            # построителей текста), считает ТОЛЬКО записи ЭТОЙ ЖЕ причины.
+            tier_count = len([a for a in active_warnings if a.get('source') == source]) + 1
+            reason = reason_builder('Замечание', display_number, tier_count)
             actions.append(_build_disc_entry('Замечание', reason, WARNING_DURATION, now_ms, source))
             result['action'] = 'warning'
             result['reason'] = reason
         elif len(active_reprimands) < MAX_ACTIVE_REPRIMANDS:
-            number = same_source_active_count + 1
-            reason = reason_builder('Выговор', number)
+            display_number = len(active_reprimands) + 1
+            tier_count = len([a for a in active_reprimands if a.get('source') == source]) + 1
+            reason = reason_builder('Выговор', display_number, tier_count)
             actions.append(_build_disc_entry('Выговор', reason, REPRIMAND_DURATION, now_ms, source))
             result['action'] = 'reprimand'
             result['reason'] = reason
-        # иначе: уже глобальный максимум и того, и другого — ничего не
-        # добавляем, но ниже всё равно проверим порог исключения.
+        # иначе: оба типа уже заполнены (по 3) — ничего не добавляем, но
+        # ниже всё равно проверяем порог исключения (например, если 3
+        # выговора набрались ранее вручную, без участия бота, — бот всё
+        # равно корректно переведёт в "Отставка" при следующем обращении).
 
         current_composition = ((data.get('gameRoles') or {}).get(GAMESTATS_GAME_NAME) or {}).get('composition', '')
         final_active_reprimands = [a for a in actions if active(a, 'Выговор')]
@@ -5612,17 +5624,18 @@ async def apply_pending_ignoring_command_violation(discord_user_id: int, nicknam
         active = _active_pending_violations(entry, now_ms)
         active_warnings = [v for v in active if v['type'] == 'Замечание']
         active_reprimands = [v for v in active if v['type'] == 'Выговор']
-        number = len(active) + 1  # единый (общий) счётчик номера для этого источника
 
         if len(active_warnings) < MAX_ACTIVE_WARNINGS:
             action_type, duration = 'Замечание', WARNING_DURATION
+            display_number = len(active_warnings) + 1  # глобальный номер ПО ТИПУ, не смешанный с выговорами
         elif len(active_reprimands) < MAX_ACTIVE_REPRIMANDS:
             action_type, duration = 'Выговор', REPRIMAND_DURATION
+            display_number = len(active_reprimands) + 1
         else:
-            action_type, duration = None, None
+            action_type, duration, display_number = None, None, None
 
         if action_type:
-            reason = _build_ignoring_command_reason(action_type, number)
+            reason = _build_ignoring_command_reason(action_type, display_number)
             entry['violations'].append({
                 'type': action_type,
                 'number': number,
