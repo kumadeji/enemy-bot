@@ -6742,18 +6742,28 @@ class OfficeMenuView(discord.ui.View):
         for label, url, row in OFFICE_SITE_LINKS:
             self.add_item(discord.ui.Button(label=es(label), style=discord.ButtonStyle.link, url=url, row=row))
 
+        # Не link-кнопка — Discord делает ЛЮБУЮ кнопку-ссылку всегда серой
+        # (ограничение самого Discord API, не discord.py), поэтому для
+        # цветной кнопки используется обычный custom_id-обработчик, который
+        # эфемерно присылает ссылку на якорное сообщение с отпуском.
         vacation_btn = discord.ui.Button(
             label=es("🏖️ Оформление отпуска"),
-            style=discord.ButtonStyle.link, url=VACATION_RULES_MESSAGE_LINK, row=3
+            style=discord.ButtonStyle.primary, custom_id="office_vacation_link", row=3
         )
+        vacation_btn.callback = self._vacation_link_callback
         self.add_item(vacation_btn)
 
         create_btn = discord.ui.Button(
             label=es("📅 Создание мероприятия"),
-            style=discord.ButtonStyle.success, custom_id="office_create_event", row=4
+            style=discord.ButtonStyle.success, custom_id="office_create_event", row=3
         )
         create_btn.callback = self._create_event_callback
         self.add_item(create_btn)
+
+    async def _vacation_link_callback(self, interaction: discord.Interaction):
+        await interaction.response.send_message(
+            es(f"🏖️ Оформить отпуск можно здесь: {VACATION_RULES_MESSAGE_LINK}"), ephemeral=True
+        )
 
     async def _create_event_callback(self, interaction: discord.Interaction):
         if not member_has_klan_arma_role(interaction.user):
