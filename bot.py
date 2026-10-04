@@ -781,6 +781,21 @@ VOICE_CHANNEL_ID = 1284893513921728582
 VOICE_ROOM_CATEGORY_ARMY = 1284893244878098464
 VOICE_ROOM_CATEGORY_PUBLIC = 1116656512677445693
 VOICE_ROOM_CATEGORY_DAYZ = 908305448552251392
+VOICE_ROOM_CATEGORY_SQUAD = 908009506657697842
+SQUAD_ROLE_ID = 908461959794532404
+
+# Конфигурация триггер-каналов "Создать голосовую комнату" по категориям.
+# mode определяет права ТОЛЬКО при первом создании триггер-канала ботом
+# (если канал уже существует — бот его права не трогает, их можно настраивать
+# вручную; временные комнаты наследуют права именно от него).
+VOICE_TRIGGER_CONFIGS = [
+    {'key': 'army',   'category_id': VOICE_ROOM_CATEGORY_ARMY,   'name': "🔵 Создать голосовую комнату", 'mode': 'copy_reference'},
+    {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать голосовую комнату", 'mode': 'open'},
+    {'key': 'dayz',   'category_id': VOICE_ROOM_CATEGORY_DAYZ,   'name': "🧟 Создать голосовую комнату", 'mode': 'open'},
+    {'key': 'squad',  'category_id': VOICE_ROOM_CATEGORY_SQUAD,  'name': "🪖 Создать голосовую комнату", 'mode': 'role', 'role_id': SQUAD_ROLE_ID},
+]
+VOICE_TRIGGER_CHANNEL_IDS = {}   # id триггер-канала -> key из VOICE_TRIGGER_CONFIGS
+
 
 OFFICE_CHANNEL_NAME = "🔵канцелярия-arma"
 # Каждый элемент: (текст с эмодзи, ссылка, номер ряда). Ряды 0 и 1 содержат
@@ -929,7 +944,15 @@ EVENT_IMAGES = {
 # (см. build_event_view). Также используется для ограничения выбора картинки
 # при создании мероприятия ИГРОКАМИ (состав "Запас"+) — эти три варианта
 # зарезервированы за официальными клановыми матчами, создаваемыми командованием.
-ATTENDANCE_ELIGIBLE_IMAGE_KEYS = {'echo', 'asvdv', 'tt'}
+
+# Типы мероприятий, для которых доступна кнопка "Явка" и "Ожидаемый командир
+# отделения". Это же множество исключается из выбора картинки для игроков
+# в канцелярии (ts, как и остальные, создаётся только командованием).
+ATTENDANCE_ELIGIBLE_IMAGE_KEYS = {'echo', 'asvdv', 'tt', 'ts'}
+# Тип, отметки на который ВСЕГДА необязательны (принудительно, см. create_event/update_event)
+ALWAYS_OPTIONAL_MARKS_IMAGE_KEYS = {'ts'}
+# Эксперимент со скрытием отметок остаётся только на прежних трёх типах
+EXPERIMENT_HIDE_MARKS_IMAGE_KEYS = {'echo', 'asvdv', 'tt'}
 
 # ============== ЭКСПЕРИМЕНТ: ВРЕМЕННОЕ СКРЫТИЕ СПИСКОВ ОТМЕТОК ==============
 # МОДУЛЬНОСТЬ: единственный переключатель ниже управляет ВСЕМИ мероприятиями,
@@ -943,7 +966,7 @@ ATTENDANCE_ELIGIBLE_IMAGE_KEYS = {'echo', 'asvdv', 'tt'}
 # в момент его создания и не меняется переключателем — это лишь исторический
 # факт "это мероприятие подпадало под условия эксперимента на момент
 # создания", а переключатель решает, действует ли это сейчас.
-EXPERIMENT_HIDE_MARKS_ENABLED = True
+EXPERIMENT_HIDE_MARKS_ENABLED = False
 EXPERIMENT_HIDE_MARKS_CUTOFF = MSK.localize(datetime(2026, 9, 29, 0, 0, 0))
 
 
@@ -953,7 +976,7 @@ def _compute_marks_hidden_eligibility(image_key: str, start_time: datetime) -> b
     ТОЛЬКО в момент создания мероприятия (create_event) — уже существующие
     (созданные до применения этого патча) мероприятия таким образом
     гарантированно не затрагиваются задним числом, как и требовалось."""
-    return image_key in ATTENDANCE_ELIGIBLE_IMAGE_KEYS and start_time >= EXPERIMENT_HIDE_MARKS_CUTOFF
+    return image_key in EXPERIMENT_HIDE_MARKS_IMAGE_KEYS and start_time >= EXPERIMENT_HIDE_MARKS_CUTOFF
 
 
 def is_marks_hidden_for_event(event: dict) -> bool:
@@ -1074,9 +1097,6 @@ _ROSTER_UNAVAILABLE_WARNED = False
 
 
 VOICE_ROOMS = {}
-TRIGGER_CHANNEL_ARMY = None
-TRIGGER_CHANNEL_PUBLIC = None
-TRIGGER_CHANNEL_DAYZ = None
 # Блокировки по member.id для защиты от двойного создания временных комнат
 VOICE_ROOM_CREATION_LOCKS = {}
 
@@ -2947,6 +2967,12 @@ class EventCreateModal(discord.ui.Modal):
             end = MSK.localize(datetime.strptime(f"{date_str} {self.end_time.value.strip()}", "%d.%m.%Y %H:%M"))
             if end <= start:
                 end += timedelta(days=1)  # мероприятие переходит через полночь
+            # Пересечения проверяем только для мероприятий игроков (канцелярия)
+            error = validate_event_times(start, end, creating=True,
+                                          check_overlap=(self.created_by_discord_id is not None))
+            if error:
+                await interaction.followup.send(es("❌ ") + error, ephemeral=True)
+                return
             await create_event(self.event_title.value, self.event_description.value, start, end,
                                 image_key=self.image_key, num_games=self.num_games, mandatory=self.mandatory,
                                 created_by_discord_id=self.created_by_discord_id)
@@ -2981,6 +3007,18 @@ class EventEditModal(discord.ui.Modal):
             end = MSK.localize(datetime.strptime(f"{date_str} {self.end_time.value.strip()}", "%d.%m.%Y %H:%M"))
             if end <= start:
                 end += timedelta(days=1)
+            # При редактировании "начало в прошлом" не блокируем (идущее
+            # мероприятие можно править), но лимит 6 часов действует всегда,
+            # а пересечения проверяются для мероприятий игроков, если правит
+            # не командование.
+            edited_event = read_json(EVENTS_FILE, {}).get(self.event_id, {})
+            check_overlap = (edited_event.get('created_by_discord_id') is not None
+                             and interaction.user.id not in ADMIN_USER_IDS)
+            error = validate_event_times(start, end, creating=False, check_overlap=check_overlap,
+                                          exclude_event_id=self.event_id)
+            if error:
+                await interaction.followup.send(es("❌ ") + error, ephemeral=True)
+                return
             await update_event(self.event_id, self.event_title.value, self.event_description.value, start, end,
                                 image_key=self.image_key, num_games=self.num_games, mandatory=self.mandatory)
             await interaction.followup.send(es("✅ Мероприятие обновлено!"), ephemeral=True)
@@ -3543,6 +3581,35 @@ def get_event_id_by_message_id(message_id):
     for event_id, event in events.items():
         if event.get('message_id') == message_id:
             return event_id
+    return None
+
+MAX_EVENT_DURATION = timedelta(hours=6)
+
+def validate_event_times(start: datetime, end: datetime, creating: bool,
+                          check_overlap: bool, exclude_event_id: str = None):
+    """Возвращает текст ошибки либо None, если всё в порядке.
+      - creating=True: начало не может быть в прошлом;
+      - длительность не больше MAX_EVENT_DURATION (6 часов);
+      - check_overlap=True (мероприятия игроков): не пересекаться по времени
+        с другими неотменёнными мероприятиями (вплотную 'конец = начало
+        другого' разрешено)."""
+    now = datetime.now(MSK)
+    if creating and start < now:
+        return "Нельзя создать мероприятие со временем начала в прошлом."
+    if end - start > MAX_EVENT_DURATION:
+        return "Мероприятие не может длиться более 6 часов."
+    if check_overlap:
+        start_ts, end_ts = start.timestamp(), end.timestamp()
+        for eid, ev in read_json(EVENTS_FILE, {}).items():
+            if eid == exclude_event_id or ev.get('status', 'active') == 'cancelled':
+                continue
+            ex_start, ex_end = ev.get('start_time'), ev.get('end_time')
+            if ex_start is None or ex_end is None:
+                continue
+            if start_ts < ex_end and end_ts > ex_start:
+                return (f"Время пересекается с мероприятием «{clean_event_title(ev.get('title', '?'))}» "
+                        f"(<t:{int(ex_start)}:f> — <t:{int(ex_end)}:t>). "
+                        f"Выберите время до его начала или после окончания.")
     return None
 
 def user_can_manage_event(user_id: int, event: dict) -> bool:
@@ -7532,6 +7599,8 @@ async def update_event(event_id, title, description, start_time, end_time, image
             event['num_games'] = num_games
         if mandatory is not None:
             event['mandatory'] = mandatory
+        if event.get('image_key') in ALWAYS_OPTIONAL_MARKS_IMAGE_KEYS:
+            event['mandatory'] = False
 
         # Сбрасываем флаги напоминаний ТОЛЬКО если реально изменилось
         # время начала мероприятия — раньше флаги сбрасывались при ЛЮБОЙ
@@ -7934,6 +8003,8 @@ async def get_or_create_thread(event, event_id, title):
 async def create_event(title, description, start_time, end_time, image_key='none', num_games=0, color=15844367,
                         mandatory=True, weekly_id=None, week_key=None, created_by_discord_id=None):
     event_id = str(uuid.uuid4())
+    if image_key in ALWAYS_OPTIONAL_MARKS_IMAGE_KEYS:
+        mandatory = False  # Tactical Shift: отметки всегда необязательны, что бы ни выбрали
     events = load_json(EVENTS_FILE, {})
     events[event_id] = {
         'title': title, 'description': description,
@@ -8886,171 +8957,86 @@ async def enforce_read_only_channel(guild):
 # ============== ВРЕМЕННЫЕ ГОЛОСОВЫЕ КОМНАТЫ ==============
 
 async def setup_voice_room_triggers(guild):
-    global TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC, TRIGGER_CHANNEL_DAYZ
-    
-    try:
-        category = guild.get_channel(VOICE_ROOM_CATEGORY_ARMY)
-        if not category:
-            print(f"⚠️ Категория {VOICE_ROOM_CATEGORY_ARMY} не найдена")
-        else:
-            existing = None
-            for ch in category.voice_channels:
-                if ch.name == "🔵 Создать голосовую комнату":
-                    existing = ch
-                    break
-            
+    """Находит (или создаёт) триггер-каналы 'Создать голосовую комнату' во всех
+    категориях из VOICE_TRIGGER_CONFIGS."""
+    VOICE_TRIGGER_CHANNEL_IDS.clear()
+    for cfg in VOICE_TRIGGER_CONFIGS:
+        try:
+            category = guild.get_channel(cfg['category_id'])
+            if not category:
+                print(f"⚠️ Категория {cfg['category_id']} не найдена ({cfg['key']})")
+                continue
+
+            existing = discord.utils.get(category.voice_channels, name=cfg['name'])
             if existing:
-                TRIGGER_CHANNEL_ARMY = existing.id
-                print(f"✅ Найден существующий 🔵 триггер-канал: {existing.id}")
-            else:
+                VOICE_TRIGGER_CHANNEL_IDS[existing.id] = cfg['key']
+                print(f"✅ Найден существующий триггер-канал '{cfg['name']}' ({cfg['key']}): {existing.id}")
+                continue
+
+            if cfg['mode'] == 'copy_reference':
                 ref_channel = guild.get_channel(VOICE_CHANNEL_ID)
-                overwrites = ref_channel.overwrites if ref_channel else {}
-                
-                new_channel = await guild.create_voice_channel(
-                    name="🔵 Создать голосовую комнату",
-                    category=category,
-                    overwrites=overwrites,
-                    user_limit=0
-                )
-                TRIGGER_CHANNEL_ARMY = new_channel.id
-                print(f"✅ Создан 🔵 триггер-канал: {new_channel.id}")
-    except Exception as e:
-        print(f"❌ Ошибка создания 🔵 триггер-канала: {e}")
-    
-    try:
-        category = guild.get_channel(VOICE_ROOM_CATEGORY_PUBLIC)
-        if not category:
-            print(f"⚠️ Категория {VOICE_ROOM_CATEGORY_PUBLIC} не найдена")
-        else:
-            existing = None
-            for ch in category.voice_channels:
-                if ch.name == "🍻 Создать голосовую комнату":
-                    existing = ch
-                    break
-            
-            if existing:
-                TRIGGER_CHANNEL_PUBLIC = existing.id
-                print(f"✅ Найден существующий 🍻 триггер-канал: {existing.id}")
-            else:
-                overwrites = {
-                    guild.default_role: discord.PermissionOverwrite(
-                        view_channel=True,
-                        connect=True,
-                        speak=True,
-                        stream=True,
-                        use_voice_activation=True
+                overwrites = dict(ref_channel.overwrites) if ref_channel else {}
+            elif cfg['mode'] == 'role':
+                role = guild.get_role(cfg['role_id'])
+                overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False)}
+                if role:
+                    overwrites[role] = discord.PermissionOverwrite(
+                        view_channel=True, connect=True, speak=True, stream=True, use_voice_activation=True
                     )
-                }
-                
-                new_channel = await guild.create_voice_channel(
-                    name="🍻 Создать голосовую комнату",
-                    category=category,
-                    overwrites=overwrites,
-                    user_limit=0
-                )
-                TRIGGER_CHANNEL_PUBLIC = new_channel.id
-                print(f"✅ Создан 🍻 триггер-канал: {new_channel.id}")
-    except Exception as e:
-        print(f"❌ Ошибка создания 🍻 триггер-канала: {e}")
-
-    try:
-        category = guild.get_channel(VOICE_ROOM_CATEGORY_DAYZ)
-        if not category:
-            print(f"⚠️ Категория {VOICE_ROOM_CATEGORY_DAYZ} не найдена")
-        else:
-            existing = None
-            for ch in category.voice_channels:
-                if ch.name == "🧟 Создать голосовую комнату":
-                    existing = ch
-                    break
-
-            if existing:
-                TRIGGER_CHANNEL_DAYZ = existing.id
-                print(f"✅ Найден существующий 🧟 триггер-канал: {existing.id}")
-            else:
-                # Открытый доступ, по аналогии с публичной категорией — DayZ
-                # не является закрытым военным разделом клана.
+                else:
+                    print(f"⚠️ Роль {cfg['role_id']} не найдена — триггер '{cfg['key']}' будет недоступен никому!")
+            else:  # open
                 overwrites = {
                     guild.default_role: discord.PermissionOverwrite(
-                        view_channel=True,
-                        connect=True,
-                        speak=True,
-                        stream=True,
-                        use_voice_activation=True
+                        view_channel=True, connect=True, speak=True, stream=True, use_voice_activation=True
                     )
                 }
 
-                new_channel = await guild.create_voice_channel(
-                    name="🧟 Создать голосовую комнату",
-                    category=category,
-                    overwrites=overwrites,
-                    user_limit=0
-                )
-                TRIGGER_CHANNEL_DAYZ = new_channel.id
-                print(f"✅ Создан 🧟 триггер-канал: {new_channel.id}")
-    except Exception as e:
-        print(f"❌ Ошибка создания 🧟 триггер-канала: {e}")
-
+            new_channel = await guild.create_voice_channel(
+                name=cfg['name'], category=category, overwrites=overwrites, user_limit=0
+            )
+            VOICE_TRIGGER_CHANNEL_IDS[new_channel.id] = cfg['key']
+            print(f"✅ Создан триггер-канал '{cfg['name']}' ({cfg['key']}): {new_channel.id}")
+        except Exception as e:
+            print(f"❌ Ошибка настройки триггер-канала '{cfg['key']}': {e}")
 
 async def create_temp_voice_room(member, trigger_channel):
+    """Права комнаты = права триггер-канала своей категории (кто мог зайти
+    в 'Создать голосовую комнату', тот сможет зайти и в созданную комнату)
+    + расширенные права владельца."""
     global VOICE_ROOMS
-    
+
     guild = member.guild
     category = trigger_channel.category
-    
-    is_public = (trigger_channel.id in (TRIGGER_CHANNEL_PUBLIC, TRIGGER_CHANNEL_DAYZ))
-    
-    if is_public:
-        overwrites = {
-            guild.default_role: discord.PermissionOverwrite(
-                view_channel=True, connect=True, speak=True,
-                stream=True, use_voice_activation=True
-            ),
-            member: discord.PermissionOverwrite(
-                view_channel=True, connect=True, speak=True,
-                manage_channels=True, manage_roles=True,
-                mute_members=True, deafen_members=True,
-                move_members=True
-            )
-        }
-    else:
-        ref_channel = guild.get_channel(VOICE_CHANNEL_ID)
-        overwrites = dict(ref_channel.overwrites) if ref_channel else {}
-        overwrites[member] = discord.PermissionOverwrite(
-            view_channel=True, connect=True, speak=True,
-            manage_channels=True, manage_roles=True,
-            mute_members=True, deafen_members=True,
-            move_members=True
-        )
-    
+
+    overwrites = dict(trigger_channel.overwrites)
+    overwrites[member] = discord.PermissionOverwrite(
+        view_channel=True, connect=True, speak=True,
+        manage_channels=True, manage_roles=True,
+        mute_members=True, deafen_members=True,
+        move_members=True
+    )
+
     try:
-        clean_name = member.display_name
-        room_name = f"🚪 Комната {clean_name}"
-        if len(room_name) > 100:
-            room_name = room_name[:100]
-        
+        room_name = f"🚪 Комната {member.display_name}"[:100]
         temp_channel = await guild.create_voice_channel(
-            name=room_name,
-            category=category,
-            overwrites=overwrites,
-            user_limit=0
+            name=room_name, category=category, overwrites=overwrites, user_limit=0
         )
-        
+
         VOICE_ROOMS[temp_channel.id] = {
             'owner_id': member.id,
             'created_at': datetime.now(MSK).isoformat(),
-            'is_public': is_public
+            'is_public': (category.id != VOICE_ROOM_CATEGORY_ARMY) if category else False,
+            'category_id': category.id if category else None,
         }
         save_voice_rooms()
-        
+
         await member.move_to(temp_channel, reason="Создание временной голосовой комнаты")
-        
         print(f"✅ Создана временная комната '{room_name}' для {member.display_name} (ID: {temp_channel.id})")
         return temp_channel
     except Exception as e:
         print(f"❌ Ошибка создания временной комнаты: {e}")
         return None
-
 
 async def cleanup_empty_temp_room(channel_id):
     global VOICE_ROOMS
@@ -9094,13 +9080,9 @@ def load_voice_rooms():
 
 
 async def sync_voice_rooms_on_startup(guild):
-    """Сверяет состояние временных комнат с реальностью при старте бота.
-    Закрывает эффект 'зависшей' комнаты, которая осталась пустой, пока бот был offline
-    (например, рестарт бота произошёл в момент, когда все вышли из комнаты, и
-    событие on_voice_state_update было пропущено из-за разрыва gateway-сессии)."""
+    """Сверяет состояние временных комнат с реальностью при старте бота."""
     load_voice_rooms()
 
-    # 1. Чистим то, что бот УЖЕ знал (из старой сессии) — вдруг оно уже пустое или удалено
     ids_to_remove = []
     for channel_id in list(VOICE_ROOMS.keys()):
         channel = guild.get_channel(channel_id)
@@ -9114,18 +9096,15 @@ async def sync_voice_rooms_on_startup(guild):
             except Exception as e:
                 print(f"⚠️ [Синхронизация] Не удалось удалить зависшую комнату {channel_id}: {e}")
             ids_to_remove.append(channel_id)
-
     for channel_id in ids_to_remove:
         VOICE_ROOMS.pop(channel_id, None)
 
-    # 2. Сканируем сами категории на предмет "бесхозных" комнат,
-    #    о которых бот вообще не знает (например, если voice_rooms.json ещё не существовал)
-    for category_id in (VOICE_ROOM_CATEGORY_ARMY, VOICE_ROOM_CATEGORY_PUBLIC, VOICE_ROOM_CATEGORY_DAYZ):
-        category = guild.get_channel(category_id)
+    for cfg in VOICE_TRIGGER_CONFIGS:
+        category = guild.get_channel(cfg['category_id'])
         if not category:
             continue
         for ch in category.voice_channels:
-            if ch.id in (TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC, TRIGGER_CHANNEL_DAYZ):
+            if ch.id in VOICE_TRIGGER_CHANNEL_IDS:
                 continue
             if not ch.name.startswith(TEMP_ROOM_NAME_PREFIX):
                 continue
@@ -9149,7 +9128,8 @@ async def sync_voice_rooms_on_startup(guild):
                 VOICE_ROOMS[ch.id] = {
                     'owner_id': owner_id,
                     'created_at': datetime.now(MSK).isoformat(),
-                    'is_public': (category_id in (VOICE_ROOM_CATEGORY_PUBLIC, VOICE_ROOM_CATEGORY_DAYZ))
+                    'is_public': cfg['category_id'] != VOICE_ROOM_CATEGORY_ARMY,
+                    'category_id': cfg['category_id'],
                 }
                 print(f"♻️ [Синхронизация] Восстановлено отслеживание непустой комнаты '{ch.name}' (ID: {ch.id})")
 
@@ -9283,35 +9263,36 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     member_index.upsert(after)
 
 
+async def _delayed_cleanup_temp_room(channel_id: int):
+    await asyncio.sleep(2)
+    await cleanup_empty_temp_room(channel_id)
+
+
 @client.event
 async def on_voice_state_update(member, before, after):
-    """Обработчик для временных голосовых комнат с защитой от двойного создания."""
-    global TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC, VOICE_ROOMS, VOICE_ROOM_CREATION_LOCKS
-    
+    """Временные голосовые комнаты. Число комнат на одного человека не
+    ограничено — защита от дубля идёт не по 'у него уже есть комната', а по
+    факту смены канала и актуальному положению участника под локом."""
     if member.bot:
         return
-    
-    # === СЛУЧАЙ 1: Пользователь подключился к триггер-каналу ===
-    if after.channel and after.channel.id in [TRIGGER_CHANNEL_ARMY, TRIGGER_CHANNEL_PUBLIC, TRIGGER_CHANNEL_DAYZ]:
-        # Получаем или создаём lock для этого пользователя (защита от race condition)
-        if member.id not in VOICE_ROOM_CREATION_LOCKS:
-            VOICE_ROOM_CREATION_LOCKS[member.id] = asyncio.Lock()
-        
-        async with VOICE_ROOM_CREATION_LOCKS[member.id]:
-            # Проверяем, не создана ли уже комната для этого пользователя
-            for room_id, room_data in VOICE_ROOMS.items():
-                if room_data['owner_id'] == member.id:
-                    return
-            
-            # Создаём временную комнату
-            await create_temp_voice_room(member, after.channel)
-        return
-    
-    # === СЛУЧАЙ 2: Пользователь вышел из временной комнаты ===
-    if before.channel and before.channel.id in VOICE_ROOMS:
-        await asyncio.sleep(2)
-        await cleanup_empty_temp_room(before.channel.id)
 
+    before_id = before.channel.id if before.channel else None
+    after_id = after.channel.id if after.channel else None
+    if before_id == after_id:
+        return  # mute/deafen/стрим и т.п. — канал не менялся
+
+    # 1) Вышел из временной комнаты (в т.ч. сразу в триггер) — проверяем, не опустела ли она.
+    if before_id in VOICE_ROOMS:
+        asyncio.create_task(_delayed_cleanup_temp_room(before_id))
+
+    # 2) Зашёл в триггер-канал — создаём новую комнату.
+    if after_id in VOICE_TRIGGER_CHANNEL_IDS:
+        lock = VOICE_ROOM_CREATION_LOCKS.setdefault(member.id, asyncio.Lock())
+        async with lock:
+            # Пока ждали лок, человек мог уже уйти из триггера — тогда не создаём.
+            if not member.voice or not member.voice.channel or member.voice.channel.id != after_id:
+                return
+            await create_temp_voice_room(member, after.channel)
 
 _bot_fully_initialized = False
 
