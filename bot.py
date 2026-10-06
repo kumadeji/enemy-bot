@@ -951,6 +951,8 @@ EVENT_IMAGES = {
 ATTENDANCE_ELIGIBLE_IMAGE_KEYS = {'echo', 'asvdv', 'tt', 'ts'}
 # Тип, отметки на который ВСЕГДА необязательны (принудительно, см. create_event/update_event)
 ALWAYS_OPTIONAL_MARKS_IMAGE_KEYS = {'ts'}
+# Типы, для которых показывается "Ожидаемый командир отделения" и двигается очередь на командование
+EXPECTED_COMMANDER_IMAGE_KEYS = {'echo', 'asvdv', 'tt'}
 # Эксперимент со скрытием отметок остаётся только на прежних трёх типах
 EXPERIMENT_HIDE_MARKS_IMAGE_KEYS = {'echo', 'asvdv', 'tt'}
 
@@ -1497,7 +1499,7 @@ async def compute_expected_squad_commanders() -> dict:
     active_events = [
         (event_id, event) for event_id, event in events.items()
         if event.get('status', 'active') == 'active'
-        and event.get('image_key') in ATTENDANCE_ELIGIBLE_IMAGE_KEYS
+        and event.get('image_key') in EXPECTED_COMMANDER_IMAGE_KEYS
     ]
     active_events.sort(key=lambda item: item[1].get('start_time', 0))
 
@@ -4217,7 +4219,7 @@ async def get_profile_data(uid: str):
 
 
 async def find_member_by_discord_username(discord_username: str):
-    """Ищет участника гильдии по полю 'Имя пользователя Discord' анкеты (username, не
+    """Ищет участника гильдии по полю 'Имя в Discord' анкеты (username, не
     display_name). Использует общий member_index.guild вместо отдельного
     fetch_channel(ANKETA_CHANNEL_ID) ради guild."""
     if not discord_username or member_index.guild is None:
@@ -4346,7 +4348,7 @@ async def build_anketa_embed(uid, data, is_new: bool = True) -> discord.Embed:
     discord_user_id = await resolve_and_cache_discord_user_id(uid, discord_username)
     if discord_user_id:
         discord_value += f" (<https://discord.com/users/{discord_user_id}>)"
-    embed.add_field(name="Имя пользователя Discord", value=_safe_field_value(discord_value), inline=False)
+    embed.add_field(name="Имя в Discord", value=_safe_field_value(discord_value), inline=False)
 
     embed.add_field(name="Steam ID", value=_safe_field_value(data.get('steamId')), inline=True)
     steam_url = data.get('steamProfileUrl') or ''
@@ -6174,7 +6176,10 @@ def render_completion_message(event: dict) -> str:
 def render_early_completion_message(event: dict) -> str:
     return es(f"🏁 Мероприятие «{clean_event_title(event['title'])}» завершено досрочно после публикации отчёта о явке.")
 
-def render_cancel_message(event: dict, by_user: str) -> str:
+def render_cancel_message(event: dict, by_user) -> str:
+    if by_user is None:
+        return es(f"🚫 Мероприятие «{clean_event_title(event['title'])}» автоматически отменено: "
+                  "к моменту начала никто не отметился, что придёт.")
     return es(f"🚫 Мероприятие «{clean_event_title(event['title'])}» отменено командованием ({by_user}).")
 
 def render_reactivate_message(event: dict) -> str:
@@ -6688,7 +6693,9 @@ async def finalize_attendance(interaction, wizard):
         print(f"⚠️ Отыгрыши для '{wizard.event_title}' применены частично "
               f"(не применено: {len(missing_nicknames)} чел.) — при следующей подаче явки недостающее будет доначислено.")
 
-    queue_changed = await apply_squad_commander_queue_promotion(wizard, old_record=old_record)
+    queue_changed = False
+    if event.get('image_key') in EXPECTED_COMMANDER_IMAGE_KEYS:
+        queue_changed = await apply_squad_commander_queue_promotion(wizard, old_record=old_record)
 
     if queue_changed:
         await refresh_all_active_event_embeds()
@@ -7445,6 +7452,67 @@ async def check_vacation_ending_soon():
                 fresh_data['ending_reminder_sent'] = True
             save_json(VACATIONS_FILE, fresh_vacations)
 
+def _vacation_phase(start_iso: str, end_iso: str, now: datetime) -> str:
+    """Фаза отпуска — те же сравнения, что и в format_vacation_period."""
+    start = datetime.fromisoformat(start_iso)
+    end = datetime.fromisoformat(end_iso)
+    if start.tzinfo is None:
+        start = MSK.localize(start)
+    if end.tzinfo is None:
+        end = MSK.localize(end)
+    if now < start:
+        return 'before'
+    if now <= end:
+        return 'during'
+    return 'after'
+
+
+async def refresh_vacation_period_fields():
+    """Обновляет поле 'Период' в сообщениях активных и ожидающих отпусков при
+    смене фазы (до начала / идёт / закончился), чтобы 'Начнется: ... назад'
+    само менялось на 'Закончится: через N дней'."""
+    vacations = read_json(VACATIONS_FILE, {})
+    now = datetime.now(MSK)
+    processed = []  # (nickname, expected_start, phase)
+
+    for nickname, data in vacations.items():
+        if data.get('status') not in ('active', 'pending'):
+            continue
+        if not data.get('message_id') or not data.get('channel_id'):
+            continue
+        try:
+            phase = _vacation_phase(data['start'], data['end'], now)
+        except Exception:
+            continue
+        if data.get('rendered_period_phase') == phase:
+            continue
+        try:
+            channel = await client.fetch_channel(data['channel_id'])
+            message = await channel.fetch_message(data['message_id'])
+            if message.embeds:
+                embed = message.embeds[0]
+                for i, field in enumerate(embed.fields):
+                    if field.name == FIELD_PERIOD:
+                        embed.set_field_at(i, name=FIELD_PERIOD,
+                                           value=format_vacation_period(data['start'], data['end']), inline=False)
+                        break
+                await message.edit(embed=embed)
+            await asyncio.sleep(0.4)
+        except discord.NotFound:
+            pass  # сообщение удалено — фазу всё равно запоминаем, чтобы не дёргать API вечно
+        except Exception as e:
+            print(f"⚠️ Не удалось обновить период отпуска {nickname}: {e}")
+            continue
+        processed.append((nickname, data.get('start'), phase))
+
+    if processed:
+        async with _vacations_write_lock:
+            fresh = load_json(VACATIONS_FILE, {})
+            for nickname, expected_start, phase in processed:
+                entry = fresh.get(nickname)
+                if entry is not None and entry.get('start') == expected_start:
+                    entry['rendered_period_phase'] = phase
+            save_json(VACATIONS_FILE, fresh)
 
 async def send_vacation_return_message(nickname):
     """Отправляет бойцу сообщение о том, что его отпуск завершён — с возвращением в ряды."""
@@ -7608,6 +7676,7 @@ async def update_event(event_id, title, description, start_time, end_time, image
         # старта), из-за чего уже отправленные напоминания рассылались
         # повторно без необходимости.
         if old_start_time != new_start_time:
+            event['start_label_refreshed'] = False
             event['reminder_2days_sent'] = False
             event['reminder_1day_sent'] = False
             event['reminder_15min_sent'] = False
@@ -7622,14 +7691,13 @@ async def update_event(event_id, title, description, start_time, end_time, image
         except Exception:
             pass
 
-
-async def cancel_event(interaction, event_id):
-    """Отменяет мероприятие: убирает кнопки Приду/Не приду, меняет статус.
-    Данные НЕ удаляются (в отличие от delete_event) — можно активировать снова."""
-    await interaction.response.defer(ephemeral=True, thinking=True)
-    # Читаем и пишем СТРОГО внутри лока. Иначе снимок events, прочитанный
-    # до захвата, успеет устареть, пока лок держит параллельный обработчик
-    # (клик «Приду», напоминание) — и save_json затрёт его изменения.
+async def cancel_event_core(event_id, by_user, require_no_accepted: bool = False):
+    """Общая логика отмены мероприятия (ручной и автоматической).
+    by_user — имя отменившего, либо None для автоматической отмены.
+    require_no_accepted=True — отменять только если мероприятие всё ещё
+    активно и на него по-прежнему никто не отметился "Приду" (проверка
+    ПОД локом, чтобы не отменить мероприятие, на которое кто-то успел записаться).
+    Возвращает (event, None) при успехе или (None, текст_ошибки)."""
     error_msg = None
     event = None
     async with _events_write_lock:
@@ -7638,37 +7706,56 @@ async def cancel_event(interaction, event_id):
             error_msg = es("❌ Мероприятие не найдено!")
         elif events[event_id].get('status') == 'cancelled':
             error_msg = es("⚠️ Мероприятие уже отменено!")
+        elif require_no_accepted and (events[event_id].get('status', 'active') != 'active'
+                                      or events[event_id].get('accepted')):
+            error_msg = "conditions_changed"
         else:
             event = events[event_id]
             event['status'] = 'cancelled'
             save_json(EVENTS_FILE, events)
-    # Ответы пользователю — ВНЕ лока, чтобы не держать его на время сетевого вызова.
     if error_msg:
-        await interaction.followup.send(error_msg, ephemeral=True)
-        return
+        return None, error_msg
 
     await refresh_event_message(event_id)
-    # Эксперимент (п.2): страховочное раскрытие отметок при отмене мероприятия.
+    # Страховочное раскрытие отметок (эксперимент) при отмене
     await reveal_event_marks(event_id, 'event_cancelled_fallback')
+
+    thread = None
     if event.get('thread_id'):
         try:
             thread = await client.fetch_channel(event['thread_id'])
             await unlock_and_unarchive_thread(thread)
             await rename_thread_if_needed(thread, desired_thread_name(event))
-            msg = await thread.send(render_cancel_message(event, interaction.user.display_name))
-            # ВАЖНО: между первым save_json (статус) и этой точкой прошло
-            # время (несколько await: fetch_channel, unlock, rename, send) —
-            # за это время параллельный клик по другому мероприятию мог
-            # изменить events. Перечитываем свежий снимок под локом и
-            # добавляем в него ТОЛЬКО запись о новом сообщении.
+            msg = await thread.send(render_cancel_message(event, by_user))
             async with _events_write_lock:
                 fresh_events = load_json(EVENTS_FILE, {})
                 fresh_event = fresh_events.get(event_id)
                 if fresh_event is not None:
-                    record_thread_message(fresh_event, msg.id, 'cancelled', extra={'by_user': interaction.user.display_name})
+                    record_thread_message(fresh_event, msg.id, 'cancelled', extra={'by_user': by_user})
                     save_json(EVENTS_FILE, fresh_events)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Ошибка работы с веткой при отмене мероприятия {event_id}: {e}")
+
+    # ИСПРАВЛЕНИЕ: раньше ветку открывали для сообщения об отмене, но
+    # обратно не закрывали. Теперь она закрывается и блокируется в любом
+    # случае (даже если сообщение отправить не удалось).
+    if thread:
+        await lock_and_archive_thread(thread)
+
+    # Отмена убирает мероприятие из расчёта "Ожидаемого командира отделения"
+    # для остальных активных мероприятий — пересчитываем их.
+    await refresh_all_active_event_embeds()
+    return event, None
+
+
+async def cancel_event(interaction, event_id):
+    """Ручная отмена: убирает кнопки Приду/Не приду, меняет статус, закрывает ветку.
+    Данные НЕ удаляются — мероприятие можно активировать снова."""
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    event, error = await cancel_event_core(event_id, interaction.user.display_name)
+    if error:
+        await interaction.followup.send(error, ephemeral=True)
+        return
     await interaction.followup.send(es("✅ Мероприятие отменено! Данные сохранены, его можно снова активировать."), ephemeral=True)
 
 
@@ -7864,7 +7951,10 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     time_value = f"Дата: <t:{start_ts}:F> - <t:{end_ts}:t>"
     # Строка "Начнётся" убирается при отмене/завершении (п.1, п.2)
     if status == 'active' and current_date <= event_end:
-        time_value += f"\nНачнется: <t:{start_ts}:R>"
+        if current_date < event_start_dt:
+            time_value += f"\nНачнется: <t:{start_ts}:R>"
+        else:
+            time_value += f"\nНачалось: <t:{start_ts}:R>"
 
     # === ОТВЕТСТВЕННЫЙ ЗА МЕРОПРИЯТИЕ (только для мероприятий, созданных
     # игроками через "🔵канцелярия-arma") — постоянная строка, показывается
@@ -7882,7 +7972,7 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     # (в т.ч. ЛЮБЫХ мероприятий, созданных игроками через "🔵канцелярия-arma",
     # у которых такая картинка недоступна по правилам создания) понятие
     # "командир отделения" неприменимо и поле не отображается вовсе.
-    if status == 'active' and event.get('image_key') in ATTENDANCE_ELIGIBLE_IMAGE_KEYS:
+    if status == 'active' and event.get('image_key') in EXPECTED_COMMANDER_IMAGE_KEYS:
         expected_commanders = await compute_expected_squad_commanders()
         expected_commander = expected_commanders.get(event_id)
         embed.add_field(
@@ -8421,6 +8511,72 @@ async def check_event_completion():
         # thread_messages, discipline_processed/discipline_applied) уже
         # записаны точечно, каждое под своим локом, в момент их появления.
 
+async def auto_cancel_events_without_accepted():
+    """Автоматически отменяет активные мероприятия, у которых время начала
+    уже наступило (но окончание — нет), а отметившихся 'Приду' нет.
+    Для мероприятий, по которым выносятся взыскания за неотметку, сначала
+    выносятся взыскания, затем мероприятие отменяется."""
+    events = read_json(EVENTS_FILE, {})
+    now = datetime.now(MSK)
+    candidates = []
+    for event_id, event in events.items():
+        if event.get('status', 'active') != 'active':
+            continue
+        try:
+            start_dt = datetime.fromtimestamp(event['start_time'], MSK)
+            end_dt = datetime.fromtimestamp(event['end_time'], MSK)
+        except Exception:
+            continue
+        if not (start_dt <= now < end_dt):
+            continue
+        if event.get('accepted'):
+            continue
+        candidates.append(event_id)
+
+    for event_id in candidates:
+        try:
+            event = load_json(EVENTS_FILE, {}).get(event_id)
+            if not event or event.get('status', 'active') != 'active' or event.get('accepted'):
+                continue
+
+            start_dt = datetime.fromtimestamp(event['start_time'], MSK)
+            discipline_applies = event.get('mandatory', True) and start_dt >= DISCIPLINE_CUTOFF
+            if discipline_applies and not event.get('discipline_processed'):
+                await process_inactivity_discipline_for_event(event_id)
+                event = load_json(EVENTS_FILE, {}).get(event_id)
+                if not event or not event.get('discipline_processed'):
+                    print(f"ℹ️ Автоотмена «{(event or {}).get('title', event_id)}» отложена: "
+                          f"взыскания ещё не применены полностью, повтор на следующей минуте.")
+                    continue
+
+            cancelled, error = await cancel_event_core(event_id, None, require_no_accepted=True)
+            if cancelled:
+                print(f"🚫 Мероприятие «{cancelled.get('title', event_id)}» автоматически отменено: никто не отметился.")
+        except Exception as e:
+            print(f"⚠️ Ошибка автоотмены мероприятия {event_id}: {e}")
+
+async def refresh_started_event_embeds():
+    """Один раз перерисовывает embed активного мероприятия, когда его время
+    начала наступило, чтобы 'Начнется' сменилось на 'Началось' без ручного
+    обновления. Флаг start_label_refreshed не даёт делать это повторно."""
+    events = read_json(EVENTS_FILE, {})
+    now_ts = datetime.now(MSK).timestamp()
+    to_refresh = [
+        eid for eid, ev in events.items()
+        if ev.get('status', 'active') == 'active'
+        and ev.get('start_time', 0) <= now_ts
+        and not ev.get('start_label_refreshed')
+    ]
+    if not to_refresh:
+        return
+    async with _events_write_lock:
+        fresh = load_json(EVENTS_FILE, {})
+        for eid in to_refresh:
+            if eid in fresh:
+                fresh[eid]['start_label_refreshed'] = True
+        save_json(EVENTS_FILE, fresh)
+    for eid in to_refresh:
+        embed_refresher.schedule(eid)
 
 # ============== ОБНОВЛЕНИЕ ШАБЛОНОВ СООБЩЕНИЙ ==============
 
@@ -9389,6 +9545,12 @@ async def on_ready():
         scheduler.add_job(check_event_reminders, 'interval', minutes=1, id='event_reminders', replace_existing=True)
     if not scheduler.get_job('event_completion_check'):
         scheduler.add_job(check_event_completion, 'interval', minutes=5, id='event_completion_check', replace_existing=True)
+    if not scheduler.get_job('started_events_refresh'):
+        scheduler.add_job(refresh_started_event_embeds, 'interval', minutes=1, id='started_events_refresh', replace_existing=True)
+    if not scheduler.get_job('auto_cancel_empty_events'):
+        scheduler.add_job(auto_cancel_events_without_accepted, 'interval', minutes=1, id='auto_cancel_empty_events', replace_existing=True)
+    if not scheduler.get_job('vacation_period_refresh'):
+        scheduler.add_job(refresh_vacation_period_fields, 'interval', minutes=10, id='vacation_period_refresh', replace_existing=True)
     if not scheduler.get_job('clan_cache_refresh'):
         scheduler.add_job(load_clan_members_from_firebase, 'interval', hours=1, id='clan_cache_refresh', replace_existing=True)
     if not scheduler.get_job('voice_rooms_sweep'):
