@@ -4217,7 +4217,7 @@ async def get_profile_data(uid: str):
 
 
 async def find_member_by_discord_username(discord_username: str):
-    """Ищет участника гильдии по полю 'Discord ID' анкеты (username, не
+    """Ищет участника гильдии по полю 'Имя пользователя Discord' анкеты (username, не
     display_name). Использует общий member_index.guild вместо отдельного
     fetch_channel(ANKETA_CHANNEL_ID) ради guild."""
     if not discord_username or member_index.guild is None:
@@ -4229,7 +4229,7 @@ async def find_member_by_discord_username(discord_username: str):
                 return member
         return None
     except Exception as e:
-        print(f"⚠️ Ошибка поиска участника по Discord ID '{discord_username}': {e}")
+        print(f"⚠️ Ошибка поиска участника по имени пользователя Discord '{discord_username}': {e}")
         return None
 
 
@@ -4346,7 +4346,7 @@ async def build_anketa_embed(uid, data, is_new: bool = True) -> discord.Embed:
     discord_user_id = await resolve_and_cache_discord_user_id(uid, discord_username)
     if discord_user_id:
         discord_value += f" (<https://discord.com/users/{discord_user_id}>)"
-    embed.add_field(name="Discord ID", value=_safe_field_value(discord_value), inline=False)
+    embed.add_field(name="Имя пользователя Discord", value=_safe_field_value(discord_value), inline=False)
 
     embed.add_field(name="Steam ID", value=_safe_field_value(data.get('steamId')), inline=True)
     steam_url = data.get('steamProfileUrl') or ''
