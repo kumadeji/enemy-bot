@@ -2636,6 +2636,7 @@ SELF_ASSIGN_ROLES = [
     (908462339089641522, "DayZ"),
     (908461959794532404, "Squad"),
     (1118883618375348316, "The Elder Scrolls"),
+    (1557399397753557033, "World of Warcraft"),
 ]
 
 SERVER_INTRO_IMAGE_FILENAME = "enemy-rounded.png"   # лежит в IMAGES_DIR (папка images рядом с bot.py)
@@ -2757,7 +2758,7 @@ class ServerIntroLayoutView(discord.ui.LayoutView):
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
             discord.ui.TextDisplay(SERVER_DIRECTIONS_TEXT),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
-            discord.ui.TextDisplay("### Открытые направления:\n* **DayZ**\n* **Squad**\n* **Серия The Elder Scrolls**"),
+            discord.ui.TextDisplay("### Открытые направления:\n* **DayZ**\n* **Squad**\n* **Серия The Elder Scrolls**\n* **World of Warcraft**"),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
             discord.ui.TextDisplay("### Закрытые направления:\n* **Серия ArmA**. Действующая игра направления - **ArmA Reforger**"),
             # Блок ролей: разделитель -> подзаголовок -> меню выбора
