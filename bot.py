@@ -6178,8 +6178,10 @@ def render_early_completion_message(event: dict) -> str:
 
 def render_cancel_message(event: dict, by_user) -> str:
     if by_user is None:
+        suffix = (" (кроме ответственного за мероприятие)"
+                  if event.get('created_by_discord_id') is not None else "")
         return es(f"🚫 Мероприятие «{clean_event_title(event['title'])}» автоматически отменено: "
-                  "к моменту начала никто не отметился, что придёт.")
+                  f"к моменту начала никто{suffix} не отметился, что придёт.")
     return es(f"🚫 Мероприятие «{clean_event_title(event['title'])}» отменено командованием ({by_user}).")
 
 def render_reactivate_message(event: dict) -> str:
@@ -6878,7 +6880,7 @@ class OfficeMenuView(discord.ui.View):
             return
         view = EventSetupView(player_mode=True, created_by_discord_id=interaction.user.id)
         await interaction.response.send_message(
-            es("📅 Настройте параметры мероприятия и нажмите Далее:"), view=view, ephemeral=True
+            es("📅 Выберите картинку для мероприятия и нажмите Далее:"), view=view, ephemeral=True
         )
 
 
@@ -7707,7 +7709,7 @@ async def cancel_event_core(event_id, by_user, require_no_accepted: bool = False
         elif events[event_id].get('status') == 'cancelled':
             error_msg = es("⚠️ Мероприятие уже отменено!")
         elif require_no_accepted and (events[event_id].get('status', 'active') != 'active'
-                                      or events[event_id].get('accepted')):
+                                      or event_has_other_acceptors(events[event_id])):
             error_msg = "conditions_changed"
         else:
             event = events[event_id]
@@ -7934,7 +7936,9 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     if num_games and num_games > 0:
         games_word = pluralize_games(num_games)
         embed.add_field(name=es("🎮 Плановые матчи"), value=f"Запланировано: {num_games} {games_word}", inline=False)
-    else:
+    elif event.get('created_by_discord_id') is None:
+        # Для мероприятий игроков (канцелярия) строки про матчи нет совсем:
+        # у них матчей не бывает и изменить это нельзя.
         embed.add_field(name=es("🎮 Плановые матчи"), value="Матчи на мероприятии не запланированы", inline=False)
 
     # === ОБЯЗАТЕЛЬНОСТЬ ОТМЕТОК (п.11) ===
@@ -8511,6 +8515,17 @@ async def check_event_completion():
         # thread_messages, discipline_processed/discipline_applied) уже
         # записаны точечно, каждое под своим локом, в момент их появления.
 
+def event_has_other_acceptors(event: dict) -> bool:
+    """True, если на мероприятие отметился «Приду» хотя бы один человек, кроме
+    ответственного (создателя) — если он у мероприятия есть."""
+    accepted = set((event.get('accepted') or {}).keys())
+    creator_id = event.get('created_by_discord_id')
+    if creator_id is not None and member_index.guild:
+        creator = member_index.guild.get_member(creator_id)
+        if creator:
+            accepted.discard(creator.display_name)
+    return bool(accepted)
+
 async def auto_cancel_events_without_accepted():
     """Автоматически отменяет активные мероприятия, у которых время начала
     уже наступило (но окончание — нет), а отметившихся 'Приду' нет.
@@ -8529,14 +8544,14 @@ async def auto_cancel_events_without_accepted():
             continue
         if not (start_dt <= now < end_dt):
             continue
-        if event.get('accepted'):
+        if event_has_other_acceptors(event):
             continue
         candidates.append(event_id)
 
     for event_id in candidates:
         try:
             event = load_json(EVENTS_FILE, {}).get(event_id)
-            if not event or event.get('status', 'active') != 'active' or event.get('accepted'):
+            if not event or event.get('status', 'active') != 'active' or event_has_other_acceptors(event):
                 continue
 
             start_dt = datetime.fromtimestamp(event['start_time'], MSK)
@@ -8593,6 +8608,28 @@ FIELD_REQUESTED_BY = es("👤 Запросил")
 FIELD_APPROVED_BY = es("✅ Утвердил")
 FIELD_REJECTED_BY = es("❌ Отклонил")
 
+async def reload_vacations_from_firebase() -> bool:
+    """Принудительно перечитывает отпуска (и их архив) из Firebase в кэш бота.
+    Сначала дожидается выгрузки собственных отложенных записей, иначе
+    свежее изменение бота было бы затёрто более старым состоянием из облака."""
+    if not USE_FIREBASE_BACKEND or not fs_db:
+        return False
+    try:
+        await firestore_writer.flush(timeout=15)
+        loop = asyncio.get_running_loop()
+        for local_name in (VACATIONS_FILE, VACATION_ARCHIVE_FILE):
+            doc_name = FIREBASE_DATA_MAP[local_name]
+            data = await loop.run_in_executor(EXECUTOR, _firestore_read_sync, doc_name)
+            async with _vacations_write_lock:
+                with _FIRESTORE_CACHE_LOCK:
+                    _FIRESTORE_CACHE[local_name] = data
+                EXECUTOR.submit(_write_local_backup_sync, local_name, data)
+        print("🔄 Отпуска перечитаны из Firebase.")
+        return True
+    except Exception as e:
+        print(f"⚠️ Не удалось перечитать отпуска из Firebase: {e}")
+        return False
+
 async def update_all_templates():
     """Обновляет шаблоны всех сообщений бота:
     - все сообщения мероприятий
@@ -8600,6 +8637,10 @@ async def update_all_templates():
     - правила отпусков в канале отпусков
     - оформление трёх якорных сообщений админ-канала
     """
+    # Сначала подтягиваем актуальные отпуска из Firebase: события ниже
+    # (список «Не отметились», ожидаемый командир) считаются по ним.
+    await reload_vacations_from_firebase()
+
     anchors_fixed = 0
     try:
         anchors = load_json(ADMIN_ANCHORS_FILE, {})
@@ -8777,6 +8818,13 @@ async def update_all_templates():
     # утверждения на уже активный отпуск.
     vacations = load_json(VACATIONS_FILE, {})
     for nickname, data in vacations.items():
+        try:
+            vac_member = await find_member_by_nickname(nickname)
+            if vac_member:
+                await update_vacation_role(vac_member, data.get('status') == 'active')
+        except Exception as e:
+            print(f"⚠️ Не удалось синхронизировать роль отпуска для {nickname}: {e}")
+
         if not data.get('message_id') or not data.get('channel_id'):
             continue
         
