@@ -2327,7 +2327,13 @@ def build_vacation_set_for_date(vacations: dict, target_date: datetime) -> set:
     'rejected' — отклонён, отпуска не было вовсе        → НЕ учитываем.
     """
     target_date_only = target_date.date() if hasattr(target_date, 'date') else target_date
+    # Если передан datetime (а не просто дата), сравниваем с моментом досрочного
+    # закрытия отпуска с точностью до времени
+    target_dt = None
+    if isinstance(target_date, datetime):
+        target_dt = target_date if target_date.tzinfo else MSK.localize(target_date)
     result = set()
+
 
     # Архив вынесен в ОТДЕЛЬНЫЙ файл, а не в ключ внутри vacations: иначе
     # семь существующих циклов `for ... in vacations.items()` (включая два
@@ -2349,18 +2355,26 @@ def build_vacation_set_for_date(vacations: dict, target_date: datetime) -> set:
             end = datetime.fromisoformat(data['end']).date()
         except Exception:
             continue
-        # Досрочное закрытие: реальный конец — дата закрытия. День закрытия
-        # включаем: лучше лишний раз не пингануть вернувшегося, чем выдать
-        # взыскание тому, кто в этот день ещё был в отпуске.
+        # Досрочное закрытие.
         if data.get('status') == 'ended_early' and data.get('closed_at'):
             try:
-                closed = datetime.fromisoformat(data['closed_at']).date()
-                # Защита от битых данных: если closed_at раньше начала отпуска,
-                # период схлопнулся бы в ноль и боец «никогда не был в отпуске».
-                if start <= closed < end:
-                    end = closed
+                closed_dt = datetime.fromisoformat(data['closed_at'])
+                if closed_dt.tzinfo is None:
+                    closed_dt = MSK.localize(closed_dt)
+                closed = closed_dt.astimezone(MSK).date()
             except Exception:
-                pass
+                closed_dt, closed = None, None
+            if closed is not None:
+                if closed < start:
+                    # Отпуск закрыли ДО его начала — его как будто не было вообще.
+                    continue
+                if closed < end:
+                    end = closed
+                # Мероприятие в день закрытия, но уже ПОСЛЕ момента закрытия,
+                # в отпуск не попадает (боец уже вернулся). Мероприятия того же
+                # дня ДО закрытия по-прежнему считаются отпускными.
+                if target_dt is not None and target_dt >= closed_dt:
+                    continue
         if start <= target_date_only <= end:
             result.add(vac_name.strip().lower())
     return result
