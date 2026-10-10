@@ -283,7 +283,19 @@ class _DiscordLogHandler(logging.Handler):
     которые НЕ идут через наш print()."""
     def emit(self, record):
         try:
-            _enqueue_log_line(self.format(record))
+            # Трейсбеки штатных попыток переподключения сворачиваем в одну строку
+            # (в файловом логе они остаются полностью). Остальные ошибки
+            # discord.client, в том числе исключения в обработчиках событий,
+            # идут с полным трейсбеком.
+            if record.exc_info and record.name == 'discord.client' and 'Attempting a reconnect' in record.getMessage():
+                short = copy.copy(record)
+                short.msg = f"{record.getMessage()} — {record.exc_info[0].__name__}: {record.exc_info[1]}"
+                short.args = ()
+                short.exc_info = None
+                short.exc_text = None
+                _enqueue_log_line(self.format(short))
+            else:
+                _enqueue_log_line(self.format(record))
         except Exception:
             pass
 
@@ -292,9 +304,13 @@ def _setup_discord_log_forwarding():
     handler = _DiscordLogHandler()
     handler.setLevel(LOG_FORWARD_LEVEL)
     handler.addFilter(_NoSelfLoopLogFilter())
-    handler.setFormatter(logging.Formatter(
+    from datetime import datetime as _dt, timezone as _tz, timedelta as _td
+    _msk_tz = _tz(_td(hours=3))  # Москва: UTC+3 без перехода на летнее время
+    _fmt = logging.Formatter(
         '[%(asctime)s] [%(levelname)-8s] %(name)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S'
-    ))
+    )
+    _fmt.converter = lambda ts: _dt.fromtimestamp(ts, _msk_tz).timetuple()
+    handler.setFormatter(_fmt)
     # 'discord' — подключения, rate limit, ошибки во View/Modal.
     # 'apscheduler' — ВАЖНО: без этой строки падения фоновых задач
     # (check_event_reminders, check_event_completion, post_weekly_events и т.д.)
@@ -9506,29 +9522,6 @@ _bot_fully_initialized = False
 async def on_ready():
     global _bot_fully_initialized
     print(f'Бот запущен как {client.user} (PID {os.getpid()})')
-
-    # ВРЕМЕННО: полный доступ роли в канале
-    channel = client.get_channel(1500448234928210011)
-
-    if channel:
-        role = channel.guild.get_role(1373394240779976704)
-
-        if role:
-            await channel.set_permissions(
-                role, 
-                overwrite=discord.PermissionOverwrite.from_pair(
-                    discord.Permissions.all_channel(),
-                    discord.Permissions.none()
-                )
-            )
-            print(
-                "✅ Роли выданы все права "
-                "в канале"
-            )
-        else:
-            print("❌ Роль не найдена")
-    else:
-        print("❌ Канал не найден")
 
     if _bot_fully_initialized:
         for guild in client.guilds:
