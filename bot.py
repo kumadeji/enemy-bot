@@ -622,7 +622,6 @@ ROLE_IDS = {
     'otpusk': 1536500577553481768,
     'zapas_arma': 1496435854531366913,
     'lichnyj_sostav_arma': 1449782732480577696,
-    'boec_veteran_arma': 1548660791107133601,   # "Боец-ветеран ArmA"
     'boec_arma': 1548661548585848882,           # "Боец ArmA" (общая для Личного состава и Запаса)
     'klan_arma': 1284456321005129778,           # было 'boets_arma' — переименовано, ID тот же ("Клан ArmA")
     'klan_enemy': 1549047492555833425,          # БЫЛ 1048133924645240903 (устарел) — актуализирован ("КЛАН ENEMY")
@@ -640,7 +639,7 @@ ROLE_IDS = {
 # см. также ARMA_MANAGED_ROLE_KEYS ниже (сделаны идентичными намеренно).
 EXPULSION_ROLE_KEYS = [
     'zapas_arma', 'lichnyj_sostav_arma', 'kombat_arma', 'zam_kombat_arma',
-    'boec_veteran_arma', 'boec_arma', 'klan_arma', 'klan_enemy',
+    'boec_arma', 'klan_arma', 'klan_enemy',
 ]
 
 
@@ -706,7 +705,7 @@ def get_anketa_leadership_mentions(guild, games_interested: list) -> str:
 
 ARMA_MANAGED_ROLE_KEYS = {
     'kombat_arma', 'zam_kombat_arma', 'lichnyj_sostav_arma',
-    'boec_veteran_arma', 'boec_arma', 'zapas_arma',
+    'boec_arma', 'zapas_arma',
     'klan_arma', 'klan_enemy',
     'otbor_arma', 'prinyaty_novobranets_arma', 'novobranets_arma',
 }
@@ -723,8 +722,6 @@ def _map_lichny_sostav_position(position: str) -> str:
         return 'zam_kombat_arma'
     if 'комбат' in p or 'командир батальона' in p:
         return 'kombat_arma'
-    if 'ветеран' in p:
-        return 'boec_veteran_arma'
     return 'boec_arma'
 
 def _map_otbor_position(position: str) -> str:
@@ -739,9 +736,8 @@ def _map_otbor_position(position: str) -> str:
 # внутри одного и того же состава (см. compute_membership_change_dm).
 _LICHNY_SOSTAV_POSITION_RANK = {
     'boec_arma': 0,
-    'boec_veteran_arma': 1,
-    'zam_kombat_arma': 2,
-    'kombat_arma': 3,
+    'zam_kombat_arma': 1,
+    'kombat_arma': 2,
 }
 
 def compute_arma_role_keys(composition: str, position: str, active_warnings: int, active_reprimands: int):
