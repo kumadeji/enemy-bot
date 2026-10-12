@@ -3872,6 +3872,10 @@ async def on_mods_button(interaction: discord.Interaction):
         return
     await interaction.response.send_modal(ModsAnnounceModal(event_id))
 
+VACATION_MARK_NOTICE = (
+    "🏖️ Вы будете в отпуске на момент проведения этого мероприятия, поэтому вам не нужно отмечаться. "
+    "Если вы хотите играть, закройте отпуск досрочно."
+)
 
 def build_personal_mark_status_text(event: dict, nickname: str) -> str:
     """Персональный статус отметки конкретного бойца на мероприятии —
@@ -3880,8 +3884,17 @@ def build_personal_mark_status_text(event: dict, nickname: str) -> str:
         return es("✅ Вы отметились: **Приду**")
     if nickname in (event.get('declined') or {}):
         return es("❌ Вы отметились: **Не приду**")
-    return es("❓ Вы пока не отметились на этом мероприятии")
 
+    # Не отмечен: если боец в отпуске на дату мероприятия, отмечаться ему не нужно
+    try:
+        event_start = datetime.fromtimestamp(event['start_time'], MSK)
+        vacation_set = build_vacation_set_for_date(load_json(VACATIONS_FILE, {}), event_start)
+        if nickname.strip().lower() in vacation_set:
+            return es(VACATION_MARK_NOTICE)
+    except Exception as e:
+        print(f"⚠️ Не удалось проверить отпуск для статуса отметки ({nickname}): {e}")
+
+    return es("❓ Вы пока не отметились на этом мероприятии")
 
 async def on_marks_button(interaction: discord.Interaction):
     event_id = get_event_id_by_message_id(interaction.message.id)
@@ -7626,7 +7639,7 @@ async def handle_event_response(interaction, event_id, response_type):
     # с build_event_embed/get_active_members, которые тоже считают отпуск
     # относительно event_start, а не текущего момента.
     if is_on_vacation_dynamic(nickname, event_start):
-        await interaction.followup.send(es("🏖️ Вы будете в отпуске на дату этого мероприятия."), ephemeral=True)
+        await interaction.followup.send(es(VACATION_MARK_NOTICE), ephemeral=True)
         return
 
     # ВАЖНО: между первым load_json() выше и этим моментом были await'ы
