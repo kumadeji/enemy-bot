@@ -6214,19 +6214,40 @@ def render_cancel_message(event: dict, by_user) -> str:
 def render_reactivate_message(event: dict) -> str:
     return es(f"🔄 Мероприятие «{clean_event_title(event['title'])}» снова активно.")
 
-def render_reminder_2days_message(mention_block: str) -> str:
-    # es() обязателен: он подставляет узкий пробел U+3164 после эмодзи,
-    # иначе Discord склеивает 📢 с текстом (визуально пропадает отступ).
-    # Раньше здесь его не было — при этом в render_announcement_message и
-    # render_reminder_15min_message он стоял, отсюда и разное оформление.
-    return (mention_block + "\n\n" +
-        es("📢 Бойцы! Мы **завтра** подаём список тех, кто придёт на игру. До подачи остались сутки, но вы ещё не отметились! ") +
-        f"Поставьте отметку в основном посте в <#{EVENTS_CHANNEL_ID}>.")
+# Правила подачи списка — ТОЛЬКО для echo / asvdv / tt. У остальных мероприятий
+# списка нет и напоминаний за 2 суток / 1 сутки тоже нет.
+#   offset_days / hour / minute — когда подаётся список (смещение от даты игры, время МСК)
+#   first_hours / second_hours  — за сколько часов до начала игры идут рассылки 1 и 2
+LIST_SUBMISSION_RULES = {
+    'echo':  {'offset_days': 0,  'hour': 10, 'minute': 0, 'first_hours': 48, 'second_hours': 24},
+    'asvdv': {'offset_days': 0,  'hour': 10, 'minute': 0, 'first_hours': 48, 'second_hours': 24},
+    'tt':    {'offset_days': -1, 'hour': 13, 'minute': 0, 'first_hours': 72, 'second_hours': 48},
+}
 
-def render_reminder_1day_message(mention_block: str) -> str:
-    return (mention_block + "\n\n" +
-        es("📢 Бойцы! Мы **сегодня** подаём список тех, кто придёт на игру. До подачи осталось несколько часов, но вы ещё не отметились, **сделайте это сейчас**. ") +
-        f"Поставьте отметку в основном посте в <#{EVENTS_CHANNEL_ID}>.")
+def get_list_submission_deadline(event: dict):
+    """Момент подачи списка (datetime МСК) либо None, если у типа нет правила."""
+    rule = LIST_SUBMISSION_RULES.get(event.get('image_key'))
+    if not rule or 'start_time' not in event:
+        return None
+    day = datetime.fromtimestamp(event['start_time'], MSK).date() + timedelta(days=rule['offset_days'])
+    return MSK.localize(datetime(day.year, day.month, day.day, rule['hour'], rule['minute']))
+
+
+def render_list_reminder_message(mention_block: str, event: dict, stage: str) -> str:
+    """stage: 'first' (за 2 дня до подачи) или 'second' (за 1 день до подачи)."""
+    rule = LIST_SUBMISSION_RULES[event['image_key']]
+    time_str = f"{rule['hour']:02d}:{rule['minute']:02d}"
+    if stage == 'first':
+        body = es("📢 Бойцы! Мы **завтра** сформируем список тех, кто придёт на мероприятие, а "
+                  f"**послезавтра** (в {time_str}) подадим его. У вас ещё есть время отметиться, "
+                  "чтобы забронировать себе слот. ")
+    else:
+        body = es("📢 Бойцы! Мы **сегодня** сформируем список тех, кто придёт на мероприятие, а "
+                  f"**завтра** (в {time_str}) подадим его. У вас осталась последняя возможность отметиться, "
+                  "чтобы забронировать себе слот. ")
+    return (mention_block + "\n\n" + body +
+            f"Пожалуйста, отметьтесь в основном посте в <#{EVENTS_CHANNEL_ID}>.")
+
 
 def render_reminder_15min_message(mention_block: str, event: dict) -> str:
     start_ts = int(event['start_time'])
@@ -8043,8 +8064,8 @@ async def build_event_embed(event_id: str) -> discord.Embed:
 
     if is_marks_hidden_for_event(event):
         embed.add_field(
-            name=es("🔒 Список отметок"),
-            value=es("Список будет автоматически раскрыт в день проведения мероприятия. Отмечаться можно и нужно — ваши отметки сохраняются как обычно. Проверить, отмечались ли вы, можно по кнопке 'Отметки'."),
+            name=es("🔒 Список отметившихся"),
+            value=es("Автоматически раскроется за несколько часов до начала мероприятия. Отмечаться можно и нужно — ваши отметки сохраняются как обычно. Проверить, отмечались ли вы, можно по кнопке ''Отметки''."),
             inline=False
         )
     else:
@@ -8321,7 +8342,6 @@ async def catch_up_weekly_events_on_startup():
     elif missing:
         print(f"ℹ️ Пропущено еженедельных мероприятий: {len(missing)} — их время на этой неделе уже прошло, наверстывание не требуется.")
 
-
 async def check_event_reminders():
     events = load_json(EVENTS_FILE, {})
     current_time = datetime.now(MSK)
@@ -8331,62 +8351,53 @@ async def check_event_reminders():
             continue
         try:
             event_start = datetime.fromtimestamp(event['start_time'], MSK)
-            start_ts = int(event_start.timestamp())
             time_until_start = event_start - current_time
 
-            # === Напоминание за 2 суток — только для ОБЯЗАТЕЛЬНЫХ мероприятий ===
-            # Окно [0;48ч] — если бот был выключен именно в тот момент, когда
-            # должно было уйти напоминание, оно наверстается при следующем
-            # запуске (флаг reminder_2days_sent гарантирует отсутствие дублей).
-            if event.get('mandatory', True) and not event.get('reminder_2days_sent', False) and timedelta(hours=24) < time_until_start <= timedelta(hours=48):
-                    active_members = await get_active_members(event_start, registered_before=event_start)
-                    accepted = list(event.get('accepted', {}).keys())
-                    declined = list(event.get('declined', {}).keys())
-                    unmarked = [m for m in active_members if m not in accepted and m not in declined]
-                    if unmarked:
-                        thread = await get_or_create_thread(event, event_id, event['title'])
-                        if thread:
-                            mention_block = await build_mentions_for_nicknames(unmarked)
-                            msg = await thread.send(render_reminder_2days_message(mention_block))
-                            record_thread_message(event, msg.id, 'reminder_2days', mention_block=mention_block)
-                    event['reminder_2days_sent'] = True
-                    changed = True
-                    
-            elif event.get('mandatory', True) and not event.get('reminder_2days_sent', False) and time_until_start <= timedelta(hours=24):
-                # Окно упущено (бот был выключен) либо мероприятие создано позже, чем за 48 ч.
-                # Гасим флаг молча, иначе продублируем суточное напоминание в ту же минуту.
-                event['reminder_2days_sent'] = True
-                changed = True
-                    
-            # === Напоминание за 1 сутки — только для ОБЯЗАТЕЛЬНЫХ мероприятий ===
-            # Отдельный флаг reminder_1day_sent — независим от 2-суточного:
-            # если 2-суточное окно было пропущено (например, мероприятие
-            # создано позже, чем за 48ч до старта), суточное всё равно сработает.
-            if event.get('mandatory', True) and not event.get('reminder_1day_sent', False) and timedelta(minutes=15) < time_until_start <= timedelta(hours=24):
-                    active_members = await get_active_members(event_start, registered_before=event_start)
-                    accepted = list(event.get('accepted', {}).keys())
-                    declined = list(event.get('declined', {}).keys())
-                    unmarked = [m for m in active_members if m not in accepted and m not in declined]
-                    if unmarked:
-                        thread = await get_or_create_thread(event, event_id, event['title'])
-                        if thread:
-                            mention_block = await build_mentions_for_nicknames(unmarked)
-                            msg = await thread.send(render_reminder_1day_message(mention_block))
-                            record_thread_message(event, msg.id, 'reminder_1day', mention_block=mention_block)
-                    event['reminder_1day_sent'] = True
-                    changed = True
+            # === Напоминания о подаче списка — ТОЛЬКО echo / asvdv / tt ===
+            # Флаги reminder_2days_sent / reminder_1day_sent означают
+            # "рассылка 1" и "рассылка 2" соответственно.
+            # У остальных типов мероприятий этих напоминаний нет вообще.
+            rule = LIST_SUBMISSION_RULES.get(event.get('image_key'))
+            if rule:
+                deadline = get_list_submission_deadline(event)
+                days_to_deadline = (deadline.date() - current_time.date()).days
+                first_h = timedelta(hours=rule['first_hours'])
+                second_h = timedelta(hours=rule['second_hours'])
 
-            elif event.get('mandatory', True) and not event.get('reminder_1day_sent', False) and time_until_start <= timedelta(minutes=15):
-                # Слишком поздно для суточного — отработает 15-минутное напоминание.
-                event['reminder_1day_sent'] = True
-                changed = True
+                for stage, flag, window_low, window_high, expected_days in (
+                    ('first',  'reminder_2days_sent', second_h,              first_h,  2),
+                    ('second', 'reminder_1day_sent',  timedelta(minutes=15), second_h, 1),
+                ):
+                    if event.get(flag, False):
+                        continue
+                    if window_low < time_until_start <= window_high:
+                        # Шлём только если до подачи списка ровно столько дней, сколько
+                        # написано в тексте ("завтра/послезавтра" и т.п.) — иначе пропускаем.
+                        if days_to_deadline == expected_days:
+                            active_members = await get_active_members(event_start, registered_before=event_start)
+                            accepted = set(event.get('accepted', {}).keys())
+                            declined = set(event.get('declined', {}).keys())
+                            unmarked = [m for m in active_members if m not in accepted and m not in declined]
+                            if unmarked:
+                                thread = await get_or_create_thread(event, event_id, event['title'])
+                                if thread:
+                                    mention_block = await build_mentions_for_nicknames(unmarked)
+                                    msg = await thread.send(render_list_reminder_message(mention_block, event, stage))
+                                    record_thread_message(
+                                        event, msg.id,
+                                        'reminder_2days' if stage == 'first' else 'reminder_1day',
+                                        mention_block=mention_block
+                                    )
+                        event[flag] = True
+                        changed = True
+                    elif time_until_start <= window_low:
+                        # Окно уже упущено (бот был выключен / мероприятие создали поздно)
+                        event[flag] = True
+                        changed = True
 
-            # === Напоминание за 15 минут (п.12, п.15) ===
-            # Окно расширено до [-10мин;15мин] — если бот был выключен ровно
-            # в момент, когда должно было уйти напоминание, и мероприятие уже
-            # чуть-чуть началось к моменту перезапуска, напоминание всё равно
-            # наверстается (не имеет смысла напоминать спустя много часов
-            # после старта, поэтому нижняя граница ограничена -10 минутами).
+            # === Напоминание за 15 минут ===
+            # Окно [-10мин;15мин] — если бот был выключен ровно в нужный момент
+            # и мероприятие чуть-чуть началось, напоминание всё равно наверстается.
             if not event.get('reminder_15min_sent', False):
                 if timedelta(minutes=-10) <= time_until_start <= timedelta(minutes=15):
                     thread = await get_or_create_thread(event, event_id, event['title'])
@@ -8394,8 +8405,7 @@ async def check_event_reminders():
                     if thread:
                         if event_created_late(event):
                             # Мероприятие создано менее чем за сутки — тегаем ТОЛЬКО тех,
-                            # кто ещё не отметился (не Приду / не Не приду), и кто не в отпуске.
-                            # Роль 'Боец ArmA' целиком больше нигде не пингуется.
+                            # кто ещё не отметился, и кто не в отпуске.
                             active_members = await get_active_members(event_start, registered_before=event_start)
                             accepted_keys = set(event.get('accepted', {}).keys())
                             declined_keys = set(event.get('declined', {}).keys())
@@ -8409,48 +8419,37 @@ async def check_event_reminders():
                         if should_send:
                             msg = await thread.send(render_reminder_15min_message(mention_block, event))
                             record_thread_message(event, msg.id, 'reminder_15min', mention_block=mention_block)
-                            # Эксперимент (п.2): напоминание за 15 минут — один
-                            # из триггеров раскрытия списка отметок для всех.
+                            # Эксперимент: напоминание за 15 минут — один из триггеров
+                            # раскрытия списка отметок для всех.
                             await reveal_event_marks(event_id, 'reminder_15min')
                     event['reminder_15min_sent'] = True
                     changed = True
-                    
+
             elif event.get('mandatory', True) and not event.get('reminder_15min_sent', False) and time_until_start < timedelta(minutes=-10):
                 event['reminder_15min_sent'] = True
                 changed = True
 
-            # === Эксперимент (п.2): fallback-раскрытие отметок, если
-            # мероприятие уже НАЧАЛОСЬ, а раскрытия по сценариям 'Моды'/
-            # '15-минутное напоминание' по какой-то причине не произошло
-            # (например, никто не отметился 'Приду', поэтому напоминание
-            # выше не было отправлено вовсе). ===
+            # === Эксперимент: fallback-раскрытие отметок, если мероприятие уже
+            # НАЧАЛОСЬ, а раскрытия по сценариям 'Моды'/'15 минут' не произошло. ===
             if is_marks_hidden_for_event(event) and time_until_start <= timedelta(0):
                 await reveal_event_marks(event_id, 'event_start_fallback')
 
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ Ошибка в check_event_reminders для мероприятия {event_id}: {e}")
+
     if changed:
-        # Между началом функции (load) и этой строкой прошло время, за
-        # которое бойцы могли жать 'Приду'/'Не приду' через
-        # handle_event_response. Перечитываем актуальный снимок ПОД ЛОКОМ
-        # и переносим в него только изменения ЭТОЙ функции (флаги напоминаний),
-        # чтобы не затереть чужие отметки устаревшей копией events.
+        # Перечитываем актуальный снимок ПОД ЛОКОМ и переносим в него только
+        # изменения этой функции (флаги напоминаний и записи о сообщениях), чтобы
+        # не затереть чужие отметки устаревшей копией events.
         async with _events_write_lock:
             fresh_events = load_json(EVENTS_FILE, {})
             for event_id, event in events.items():
                 fresh = fresh_events.get(event_id)
                 if fresh is None:
                     continue
-                # reminder_1day_sent раньше отсутствовал в этом списке — флаг
-                # никогда не сохранялся, из-за чего суточное напоминание
-                # (окно [0;24ч]) рассылалось повторно КАЖДУЮ МИНУТУ работы job'а.
                 fresh['reminder_2days_sent'] = event.get('reminder_2days_sent', fresh.get('reminder_2days_sent'))
                 fresh['reminder_1day_sent'] = event.get('reminder_1day_sent', fresh.get('reminder_1day_sent'))
                 fresh['reminder_15min_sent'] = event.get('reminder_15min_sent', fresh.get('reminder_15min_sent'))
-                # thread_messages тоже терялся: записи о новых напоминаниях,
-                # отправленных в этом прогоне, накапливались только в локальной
-                # копии event и не попадали в fresh — ресинхронизация оформления
-                # (update_all_templates) не находила эти сообщения.
                 local_thread_messages = event.get('thread_messages', [])
                 fresh_thread_messages = fresh.get('thread_messages', [])
                 existing_ids = {m.get('id') for m in fresh_thread_messages}
