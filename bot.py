@@ -8077,8 +8077,8 @@ async def build_event_embed(event_id: str) -> discord.Embed:
 
     if is_marks_hidden_for_event(event):
         embed.add_field(
-            name=es("🔒 Список отметившихся"),
-            value=es("Автоматически раскроется за несколько часов до начала мероприятия. Отмечаться можно и нужно — ваши отметки сохраняются как обычно. Проверить, отмечались ли вы, можно по кнопке ''Отметки''."),
+            name=es("🔒 Список бойцов"),
+            value=es("Автоматически раскроется ко времени его подачи для бронирования слотов. Отмечаться можно и нужно — ваши отметки сохраняются как обычно. Проверить, отмечались ли вы, можно по кнопке ''Отметки''."),
             inline=False
         )
     else:
@@ -8444,8 +8444,18 @@ async def check_event_reminders():
 
             # === Эксперимент: fallback-раскрытие отметок, если мероприятие уже
             # НАЧАЛОСЬ, а раскрытия по сценариям 'Моды'/'15 минут' не произошло. ===
+            
+            # Раскрытие по сроку подачи списка (echo / asvdv / tt): в момент подачи
+            # список отметившихся становится виден всем.
+            if is_marks_hidden_for_event(event):
+                submission_deadline = get_list_submission_deadline(event)
+                if submission_deadline is not None and current_time >= submission_deadline:
+                    await reveal_event_marks(event_id, 'list_submission_deadline')
+
+            # Fallback: мероприятие уже началось, а другие триггеры не сработали.
             if is_marks_hidden_for_event(event) and time_until_start <= timedelta(0):
                 await reveal_event_marks(event_id, 'event_start_fallback')
+
 
         except Exception as e:
             print(f"⚠️ Ошибка в check_event_reminders для мероприятия {event_id}: {e}")
