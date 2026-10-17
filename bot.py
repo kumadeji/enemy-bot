@@ -7661,6 +7661,15 @@ async def handle_event_response(interaction, event_id, response_type):
             return
         fresh_event.setdefault('accepted', {})
         fresh_event.setdefault('declined', {})
+        fresh_event.setdefault('mark_times', {})
+        mark_times = fresh_event['mark_times']
+        # Время фиксируется ТОЛЬКО при первой отметке игрока и дальше не меняется:
+        # смена решения (Приду <-> Не приду) «поздней» отметкой не считается.
+        if nickname not in mark_times:
+            had_answer_before = nickname in fresh_event['accepted'] or nickname in fresh_event['declined']
+            # 0 — отметка поставлена до появления учёта времени, поздней быть не может
+            mark_times[nickname] = 0 if had_answer_before else int(datetime.now(MSK).timestamp())
+
         if response_type == "accept":
             fresh_event['accepted'][nickname] = True
             fresh_event['declined'].pop(nickname, None)
@@ -7950,27 +7959,45 @@ def build_display_title(event: dict) -> str:
     weekday_name = get_weekday_name(event['start_time'])
     return f"{title_prefix}{weekday_name}. {clean_event_title(event['title'])}"
 
+def event_uses_list_submission(event: dict) -> bool:
+    """Мероприятие участвует в эксперименте со скрытием списка и имеет срок подачи списка."""
+    return (EXPERIMENT_HIDE_MARKS_ENABLED
+            and bool(event.get('marks_hidden_experiment'))
+            and get_list_submission_deadline(event) is not None)
+
+
+def is_late_mark(event: dict, nickname: str) -> bool:
+    """True, если отметка (Приду или Не приду) поставлена ПОСЛЕ срока подачи списка.
+    У отметок, поставленных до этого патча, времени нет — они поздними не считаются."""
+    if not event_uses_list_submission(event):
+        return False
+    mark_ts = (event.get('mark_times') or {}).get(nickname)
+    if mark_ts is None:
+        return False
+    deadline_ts = get_list_submission_deadline(event).timestamp()
+    created_at = event.get('created_at')
+    if created_at is not None and created_at >= deadline_ts:
+        return False  # мероприятие создано уже после срока подачи: «поздних» отметок не бывает
+    return mark_ts >= deadline_ts
+
+
+def format_name_for_marks(event: dict, nickname: str) -> str:
+    """Поздняя отметка: курсив и звёздочка после ника. Остальные — как есть."""
+    if is_late_mark(event, nickname):
+        return f"*{discord.utils.escape_markdown(nickname)}*\\*"
+    return nickname
+
 async def build_event_embed(event_id: str) -> discord.Embed:
     events = load_json(EVENTS_FILE, {})
     event = events[event_id]
     current_date = datetime.now(MSK)
     event_start_dt = datetime.fromtimestamp(event['start_time'], MSK)
 
-    # Строим множество активных отпусков ОДИН РАЗ за весь рендер embed'а
-    # и передаём его и в get_active_members, и в get_expected_squad_commander
-    # ниже — раньше обе функции читали VACATIONS_FILE и строили набор
-    # самостоятельно, из-за чего на каждый клик по кнопке мероприятия
-    # (build_event_embed вызывается на каждый refresh) отпуска
-    # пересчитывались дважды, а get_expected_squad_commander вдобавок
-    # делала это ещё и на КАЖДОГО кандидата в очереди командования.
-    
     # Отпуска считаем НА ДАТУ МЕРОПРИЯТИЯ, а не на «сейчас».
     # Для прошедших мероприятий это единственный корректный вариант: иначе
     # боец, бывший тогда в отпуске, задним числом попадает в «Не отметились».
     # Для будущих — тоже правильнее: тот, кто уйдёт в отпуск до старта,
     # не должен получать пинги и взыскания за это мероприятие.
-    # (registered_before ниже уже использовал event_start_dt — логика была
-    # задумана верно, но для отпусков не доведена.)
     vacation_set = build_vacation_set_for_date(load_json(VACATIONS_FILE, {}), event_start_dt)
 
     active_members = await get_active_members(event_start_dt, registered_before=event_start_dt, vacation_set=vacation_set)
@@ -7992,7 +8019,7 @@ async def build_event_embed(event_id: str) -> discord.Embed:
         color=embed_color
     )
 
-    # === ЧИСЛО МАТЧЕЙ (строка сверху, п.7) ===
+    # === ЧИСЛО МАТЧЕЙ ===
     num_games = event.get('num_games', 0)
     if num_games and num_games > 0:
         games_word = pluralize_games(num_games)
@@ -8002,7 +8029,7 @@ async def build_event_embed(event_id: str) -> discord.Embed:
         # у них матчей не бывает и изменить это нельзя.
         embed.add_field(name=es("🎮 Плановые матчи"), value="Матчи на мероприятии не запланированы", inline=False)
 
-    # === ОБЯЗАТЕЛЬНОСТЬ ОТМЕТОК (п.11) ===
+    # === ОБЯЗАТЕЛЬНОСТЬ ОТМЕТОК ===
     if event.get('mandatory', True):
         embed.add_field(name=es("📌 Отметки"), value="Обязательны для всех бойцов", inline=False)
     else:
@@ -8014,29 +8041,21 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     event_end = datetime.fromtimestamp(end_ts, MSK)
 
     time_value = f"Дата: <t:{start_ts}:F> - <t:{end_ts}:t>"
-    # Строка "Начнётся" убирается при отмене/завершении (п.1, п.2)
+    # Строка "Начнётся/Началось" убирается при отмене/завершении
     if status == 'active' and current_date <= event_end:
         if current_date < event_start_dt:
             time_value += f"\nНачнется: <t:{start_ts}:R>"
         else:
             time_value += f"\nНачалось: <t:{start_ts}:R>"
 
-    # === ОТВЕТСТВЕННЫЙ ЗА МЕРОПРИЯТИЕ (только для мероприятий, созданных
-    # игроками через "🔵канцелярия-arma") — постоянная строка, показывается
-    # ВСЕГДА, независимо от статуса мероприятия (в отличие от "Ожидаемого
-    # командира отделения", который скрывается для cancelled/completed). ===
+    # === ОТВЕТСТВЕННЫЙ ЗА МЕРОПРИЯТИЕ (только для мероприятий игроков) ===
     creator_id = event.get('created_by_discord_id')
     if creator_id is not None:
         creator_member = member_index.guild.get_member(creator_id) if member_index.guild else None
         creator_value = creator_member.mention if creator_member else f"<@{creator_id}>"
         embed.add_field(name=es("🪖 Ответственный за мероприятие"), value=creator_value, inline=False)
 
-    # === ОЖИДАЕМЫЙ КОМАНДИР ОТДЕЛЕНИЯ (очередь Firebase) (п.4) ===
-    # Поле показывается ТОЛЬКО для активных мероприятий с картинкой из
-    # ATTENDANCE_ELIGIBLE_IMAGE_KEYS (echo/asvdv/tt) — для остальных форматов
-    # (в т.ч. ЛЮБЫХ мероприятий, созданных игроками через "🔵канцелярия-arma",
-    # у которых такая картинка недоступна по правилам создания) понятие
-    # "командир отделения" неприменимо и поле не отображается вовсе.
+    # === ОЖИДАЕМЫЙ КОМАНДИР ОТДЕЛЕНИЯ (только echo/asvdv/tt, только активные) ===
     if status == 'active' and event.get('image_key') in EXPECTED_COMMANDER_IMAGE_KEYS:
         expected_commanders = await compute_expected_squad_commanders()
         expected_commander = expected_commanders.get(event_id)
@@ -8050,9 +8069,7 @@ async def build_event_embed(event_id: str) -> discord.Embed:
 
     def add_names_field(name_prefix: str, names: list, inline: bool):
         """Добавляет поле со списком имён, разбивая на несколько полей
-        (…(1/2), (2/2)…), если общая длина превышает лимит Discord в 1024
-        символа на value — без этого рост клана рано или поздно приводил бы
-        к 400 Bad Request и полному отказу обновления embed'а мероприятия."""
+        (…(1/2), (2/2)…), если длина превышает лимит Discord в 1024 символа."""
         if not names:
             return
         chunks = []
@@ -8082,27 +8099,45 @@ async def build_event_embed(event_id: str) -> discord.Embed:
             inline=False
         )
     else:
-        add_names_field("✅ Придут", accepted, inline=True)
-        add_names_field("❌ Не придут", declined, inline=True)
-        # Список "Не отметились" ПОСТОЯННО визуально скрыт для мероприятий
-        # с необязательными отметками (mandatory=False) — данные по-прежнему
-        # считаются и хранятся в базе как обычно (см. unmarked выше,
-        # используется дисциплиной/командиром отделения/пр.), просто не
-        # отображаются в самом посте. Никаких пояснений/раскрытия не требуется —
-        # поле просто отсутствует в embed'е.
+        uses_submission = event_uses_list_submission(event)
+
+        # Поздние отметки (первая отметка поставлена после срока подачи списка):
+        # курсив + звёздочка после ника. Только в «Придут» и «Не придут».
+        accepted_view = [format_name_for_marks(event, n) for n in accepted]
+        declined_view = [format_name_for_marks(event, n) for n in declined]
+
+        add_names_field("✅ Придут", accepted_view, inline=True)
+        add_names_field("❌ Не придут", declined_view, inline=True)
+
+        # Список «Не отметились» постоянно скрыт для мероприятий с необязательными
+        # отметками (mandatory=False): данные считаются и хранятся, но не показываются.
+        # Названия без курсива и звёздочек.
         if event.get('mandatory', True):
-            add_names_field("❓ Не отметились", unmarked, inline=False)
+            unmarked_title = "❓ Не отметились до подачи списка" if uses_submission else "❓ Не отметились"
+            add_names_field(unmarked_title, unmarked, inline=False)
+
+        # Приписка про поздние отметки (курсивом)
+        late_accepted = any(is_late_mark(event, n) for n in accepted)
+        late_declined = any(is_late_mark(event, n) for n in declined)
+        if late_accepted:
+            embed.add_field(
+                name="\u200b",
+                value="*\\* - отметки, оставленные слишком поздно - после подачи списка; может не хватить места на мероприятии*",
+                inline=False
+            )
+        elif late_declined:
+            embed.add_field(
+                name="\u200b",
+                value="*\\* - отметки, оставленные слишком поздно - после подачи списка*",
+                inline=False
+            )
 
     image_key = event.get('image_key', 'none')
     if image_key != 'none' and image_key in EVENT_IMAGES:
         filename = EVENT_IMAGES[image_key]['file']
         embed.set_image(url=f'attachment://{filename}')
 
-    # Предохранитель на случай экстремального роста клана: Discord отклоняет
-    # embed с более чем 25 полями. Если после разбивки на части полей вышло
-    # больше 24 (оставляем запас на возможные будущие поля) — заменяем
-    # избыточные списки на компактные счётчики, чтобы не сломать отправку
-    # вообще.
+    # Предохранитель: Discord отклоняет embed с более чем 25 полями.
     if len(embed.fields) > 24:
         while len(embed.fields) > 24:
             embed.remove_field(len(embed.fields) - 1)
