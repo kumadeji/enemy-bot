@@ -8113,7 +8113,7 @@ async def build_event_embed(event_id: str) -> discord.Embed:
         # отметками (mandatory=False): данные считаются и хранятся, но не показываются.
         # Названия без курсива и звёздочек.
         if event.get('mandatory', True):
-            unmarked_title = "❓ Не отметились после подачи списка" if uses_submission else "❓ Не отметились"
+            unmarked_title = "❓ Не отметились даже после подачи списка" if uses_submission else "❓ Не отметились"
             add_names_field(unmarked_title, unmarked, inline=False)
 
         # Приписка про поздние отметки (курсивом)
