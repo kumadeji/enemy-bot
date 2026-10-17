@@ -7987,6 +7987,36 @@ def format_name_for_marks(event: dict, nickname: str) -> str:
         return f"*{discord.utils.escape_markdown(nickname)}*\\*"
     return nickname
 
+# Новые заголовки списка «Не отметились» применяются только к мероприятиям,
+# которые начинаются с этой даты включительно. У более старых остаётся «Не отметились».
+UNMARKED_TITLE_CUTOFF = MSK.localize(datetime(2026, 10, 12, 0, 0, 0))
+
+
+def get_unmarked_field_title(event: dict, now: datetime = None) -> str:
+    """Заголовок поля «Не отметились» для мероприятий с подачей списка."""
+    base = "❓ Не отметились"
+    if not event_uses_list_submission(event):
+        return base
+    try:
+        event_start = datetime.fromtimestamp(event['start_time'], MSK)
+    except Exception:
+        return base
+    if event_start < UNMARKED_TITLE_CUTOFF:
+        return base  # старые мероприятия не трогаем
+
+    status = event.get('status', 'active')
+    if status in ('completed', 'cancelled'):
+        return "❓ Не отметились даже после подачи списка"
+
+    now = now or datetime.now(MSK)
+    deadline = get_list_submission_deadline(event)
+    if deadline is not None and now >= deadline:
+        return "❓ Не отметились ко времени подачи списка"
+
+    # Список раскрыт раньше срока подачи (например, по кнопке «Моды») —
+    # слов «ко времени подачи» ещё рано, оставляем обычный заголовок.
+    return base
+
 async def build_event_embed(event_id: str) -> discord.Embed:
     events = load_json(EVENTS_FILE, {})
     event = events[event_id]
@@ -8099,7 +8129,6 @@ async def build_event_embed(event_id: str) -> discord.Embed:
             inline=False
         )
     else:
-        uses_submission = event_uses_list_submission(event)
 
         # Поздние отметки (первая отметка поставлена после срока подачи списка):
         # курсив + звёздочка после ника. Только в «Придут» и «Не придут».
@@ -8113,8 +8142,7 @@ async def build_event_embed(event_id: str) -> discord.Embed:
         # отметками (mandatory=False): данные считаются и хранятся, но не показываются.
         # Названия без курсива и звёздочек.
         if event.get('mandatory', True):
-            unmarked_title = "❓ Не отметились даже после подачи списка" if uses_submission else "❓ Не отметились"
-            add_names_field(unmarked_title, unmarked, inline=False)
+            add_names_field(get_unmarked_field_title(event), unmarked, inline=False)
 
         # Приписка про поздние отметки (курсивом)
         late_accepted = any(is_late_mark(event, n) for n in accepted)
