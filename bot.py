@@ -599,6 +599,18 @@ COLUMNS_TO_CHECK = [
 
 EXPECTED_INTRO_MAX_LEN = 700
 
+# ============== МОДУЛЬНОЕ УПРАВЛЕНИЕ ПРОВЕРКОЙ ЧЛЕНСТВА ==============
+
+# Автоматический запуск проверки регистраций каждую субботу в 12:00 МСК.
+# False отключает только плановый запуск; ручные проверки остаются доступны.
+AUTOMATIC_SPREADSHEET_CHECK_ENABLED = False
+
+# Учитывать ли отпуска при ЛЮБОМ запуске проверки регистраций
+# (автоматическом, через кнопку админ-панели или команду !check).
+# True  — бойцы, находящиеся в отпуске, исключаются из проверки.
+# False — отпускной статус не проверяется, проверяются все бойцы из таблицы.
+SPREADSHEET_CHECK_VACATION_FILTER_ENABLED = False
+
 # ============== НОВЫЕ НАСТРОЙКИ ==============
 
 EVENTS_CHANNEL_ID = 1311705378140196926
@@ -1681,12 +1693,15 @@ async def send_chunked(thread, text, user_name="") -> list:
 
 # ============== ПОСТРОЕНИЕ ТЕКСТОВ ==============
 
+# es("Это автоматическая проверка бойцов на **соответствие требованиям членства в клане** — всех, кто не в отпуске. Проводится 1 раз в неделю по субботам в 12:00 по МСК."),
+# es("Игнорирование результатов проверки приведёт к **назначению дисциплинарных взысканий**."),
+# es("Дисциплинарные взыскания не накладываются на бойцов в течение 1 месяца после вступления в клан."), "",
+# es(f"📅 Проверка от {current_time.strftime('%d.%m.%Y %H:%M')} МСК"), " ",
+
 def build_intro_lines(current_time: datetime) -> list:
     return [
-        es("🔔 **Проверка бойцов**"), "",
-        es("Это автоматическая проверка бойцов на **соответствие требованиям членства в клане** — всех, кто не в отпуске. Проводится 1 раз в неделю по субботам в 12:00 по МСК."),
-        es("Игнорирование результатов проверки приведёт к **назначению дисциплинарных взысканий**."),
-        es("Дисциплинарные взыскания не накладываются на бойцов в течение 1 месяца после вступления в клан."), "",
+        es("🔔 **Итоговая проверка бойцов**"), "",
+        es("Это последняя автоматическая проверка всех бойцов на **соответствие требованиям членства в клане** — даже тех, кто в отпуске. Больше невозможно вступить в клан, не выполнив все требования по вступлению. Исходим из того, что проверки больше никогда не будут проводиться. Возможно, нам не удалось донести важность прохождения регистрации на проектах или указания правильного позывного на проектах. Мы каждую неделю просили об исправлении проблем с регистрацией как минимум с июля 2026 года: как здесь, так и в личных сообщениях и от бота, и от нас. Далее последуют исключения в ручном формате."),
         es(f"📅 Проверка от {current_time.strftime('%d.%m.%Y %H:%M')} МСК"), " ",
     ]
 
@@ -1812,7 +1827,16 @@ async def check_spreadsheet() -> bool:
             headers = [cell['value'] for cell in data_with_colors[0]]
             rows = data_with_colors[1:]
             current_time = datetime.now(MSK)
-            vacation_set = build_active_vacation_set(load_json(VACATIONS_FILE, {}), current_time)
+
+            # Единый отпускной фильтр для ВСЕХ способов запуска check_spreadsheet():
+            # планировщик, кнопка админ-панели и команда !check.
+            if SPREADSHEET_CHECK_VACATION_FILTER_ENABLED:
+                vacation_set = build_active_vacation_set(
+                    load_json(VACATIONS_FILE, {}), current_time
+                )
+            else:
+                vacation_set = set()
+
             join_date_idx = headers.index(JOIN_DATE_COLUMN) if JOIN_DATE_COLUMN in headers else None
 
             user_issues = {}
@@ -9666,12 +9690,22 @@ async def on_ready():
     except Exception as e:
         print(f"⚠️ Ошибка при проверке несозданных еженедельных мероприятий: {e}")
 
-    if not scheduler.get_job('spreadsheet_check'):
-        scheduler.add_job(
-            scheduled_check_spreadsheet, 'cron', day_of_week='sat', hour=12, minute=0,
-            id='spreadsheet_check', replace_existing=True,
-            max_instances=1, coalesce=True, misfire_grace_time=3600 * 6
-        )
+    # ============== АВТОМАТИЧЕСКАЯ ПРОВЕРКА РЕГИСТРАЦИЙ ==============
+    
+    if AUTOMATIC_SPREADSHEET_CHECK_ENABLED:
+        if not scheduler.get_job('spreadsheet_check'):
+            scheduler.add_job(
+                scheduled_check_spreadsheet, 'cron', day_of_week='sat', hour=12, minute=0,
+                id='spreadsheet_check', replace_existing=True,
+                max_instances=1, coalesce=True, misfire_grace_time=3600 * 6
+            )
+        print("✅ Автоматическая еженедельная проверка регистраций включена.")
+    else:
+        # Удаляем и ранее зарегистрированную задачу, например при повторном on_ready.
+        if scheduler.get_job('spreadsheet_check'):
+            scheduler.remove_job('spreadsheet_check')
+    
+        print("⏸️ Автоматическая еженедельная проверка регистраций отключена.")
     if not scheduler.get_job('weekly_events'):
         scheduler.add_job(post_weekly_events, 'cron', day_of_week='mon', hour=8, minute=0, id='weekly_events', replace_existing=True)
     if not scheduler.get_job('vacation_check'):
