@@ -616,6 +616,7 @@ SPREADSHEET_CHECK_VACATION_FILTER_ENABLED = False
 EVENTS_CHANNEL_ID = 1311705378140196926
 VACATION_CHANNEL_ID = 1284905224099598407
 ADMIN_CHANNEL_ID = 1536632416511332362
+OFFICE_PANEL_CHANNEL_ID = 1553932674622693528
 ANKETA_CHANNEL_ID = 1366767440939454504
 MEMBER_LEAVE_LOG_CHANNEL_ID = 734494109590487043
 
@@ -641,17 +642,40 @@ ROLE_IDS = {
     'otbor_arma': 1548661103406358588,          # "Отбор ArmA" — состав "Отбор"
     'prinyaty_novobranets_arma': 1548661262894895104,  # "Принятый новобранец ArmA"
     'novobranets_arma': 1548661447788339271,           # "Новобранец ArmA"
+    'project_tactical_shift': 1571912021266665503,     # "Проект Tactical Shift в ArmA"
+    'project_echo': 1571912196106223686,               # "Проект ECHO в ArmA"
+    'project_as_vdv': 1571912244013301881,             # "Проект AS VDV в ArmA"
+    'project_triad_tactics': 1571912290452902008,      # "Проект Triad Tactics в ArmA"
 }
     # Роли специализаций (миномётчик/БТВ/пилот/КО и т.д.) удалены из реестра —
     # соответствующие роли в Discord больше не существуют.
 
+# Соответствие картинки мероприятия проектной роли. Эти роли выбираются
+# самими бойцами и НЕ входят в постоянный набор ARMA_MANAGED_ROLE_KEYS.
+PROJECT_ROLE_KEYS_BY_IMAGE = {
+    'ts': 'project_tactical_shift',
+    'echo': 'project_echo',
+    'asvdv': 'project_as_vdv',
+    'tt': 'project_triad_tactics',
+}
+PROJECT_ROLE_LABELS = {
+    'project_tactical_shift': 'Проект Tactical Shift в ArmA',
+    'project_echo': 'Проект ECHO в ArmA',
+    'project_as_vdv': 'Проект AS VDV в ArmA',
+    'project_triad_tactics': 'Проект Triad Tactics в ArmA',
+}
+PROJECT_ROLE_KEYS = tuple(PROJECT_ROLE_LABELS.keys())
+PROJECT_ROLE_OPTIONS = [(ROLE_IDS[key], PROJECT_ROLE_LABELS[key]) for key in PROJECT_ROLE_KEYS]
+
 # Роли, снимаемые при достижении 3 предупреждений + 3 выговоров (сценарий,
 # где взыскание выносит САМ БОТ, см. process_inactivity_discipline_for_event).
-# Этот же набор — единственно верный набор "управляемых" ролей состава/должности,
-# см. также ARMA_MANAGED_ROLE_KEYS ниже (сделаны идентичными намеренно).
+# Этот набор снимается при дисциплинарном исключении; проектные роли также
+# снимаются при переходе в 'Отставка', но не входят в обычную синхронизацию
+# активных ролей, так как их выбирают сами бойцы.
 EXPULSION_ROLE_KEYS = [
     'zapas_arma', 'lichnyj_sostav_arma', 'kombat_arma', 'zam_kombat_arma',
     'boec_arma', 'klan_arma', 'klan_enemy',
+    *PROJECT_ROLE_KEYS,
 ]
 
 
@@ -682,6 +706,36 @@ def get_role_mention_by_id(guild, role_key: str):
 def get_role_by_name(guild, name: str):
     """Единая точка поиска ролей БЕЗ фиксированного ID (по имени)."""
     return discord.utils.get(guild.roles, name=name)
+
+
+def get_event_project_role_key(event: dict | None):
+    """Возвращает ключ проектной роли для картинки мероприятия либо None."""
+    if not event:
+        return None
+    return PROJECT_ROLE_KEYS_BY_IMAGE.get(event.get('image_key'))
+
+
+def member_has_event_project_role(member, event: dict) -> bool:
+    """Проверяет право бойца участвовать в мероприятии конкретного проекта.
+    Для обычных мероприятий без проектной картинки ограничений нет."""
+    role_key = get_event_project_role_key(event)
+    if role_key is None:
+        return True
+    role_id = ROLE_IDS.get(role_key)
+    return bool(member and role_id and any(role.id == role_id for role in member.roles))
+
+
+def get_event_project_role_requirement_message(event: dict) -> str | None:
+    """Пояснение игроку, которому не хватает роли проекта для отметки."""
+    role_key = get_event_project_role_key(event)
+    if not role_key:
+        return None
+    project_name = PROJECT_ROLE_LABELS.get(role_key, role_key)
+    return es(
+        f"⛔ Вы не указали, что хотите играть на проекте «{project_name}». "
+        f"Чтобы отмечаться на мероприятиях этого проекта, выберите соответствующую роль "
+        f"в канале <#{OFFICE_PANEL_CHANNEL_ID}>."
+    )
 
 
 def get_leadership_mentions(guild, *role_keys: str) -> str:
@@ -1541,7 +1595,9 @@ async def compute_expected_squad_commanders() -> dict:
     vacations = read_json(VACATIONS_FILE, {})
     result = {}
     for event_id, event in active_events:
-        accepted = set(event.get('accepted', {}).keys())
+        accepted = set(await filter_event_project_nicknames(
+            event.get('accepted', {}).keys(), event
+        ))
         event_start_dt = datetime.fromtimestamp(event['start_time'], MSK)
         vacation_set = build_vacation_set_for_date(vacations, event_start_dt)
 
@@ -1647,6 +1703,23 @@ async def find_member_by_nickname(nickname: str):
         print(f"Ошибка поиска участника: {e}")
         return None
 
+async def filter_event_project_nicknames(nicknames, event: dict) -> list:
+    """Оставляет только тех игроков из списка, у кого есть роль проекта
+    мероприятия. Для обычных мероприятий возвращает исходный список."""
+    role_key = get_event_project_role_key(event)
+    if role_key is None:
+        return list(nicknames)
+    role_id = ROLE_IDS.get(role_key)
+    if not role_id:
+        print(f"⚠️ Не задан ID проектной роли для image_key='{event.get('image_key')}' — игроки исключены из списков.")
+        return []
+
+    eligible = []
+    for nickname in nicknames:
+        member = await find_member_by_nickname(nickname)
+        if member_has_event_project_role(member, event):
+            eligible.append(nickname)
+    return eligible
 
 async def try_dm_member(member, text: str, context: str = "") -> bool:
     """Отправляет личное сообщение с тихим fallback: если ЛС у пользователя
@@ -2416,8 +2489,8 @@ def is_on_vacation_dynamic(nickname: str, current_date: datetime) -> bool:
     active_set = build_active_vacation_set(vacations, current_date)
     return nickname.strip().lower() in active_set
 
-
-async def get_active_members(current_date: datetime, registered_before: datetime = None, vacation_set: set = None) -> list:
+async def get_active_members(current_date: datetime, registered_before: datetime = None,
+                             vacation_set: set = None, event: dict = None) -> list:
     """Список активных (не в отпуске) бойцов. Отпуска читаются и разбираются
     РОВНО ОДИН РАЗ за вызов (а не по разу на каждого бойца клана).
 
@@ -2435,20 +2508,24 @@ async def get_active_members(current_date: datetime, registered_before: datetime
             m for m in filtered
             if get_member_created_at(m) is None or get_member_created_at(m) <= registered_before
         ]
+    if event is not None:
+        filtered = await filter_event_project_nicknames(filtered, event)
     return filtered
 
 
-async def build_mentions_for_nicknames(nicknames: list) -> str:
+async def build_mentions_for_nicknames(nicknames: list, event: dict = None) -> str:
     """Строит через пробел Discord-упоминания игроков по их позывным
     (запасной вариант — жирный текст ника, если пользователь Discord не найден)."""
     mentions = []
     for nickname in nicknames:
         member = await find_member_by_nickname(nickname)
+        if event is not None and not member_has_event_project_role(member, event):
+            continue
         mentions.append(member.mention if member else f"**{nickname}**")
     return " ".join(mentions)
 
 
-async def get_all_active_members_mentions(target_date: datetime) -> str:
+async def get_all_active_members_mentions(target_date: datetime, event: dict = None) -> str:
     """Упоминания ВСЕХ действующих бойцов клана (composition из
     ACTIVE_CLAN_COMPOSITIONS), которые НЕ в отпуске НА УКАЗАННУЮ ДАТУ.
     Используется везде, где раньше пинговалась роль 'Боец ArmA' целиком —
@@ -2458,8 +2535,9 @@ async def get_all_active_members_mentions(target_date: datetime) -> str:
     боец, уходящий в отпуск до старта, получит анонс мероприятия, на котором
     его заведомо не будет, — а тот, кто к старту уже вернётся, анонс
     не получит вовсе."""
-    active_members = await get_active_members(target_date)
-    return await build_mentions_for_nicknames(active_members)
+    active_members = await get_active_members(target_date, event=event)
+    return await build_mentions_for_nicknames(active_members, event=event)
+
 
 
 async def get_vacation_role(guild):
@@ -2725,24 +2803,38 @@ SERVER_INTRO_LINKS = [
 ]
 
 
-async def process_self_assign_selection(interaction: discord.Interaction, selected_values):
-    """Общая логика выдачи/снятия гостевых ролей по выбору в меню."""
+async def process_self_assign_selection(interaction: discord.Interaction, selected_values,
+                                        role_choices=None, require_clan_member=False,
+                                        selection_context="самостоятельный выбор роли"):
+    """Единая логика самостоятельной выдачи/снятия ролей в существующих меню.
+    По умолчанию сохраняет прежнее поведение гостевого меню; для меню проектов
+    получает соответствующий список ролей и проверяет членство в ArmA."""
     await interaction.response.defer(ephemeral=True, thinking=True)
     selected_ids = {int(v) for v in selected_values}
     member = interaction.user
     guild = interaction.guild
+    role_choices = role_choices if role_choices is not None else SELF_ASSIGN_ROLES
 
-    # Роль 'Клан ArmA' автоматически есть у всех, чей состав "Запас" или выше,
-    # поэтому её наличие надёжно говорит "этот человек уже в клане".
+    if require_clan_member and not member_has_klan_arma_role(member):
+        await interaction.followup.send(
+            es("⛔ Выбор проектных ролей доступен только бойцам составов «Запас» и «Личный состав» ArmA."),
+            ephemeral=True
+        )
+        return
+
+    # Роль 'Клан ArmA' автоматически есть у действующих бойцов 'Запаса' и
+    # 'Личного состава'. Ограничение гостевой роли сохраняем без изменений.
     guest_role_id = ROLE_IDS.get('gost_arma')
-    klan_arma_role = guild.get_role(ROLE_IDS['klan_arma']) if ROLE_IDS.get('klan_arma') else None
+    klan_arma_role = guild.get_role(ROLE_IDS['klan_arma']) if guild and ROLE_IDS.get('klan_arma') else None
     is_already_clan_member = bool(klan_arma_role and klan_arma_role in member.roles)
-    blocked_guest_attempt = bool(guest_role_id and is_already_clan_member and guest_role_id in selected_ids)
+    choice_role_ids = {role_id for role_id, _ in role_choices}
+    blocked_guest_attempt = bool(guest_role_id and guest_role_id in choice_role_ids
+                                 and is_already_clan_member and guest_role_id in selected_ids)
     if blocked_guest_attempt:
         selected_ids.discard(guest_role_id)
 
     to_add, to_remove = [], []
-    for role_id, name in SELF_ASSIGN_ROLES:
+    for role_id, name in role_choices:
         role = guild.get_role(role_id)
         if not role:
             continue
@@ -2754,9 +2846,9 @@ async def process_self_assign_selection(interaction: discord.Interaction, select
             to_remove.append(role)
     try:
         if to_add:
-            await member.add_roles(*to_add, reason="Самостоятельный выбор гостевой роли")
+            await member.add_roles(*to_add, reason=f"{selection_context}: выдача ролей")
         if to_remove:
-            await member.remove_roles(*to_remove, reason="Самостоятельный отказ от гостевой роли")
+            await member.remove_roles(*to_remove, reason=f"{selection_context}: снятие ролей")
     except Exception as e:
         await interaction.followup.send(f"❌ Ошибка изменения ролей: {e}", ephemeral=True)
         return
@@ -3907,6 +3999,11 @@ VACATION_MARK_NOTICE = (
 def build_personal_mark_status_text(event: dict, nickname: str) -> str:
     """Персональный статус отметки конкретного бойца на мероприятии —
     базовая часть ответа кнопки '📋 Отметки', доступная всем без исключения."""
+    project_role_key = get_event_project_role_key(event)
+    if project_role_key:
+        member = member_index.get_exact(nickname) or member_index.get_fuzzy(nickname)
+        if not member_has_event_project_role(member, event):
+            return get_event_project_role_requirement_message(event)
     if nickname in (event.get('accepted') or {}):
         return es("✅ Вы отметились: **Приду**")
     if nickname in (event.get('declined') or {}):
@@ -3963,7 +4060,6 @@ class ConfirmDeleteView(discord.ui.View):
     async def cancel(self, interaction, button):
         await interaction.response.send_message(es("🚫 Удаление отменено."), ephemeral=True)
 
-
 class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление для скачивания модов")):
     server_name = discord.ui.TextInput(label="Название сервера (необязательно)", required=False, max_length=100)
     server_ip = discord.ui.TextInput(label="IP-адрес сервера (необязательно)", required=False, max_length=100)
@@ -3995,15 +4091,15 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление д
             # боец, уходящий в отпуск до старта, получал бы объявление о модах
             # для мероприятия, на котором его заведомо не будет, а тот, кто
             # к старту уже вернётся, — не получал бы его вовсе.
-            mention_block = await get_all_active_members_mentions(event_start)
+            mention_block = await get_all_active_members_mentions(event_start, event=event)
         else:
             # По умолчанию — только тем, кто отметился "Приду"
-            accepted = list(event.get('accepted', {}).keys())
+            accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
             if accepted:
-                mention_block = await build_mentions_for_nicknames(accepted)
+                mention_block = await build_mentions_for_nicknames(accepted, event=event)
             else:
                 # Никто ещё не отметился — тегаем всех активных, кто не в отпуске
-                mention_block = await get_all_active_members_mentions(event_start)
+                mention_block = await get_all_active_members_mentions(event_start, event=event)
 
         server_name = self.server_name.value.strip()
         server_ip = self.server_ip.value.strip()
@@ -4023,7 +4119,6 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление д
         # триггеров раскрытия списка отметок для всех.
         await reveal_event_marks(self.event_id, 'mods_announcement')
         await interaction.response.send_message(es("✅ Объявление для скачивания модов отправлено!"), ephemeral=True)
-
 
 # --- Фабрики кнопок ---
 
@@ -4084,9 +4179,11 @@ async def build_marks_report_embed(event_id: str):
 
     event_start_dt = datetime.fromtimestamp(event['start_time'], MSK)
     vacation_set = build_vacation_set_for_date(load_json(VACATIONS_FILE, {}), event_start_dt)
-    active_members = await get_active_members(event_start_dt, registered_before=event_start_dt, vacation_set=vacation_set)
-    accepted = list(event.get('accepted', {}).keys())
-    declined = list(event.get('declined', {}).keys())
+    active_members = await get_active_members(
+        event_start_dt, registered_before=event_start_dt, vacation_set=vacation_set, event=event
+    )
+    accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
+    declined = await filter_event_project_nicknames(event.get('declined', {}).keys(), event)
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
 
     embed = discord.Embed(title=es(f"📋 Отметки: {build_display_title(event)}"), color=discord.Color.blurple())
@@ -4934,7 +5031,17 @@ async def sync_arma_member_state(uid: str, data: dict):
     desired_keys, guest_action = result
 
     desired_role_ids = {ROLE_IDS[k] for k in desired_keys if ROLE_IDS.get(k)}
-    managed_role_ids = {ROLE_IDS[k] for k in ARMA_MANAGED_ROLE_KEYS if ROLE_IDS.get(k)}
+    managed_role_keys = set(ARMA_MANAGED_ROLE_KEYS)
+    # Проектные роли выбираются игроком самостоятельно: не трогаем их
+    # при обычной синхронизации активного состава, но снимаем при 'Отставке'
+    # и при достижении порога 3 замечания + 3 выговора.
+    is_expelled_by_discipline = (
+        active_warnings >= MAX_ACTIVE_WARNINGS
+        and active_reprimands >= MAX_ACTIVE_REPRIMANDS
+    )
+    if composition == 'Отставка' or is_expelled_by_discipline:
+        managed_role_keys.update(PROJECT_ROLE_KEYS)
+    managed_role_ids = {ROLE_IDS[k] for k in managed_role_keys if ROLE_IDS.get(k)}
     current_managed_roles = {r for r in member.roles if r.id in managed_role_ids}
     desired_roles = {guild.get_role(rid) for rid in desired_role_ids}
     desired_roles.discard(None)
@@ -5897,7 +6004,12 @@ async def apply_false_acceptance_punishments(wizard, thread):
     """Выносит дисциплинарные взыскания бойцам, отмеченным на финальном шаге
     мастера явки как 'поставил Приду, но не пришёл и не предупредил'."""
     any_expelled = False
+    event = load_json(EVENTS_FILE, {}).get(wizard.event_id, {})
     for nickname in (wizard.false_acceptance_punish or []):
+        member = await find_member_by_nickname(nickname)
+        if not member_has_event_project_role(member, event):
+            print(f"ℹ️ Взыскание за ложную отметку для '{nickname}' пропущено: нет проектной роли.")
+            continue
         uid = await get_uid_by_nickname(nickname)
         if not uid:
             print(f"⚠️ Не удалось найти uid для '{nickname}' — взыскание за ложную отметку не вынесено")
@@ -5982,7 +6094,9 @@ async def process_inactivity_discipline_for_event(event_id):
     # закончился; бот перезапустился, recover_incomplete_discipline
     # доработала событие уже «сегодняшней» датой — и боец получил взыскание
     # за мероприятие, на котором отсутствовал законно.
-    active_members = await get_active_members(event_start_dt, registered_before=event_start_dt)
+    active_members = await get_active_members(
+        event_start_dt, registered_before=event_start_dt, event=event
+    )
 
     accepted = set(event.get('accepted', {}).keys())
     declined = set(event.get('declined', {}).keys())
@@ -6536,7 +6650,6 @@ class AttendanceStepView(discord.ui.View):
         await interaction.response.defer()
         await show_commander_step(interaction, self.wizard)
 
-
 async def start_attendance_wizard(interaction, event_id):
     events = load_json(EVENTS_FILE, {})
     event = events.get(event_id)
@@ -6552,8 +6665,11 @@ async def start_attendance_wizard(interaction, event_id):
     # нажатия кнопки), физически отсутствовал в селекте: его нельзя было
     # отметить, он не получал отыгрыш и не мог быть назначен командиром.
     clan_members = await load_clan_members_from_firebase()
+    clan_members = await filter_event_project_nicknames(clan_members, event)
     if not clan_members:
-        await interaction.response.send_message(es("❌ Список клана пуст!"), ephemeral=True)
+        await interaction.response.send_message(
+            es("❌ Нет бойцов с соответствующей проектной ролью для этого мероприятия."), ephemeral=True
+        )
         return
 
     attendance = load_json(ATTENDANCE_FILE, {})
@@ -6572,7 +6688,6 @@ async def start_attendance_wizard(interaction, event_id):
         title_text = warning_prefix + es(f"👥 **{event.get('title', '')}**\n\n") + es(f"**Матч 1** из {num_games}\nВыберите явившихся:")
     await interaction.response.send_message(title_text, view=view, ephemeral=True)
 
-
 async def show_commander_step(interaction, wizard):
     key = "overall" if wizard.num_games == 0 else wizard.current_step
     present_players = wizard.data.get(key, [])
@@ -6586,8 +6701,10 @@ async def show_commander_step(interaction, wizard):
     await interaction.followup.send(title_text, view=view, ephemeral=True)
 
 async def proceed_to_next_step(interaction, wizard):
-    # Полный состав, без фильтра по отпускам — см. коммент в start_attendance_wizard.
+    # Полный состав без фильтра по отпускам, но с проектной ролью мероприятия.
     clan_members = await load_clan_members_from_firebase()
+    event = load_json(EVENTS_FILE, {}).get(wizard.event_id, {})
+    clan_members = await filter_event_project_nicknames(clan_members, event)
     
     if wizard.num_games == 0:
         await show_false_acceptance_step(interaction, wizard)
@@ -6611,7 +6728,9 @@ async def show_false_acceptance_step(interaction, wizard):
     таких бойцов нет — шаг автоматически пропускается."""
     events = load_json(EVENTS_FILE, {})
     event = events.get(wizard.event_id, {})
-    accepted = set(event.get('accepted', {}).keys())
+    accepted = set(await filter_event_project_nicknames(
+        event.get('accepted', {}).keys(), event
+    ))
 
     all_present = set()
     for players, _, _ in _extract_game_triples_from_wizard(wizard):
@@ -6913,8 +7032,8 @@ async def ensure_vacation_rules_message():
 def build_office_embed():
     embed = discord.Embed(
         title=es("🛠️ Панель бота для бойцов клана"),
-        description=es("Здесь собраны полезные ссылки на сайт клана, а также возможность "
-                        "самостоятельно создать мероприятие."),
+        description=es("Здесь собраны полезные ссылки на сайт клана, а также можно "
+                        "самостоятельно создать мероприятие и выбрать проектные роли ArmA."),
         color=discord.Color.blue()
     )
     return embed
@@ -6955,6 +7074,26 @@ class OfficeMenuView(discord.ui.View):
         create_btn.callback = self._create_event_callback
         self.add_item(create_btn)
 
+        # Проектные роли доступны только действующим бойцам ArmA.
+        project_roles_select = discord.ui.Select(
+            placeholder="🎮 Выберите проекты, на которых хотите играть...",
+            options=[discord.SelectOption(label=name, value=str(role_id))
+                     for role_id, name in PROJECT_ROLE_OPTIONS],
+            min_values=0, max_values=len(PROJECT_ROLE_OPTIONS),
+            custom_id="office_project_roles_select", row=4
+        )
+
+        async def _project_roles_callback(interaction: discord.Interaction):
+            await process_self_assign_selection(
+                interaction, project_roles_select.values,
+                role_choices=PROJECT_ROLE_OPTIONS,
+                require_clan_member=True,
+                selection_context="Самостоятельный выбор проектных ролей ArmA"
+            )
+
+        project_roles_select.callback = _project_roles_callback
+        self.add_item(project_roles_select)
+
     async def _vacation_link_callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(
             es(f"🏖️ Оформить отпуск можно здесь: {VACATION_RULES_MESSAGE_LINK}"), ephemeral=True
@@ -6970,6 +7109,7 @@ class OfficeMenuView(discord.ui.View):
         await interaction.response.send_message(
             es("📅 Выберите картинку для мероприятия и нажмите Далее:"), view=view, ephemeral=True
         )
+
 
 
 async def ensure_office_message():
@@ -7643,6 +7783,11 @@ async def handle_event_response(interaction, event_id, response_type):
         await interaction.followup.send(es("⛔ Мероприятие отменено или уже завершено. Отметки не принимаются!"), ephemeral=True)
         return
     nickname = interaction.user.display_name
+    if not member_has_event_project_role(interaction.user, event):
+        await interaction.followup.send(
+            get_event_project_role_requirement_message(event), ephemeral=True
+        )
+        return
     current_date = datetime.now(MSK)
     event_start = datetime.fromtimestamp(event['start_time'], MSK)
     event_end = datetime.fromtimestamp(event['end_time'], MSK)
@@ -8057,10 +8202,11 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     # не должен получать пинги и взыскания за это мероприятие.
     vacation_set = build_vacation_set_for_date(load_json(VACATIONS_FILE, {}), event_start_dt)
 
-    active_members = await get_active_members(event_start_dt, registered_before=event_start_dt, vacation_set=vacation_set)
-
-    accepted = list(event.get('accepted', {}).keys())
-    declined = list(event.get('declined', {}).keys())
+    active_members = await get_active_members(
+        event_start_dt, registered_before=event_start_dt, vacation_set=vacation_set, event=event
+    )
+    accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
+    declined = await filter_event_project_nicknames(event.get('declined', {}).keys(), event)
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
 
     status = event.get('status', 'active')
@@ -8290,7 +8436,7 @@ async def create_event(title, description, start_time, end_time, image_key='none
         # вернётся из отпуска, — получит. Это же согласует состав анонса
         # со списком «Не отметились» в embed, который тоже считается
         # по event_start_dt.
-        mention_block = await get_all_active_members_mentions(start_time)
+        mention_block = await get_all_active_members_mentions(start_time, event=events[event_id])
         announcement_msg = await thread.send(render_announcement_message(mention_block))
         record_thread_message(events[event_id], announcement_msg.id, 'announcement', mention_block=mention_block)
 
@@ -8477,14 +8623,14 @@ async def check_event_reminders():
                         # Шлём только если до подачи списка ровно столько дней, сколько
                         # написано в тексте ("завтра/послезавтра" и т.п.) — иначе пропускаем.
                         if days_to_deadline == expected_days:
-                            active_members = await get_active_members(event_start, registered_before=event_start)
+                            active_members = await get_active_members(event_start, registered_before=event_start, event=event)
                             accepted = set(event.get('accepted', {}).keys())
                             declined = set(event.get('declined', {}).keys())
                             unmarked = [m for m in active_members if m not in accepted and m not in declined]
                             if unmarked:
                                 thread = await get_or_create_thread(event, event_id, event['title'])
                                 if thread:
-                                    mention_block = await build_mentions_for_nicknames(unmarked)
+                                    mention_block = await build_mentions_for_nicknames(unmarked, event=event)
                                     msg = await thread.send(render_list_reminder_message(mention_block, event, stage))
                                     record_thread_message(
                                         event, msg.id,
@@ -8509,15 +8655,15 @@ async def check_event_reminders():
                         if event_created_late(event):
                             # Мероприятие создано менее чем за сутки — тегаем ТОЛЬКО тех,
                             # кто ещё не отметился, и кто не в отпуске.
-                            active_members = await get_active_members(event_start, registered_before=event_start)
+                            active_members = await get_active_members(event_start, registered_before=event_start, event=event)
                             accepted_keys = set(event.get('accepted', {}).keys())
                             declined_keys = set(event.get('declined', {}).keys())
                             unmarked = [m for m in active_members if m not in accepted_keys and m not in declined_keys]
-                            mention_block = await build_mentions_for_nicknames(unmarked)
+                            mention_block = await build_mentions_for_nicknames(unmarked, event=event)
                             should_send = bool(unmarked)
                         else:
-                            accepted = list(event.get('accepted', {}).keys())
-                            mention_block = await build_mentions_for_nicknames(accepted)
+                            accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
+                            mention_block = await build_mentions_for_nicknames(accepted, event=event)
                             should_send = bool(accepted)
                         if should_send:
                             msg = await thread.send(render_reminder_15min_message(mention_block, event))
@@ -8658,6 +8804,13 @@ def event_has_other_acceptors(event: dict) -> bool:
     """True, если на мероприятие отметился «Приду» хотя бы один человек, кроме
     ответственного (создателя) — если он у мероприятия есть."""
     accepted = set((event.get('accepted') or {}).keys())
+    if get_event_project_role_key(event):
+        accepted = {
+            nickname for nickname in accepted
+            if member_has_event_project_role(
+                member_index.get_exact(nickname) or member_index.get_fuzzy(nickname), event
+            )
+        }
     creator_id = event.get('created_by_discord_id')
     if creator_id is not None and member_index.guild:
         creator = member_index.guild.get_member(creator_id)
@@ -9191,9 +9344,11 @@ def member_has_klan_arma_role(member) -> bool:
 
 
 async def setup_office_channel(guild):
-    """Создаёт (при первом запуске) текстовый канал '🔵канцелярия-arma' в
-    категории OFFICE_CATEGORY_ID, доступный только составу 'Запас' и выше
-    (по роли 'Клан ArmA'), и располагает его сразу после канала отпусков."""
+    """Находит существующую канцелярию по ID (или создаёт канал, если его нет)
+    в категории OFFICE_CATEGORY_ID. Доступен составу 'Запас' и выше."""
+    existing = guild.get_channel(OFFICE_PANEL_CHANNEL_ID)
+    if existing:
+        return existing
     category = guild.get_channel(OFFICE_CATEGORY_ID)
     if not category:
         print(f"⚠️ Категория {OFFICE_CATEGORY_ID} не найдена — канал '{OFFICE_CHANNEL_NAME}' не создан")
@@ -9235,7 +9390,7 @@ async def setup_office_channel(guild):
 
 # ============== ПРИНУДИТЕЛЬНО "ТОЛЬКО ЧТЕНИЕ" ДЛЯ КОНКРЕТНОГО КАНАЛА ==============
 
-READ_ONLY_CHANNEL_ID = 1553932674622693528
+READ_ONLY_CHANNEL_ID = OFFICE_PANEL_CHANNEL_ID
 READ_ONLY_CHANNEL_WRITER_ROLE_IDS = {1252277370711441429, 1470351490005729383}  # Комбат ArmA, Зам. комбата ArmA
 
 
@@ -9604,6 +9759,17 @@ async def on_member_update(before: discord.Member, after: discord.Member):
     if before.display_name != after.display_name:
         member_index.remove(before)
     member_index.upsert(after)
+
+    project_role_ids = {ROLE_IDS[key] for key in PROJECT_ROLE_KEYS if ROLE_IDS.get(key)}
+    before_role_ids = {role.id for role in before.roles}
+    after_role_ids = {role.id for role in after.roles}
+    if project_role_ids.intersection(before_role_ids ^ after_role_ids):
+        # После смены проектной роли актуализируем списки «Придут / Не придут /
+        # Не отметились» во всех активных мероприятиях.
+        try:
+            await refresh_all_active_event_embeds()
+        except Exception as e:
+            print(f"⚠️ Не удалось обновить мероприятия после изменения проектной роли {after.display_name}: {e}")
 
 
 async def _delayed_cleanup_temp_room(channel_id: int):
