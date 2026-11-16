@@ -7050,7 +7050,7 @@ class OfficeMenuView(discord.ui.LayoutView):
         # Выбор проектных ролей: тот же callback и та же общая функция,
         # которые уже используются для выдачи/снятия остальных ролей.
         project_roles_select = discord.ui.Select(
-            placeholder="Выберите проекты, на которых хотите играть...",
+            placeholder="Роли для проектов (чтобы снять - уберите галочку)",
             options=[
                 discord.SelectOption(label=name, value=str(role_id))
                 for role_id, name in PROJECT_ROLE_OPTIONS
@@ -7098,7 +7098,7 @@ class OfficeMenuView(discord.ui.LayoutView):
 
         children = [
             discord.ui.TextDisplay(
-                "## 🛠️ Панель бота для бойцов клана\n"
+                "## 🛠️  Панель бота для бойцов клана\n"
                 "Здесь есть полезные ссылки на сайте клана, а также можно "
                 "самостоятельно создать мероприятие или выбрать проекты, "
                 "на которых вы хотите играть."
