@@ -7029,111 +7029,193 @@ async def ensure_vacation_rules_message():
         print(f"⚠️ Не удалось обновить сообщение с правилами отпусков: {e}")
 
 
-def build_office_embed():
-    embed = discord.Embed(
-        title=es("🛠️ Панель бота для бойцов клана"),
-        description=es("Здесь есть полезные ссылки на сайте клана, а также можно "
-                        "самостоятельно создать мероприятие или выбрать проекты, на "
-                        "которых вы хотите играть."),
-        color=discord.Color.blue()
-    )
-    return embed
-
-
 # Прямая ссылка на якорное сообщение с правилами отпусков и кнопкой
-# "Оформить отпуск" (VACATION_CHANNEL_ID). Если сообщение будет пересоздано
-# (например, вручную удалено администрацией) — ID в этой ссылке придётся
-# обновить тоже; автоматически подхватить новый ID сюда нельзя, так как
-# discord.ui.Button(style=link) требует готовый URL на этапе создания View,
-# а не динамический lookup при каждом рендере.
+# "Оформить отпуск" (VACATION_CHANNEL_ID). Если сообщение будет пересоздано,
+# ID в ссылке потребуется обновить.
 VACATION_RULES_MESSAGE_LINK = (
     f"https://discord.com/channels/734494109032513699/{VACATION_CHANNEL_ID}/1536512525535944726"
 )
 
 
-class OfficeMenuView(discord.ui.View):
+class OfficeMenuView(discord.ui.LayoutView):
+    """Единая панель канцелярии на Components V2.
+
+    Описание, выбор проектных ролей, полезные ссылки и кнопки действий
+    находятся внутри одного Container. Выпадающий список расположен
+    сразу под описанием и выше всех кнопок.
+    """
     def __init__(self):
         super().__init__(timeout=None)
-        for label, url, row in OFFICE_SITE_LINKS:
-            self.add_item(discord.ui.Button(label=es(label), style=discord.ButtonStyle.link, url=url, row=row))
 
-        # Не link-кнопка — Discord делает ЛЮБУЮ кнопку-ссылку всегда серой
-        # (ограничение самого Discord API, не discord.py), поэтому для
-        # цветной кнопки используется обычный custom_id-обработчик, который
-        # эфемерно присылает ссылку на якорное сообщение с отпуском.
-        vacation_btn = discord.ui.Button(
-            label=es("🏖️ Оформление отпуска"),
-            style=discord.ButtonStyle.primary, custom_id="office_vacation_link", row=3
-        )
-        vacation_btn.callback = self._vacation_link_callback
-        self.add_item(vacation_btn)
-
-        create_btn = discord.ui.Button(
-            label=es("📅 Создание мероприятия"),
-            style=discord.ButtonStyle.success, custom_id="office_create_event", row=3
-        )
-        create_btn.callback = self._create_event_callback
-        self.add_item(create_btn)
-
-        # Проектные роли доступны только действующим бойцам ArmA.
+        # Выбор проектных ролей: тот же callback и та же общая функция,
+        # которые уже используются для выдачи/снятия остальных ролей.
         project_roles_select = discord.ui.Select(
-            placeholder="Роли для проектов (чтобы снять - уберите галочку)",
-            options=[discord.SelectOption(label=name, value=str(role_id))
-                     for role_id, name in PROJECT_ROLE_OPTIONS],
-            min_values=0, max_values=len(PROJECT_ROLE_OPTIONS),
-            custom_id="office_project_roles_select", row=4
+            placeholder="Выберите проекты, на которых хотите играть...",
+            options=[
+                discord.SelectOption(label=name, value=str(role_id))
+                for role_id, name in PROJECT_ROLE_OPTIONS
+            ],
+            min_values=0,
+            max_values=len(PROJECT_ROLE_OPTIONS),
+            custom_id="office_project_roles_select"
         )
 
         async def _project_roles_callback(interaction: discord.Interaction):
             await process_self_assign_selection(
-                interaction, project_roles_select.values,
+                interaction,
+                project_roles_select.values,
                 role_choices=PROJECT_ROLE_OPTIONS,
                 require_clan_member=True,
                 selection_context="Самостоятельный выбор проектных ролей ArmA"
             )
 
         project_roles_select.callback = _project_roles_callback
-        self.add_item(project_roles_select)
+
+        # Ссылки остаются обычными link-кнопками Discord, но теперь находятся
+        # в том же визуальном контейнере, сразу после выбора проектов.
+        site_link_buttons = [
+            discord.ui.Button(
+                label=es(label),
+                style=discord.ButtonStyle.link,
+                url=url
+            )
+            for label, url, _row in OFFICE_SITE_LINKS
+        ]
+
+        vacation_btn = discord.ui.Button(
+            label=es("🏖️ Оформление отпуска"),
+            style=discord.ButtonStyle.primary,
+            custom_id="office_vacation_link"
+        )
+        vacation_btn.callback = self._vacation_link_callback
+
+        create_btn = discord.ui.Button(
+            label=es("📅 Создание мероприятия"),
+            style=discord.ButtonStyle.success,
+            custom_id="office_create_event"
+        )
+        create_btn.callback = self._create_event_callback
+
+        children = [
+            discord.ui.TextDisplay(
+                "## 🛠️ Панель бота для бойцов клана\n"
+                "Здесь есть полезные ссылки на сайте клана, а также можно "
+                "самостоятельно создать мероприятие или выбрать проекты, "
+                "на которых вы хотите играть."
+            ),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
+            discord.ui.TextDisplay(
+                "### Выбор проектов\n"
+                "Отметьте проекты, на которых вы хотите играть. "
+                "Чтобы отказаться от игр на проекте, уберите соответствующую отметку."
+            ),
+            discord.ui.ActionRow(project_roles_select),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
+            discord.ui.TextDisplay("### Полезные ссылки"),
+            discord.ui.ActionRow(*site_link_buttons),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            discord.ui.ActionRow(vacation_btn, create_btn),
+        ]
+        self.add_item(discord.ui.Container(*children, accent_color=9881319))
 
     async def _vacation_link_callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(
-            es(f"🏖️ Оформить отпуск можно здесь: {VACATION_RULES_MESSAGE_LINK}"), ephemeral=True
+            es(f"🏖️ Оформить отпуск можно здесь: {VACATION_RULES_MESSAGE_LINK}"),
+            ephemeral=True
         )
 
     async def _create_event_callback(self, interaction: discord.Interaction):
         if not member_has_klan_arma_role(interaction.user):
             await interaction.response.send_message(
-                es("⛔ Создание мероприятий доступно только бойцам состава 'Запас' и выше!"), ephemeral=True
+                es("⛔ Создание мероприятий доступно только бойцам состава 'Запас' и выше!"),
+                ephemeral=True
             )
             return
         view = EventSetupView(player_mode=True, created_by_discord_id=interaction.user.id)
         await interaction.response.send_message(
-            es("📅 Выберите картинку для мероприятия и нажмите Далее:"), view=view, ephemeral=True
+            es("📅 Выберите картинку для мероприятия и нажмите Далее:"),
+            view=view,
+            ephemeral=True
         )
 
 
-
 async def ensure_office_message():
-    """Находит (или создаёт при первом запуске) постоянное сообщение
-    с меню канцелярии — по аналогии с якорными сообщениями админ-канала."""
+    """Находит и обновляет постоянную панель канцелярии в Components V2.
+
+    Сначала обновляет существующее сообщение на месте: старый Embed/content
+    очищается, а LayoutView становится содержимым того же сообщения. Это
+    сохраняет его ID и закрепление. Если Discord не принимает преобразование,
+    старое сообщение удаляется и панель публикуется заново.
+    """
     guild = member_index.guild
     if not guild:
         return
     channel = await setup_office_channel(guild)
     if not channel:
         return
+
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
-    msg, _ = await _find_or_create_anchor(
-        channel, es("🛠️ Панель бота для бойцов клана"), build_office_embed,
-        thread_name=None, view=OfficeMenuView(),
-        saved_message_id=anchors.get('office_message_id')
-    )
+    saved_id = anchors.get('office_message_id')
+    message = None
+
+    if saved_id:
+        try:
+            message = await channel.fetch_message(saved_id)
+        except discord.NotFound:
+            message = None
+        except Exception as e:
+            print(f"⚠️ Не удалось найти сохранённую панель канцелярии: {e}")
+            return
+
+    # Если ID якоря отсутствует/устарел, ищем прежнюю панель по заголовку.
+    if message is None:
+        try:
+            async for old_message in channel.history(limit=100):
+                if old_message.author.id != client.user.id:
+                    continue
+                if old_message.embeds and old_message.embeds[0].title == es("🛠️ Панель бота для бойцов клана"):
+                    message = old_message
+                    break
+        except Exception as e:
+            print(f"⚠️ Не удалось просканировать историю канцелярии: {e}")
+
+    # Discord позволяет преобразовать старое Embed-сообщение в Components V2,
+    # если при редактировании явно очистить content, embeds и attachments.
+    # Обновляем на месте, чтобы не менять ссылку/ID и не снимать закрепление.
+    if message is not None:
+        try:
+            await message.edit(
+                content=None,
+                embed=None,
+                embeds=[],
+                attachments=[],
+                view=OfficeMenuView(),
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            anchors['office_message_id'] = message.id
+            save_json(ADMIN_ANCHORS_FILE, anchors)
+            print(f"✅ Панель канцелярии обновлена в Components V2 (ID: {message.id})")
+            return
+        except Exception as e:
+            print(f"⚠️ Не удалось преобразовать существующую панель в Components V2: {e}")
+            try:
+                await message.delete()
+            except Exception as delete_error:
+                print(f"❌ Не удалось удалить старую панель канцелярии: {delete_error}")
+                return
+
     try:
-        await msg.edit(embed=build_office_embed(), view=OfficeMenuView())
+        message = await channel.send(
+            view=OfficeMenuView(),
+            allowed_mentions=discord.AllowedMentions.none()
+        )
     except Exception as e:
-        print(f"⚠️ Не удалось обновить сообщение канцелярии: {e}")
-    anchors['office_message_id'] = msg.id
+        print(f"❌ Не удалось опубликовать панель канцелярии Components V2: {e}")
+        return
+
+    anchors['office_message_id'] = message.id
     save_json(ADMIN_ANCHORS_FILE, anchors)
+    print(f"✅ Панель канцелярии опубликована в Components V2 (ID: {message.id})")
 
 
 async def publish_vacation_info(interaction):
