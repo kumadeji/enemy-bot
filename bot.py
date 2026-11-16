@@ -7032,8 +7032,9 @@ async def ensure_vacation_rules_message():
 def build_office_embed():
     embed = discord.Embed(
         title=es("🛠️ Панель бота для бойцов клана"),
-        description=es("Здесь собраны полезные ссылки на сайт клана, а также можно "
-                        "самостоятельно создать мероприятие и выбрать проектные роли ArmA."),
+        description=es("Здесь есть полезные ссылки на сайте клана, а также можно "
+                        "самостоятельно создать мероприятие или выбрать проекты, на "
+                        "которых вы хотите играть."),
         color=discord.Color.blue()
     )
     return embed
@@ -7076,7 +7077,7 @@ class OfficeMenuView(discord.ui.View):
 
         # Проектные роли доступны только действующим бойцам ArmA.
         project_roles_select = discord.ui.Select(
-            placeholder="🎮 Выберите проекты, на которых хотите играть...",
+            placeholder="Роли для проектов (чтобы снять - уберите галочку)",
             options=[discord.SelectOption(label=name, value=str(role_id))
                      for role_id, name in PROJECT_ROLE_OPTIONS],
             min_values=0, max_values=len(PROJECT_ROLE_OPTIONS),
