@@ -8647,24 +8647,18 @@ async def publish_weekly_kickoff_announcement(week_key: str) -> bool:
             channel = await client.fetch_channel(EVENTS_CHANNEL_ID)
 
             embed = discord.Embed(
-                title="🌅 Новая неделя в клане ENEMY",
+                title="🪖 Новая неделя в клане!",
                 description=(
                     "Бойцы, началась новая неделя! Впереди тренировки, матчи и общие задачи. "
-                    "Загляните в расписание, заранее отметьтесь на мероприятиях и спланируйте время."
+                    "Заранее отметьтесь на мероприятиях и спланируйте время."
                 ),
                 color=discord.Color.blue(),
             )
             embed.add_field(
-                name="📅 План на неделю",
-                value=f"{week_start:%d.%m.%Y} — {week_end:%d.%m.%Y}",
-                inline=False,
-            )
-            embed.add_field(
-                name="💬 Настрой недели",
+                name="💬 Памятка",
                 value=f"*{random.choice(WEEKLY_KICKOFF_MOTIVATION_LINES)}*",
                 inline=False,
             )
-            embed.set_footer(text="Увидимся на серверах. ENEMY — сила в команде!")
 
             message = await channel.send(
                 embed=embed,
