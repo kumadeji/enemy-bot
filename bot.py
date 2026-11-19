@@ -646,6 +646,9 @@ ROLE_IDS = {
     'project_echo': 1571912196106223686,               # "Проект ECHO в ArmA"
     'project_as_vdv': 1571912244013301881,             # "Проект AS VDV в ArmA"
     'project_triad_tactics': 1571912290452902008,      # "Проект Triad Tactics в ArmA"
+    'voice_dayz': 908462339089641522,                  # Доступ к голосовым комнатам DayZ
+    'voice_wow': 1557399397753557033,                   # Доступ к голосовым комнатам WoW
+    'voice_squad': 908461959794532404,                  # Доступ к голосовым комнатам SQUAD
 }
     # Роли специализаций (миномётчик/БТВ/пилот/КО и т.д.) удалены из реестра —
     # соответствующие роли в Discord больше не существуют.
@@ -855,6 +858,7 @@ def compute_desired_nickname(composition: str, callsign: str):
     return None
 
 VOICE_CHANNEL_ID = 1284893513921728582
+VOICE_PUBLIC_CHANNEL_ID = 1284896715551408159
 
 VOICE_ROOM_CATEGORY_ARMY = 1284893244878098464
 VOICE_ROOM_CATEGORY_PUBLIC = 1116656512677445693
@@ -862,19 +866,18 @@ VOICE_ROOM_CATEGORY_DAYZ = 908305448552251392
 VOICE_ROOM_CATEGORY_WOW = 1572603025695047791
 VOICE_ROOM_CATEGORY_SQUAD = 908009506657697842
 
-# Конфигурация триггер-каналов "Создать голосовую комнату" по категориям.
-# mode определяет права ТОЛЬКО при первом создании триггер-канала ботом
-# (если канал уже существует — бот его права не трогает, их можно настраивать
-# вручную; временные комнаты наследуют права именно от него).
+# Конфигурация категорий временных голосовых комнат.
+# role_key=None означает открытый доступ всем участникам сервера;
+# в остальных случаях видимость и подключение разрешены только указанной роли.
 VOICE_TRIGGER_CONFIGS = [
-    {'key': 'army',   'category_id': VOICE_ROOM_CATEGORY_ARMY,   'name': "🔵 Создать ГК ArmA", 'mode': 'copy_reference'},
-    {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать ГК в сообществе", 'mode': 'open'},
-    {'key': 'dayz',   'category_id': VOICE_ROOM_CATEGORY_DAYZ,   'name': "🧟 Создать ГК DayZ", 'mode': 'open'},
-    {'key': 'wow',   'category_id': VOICE_ROOM_CATEGORY_WOW,   'name': "🧌 Создать ГК WoW", 'mode': 'open'},
-    {'key': 'squad',  'category_id': VOICE_ROOM_CATEGORY_SQUAD,  'name': "🪖 Создать ГК SQUAD", 'mode': 'open'},
+    {'key': 'army',   'category_id': VOICE_ROOM_CATEGORY_ARMY,   'name': "🔵 Создать ГК ArmA",          'role_key': 'klan_arma'},
+    {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать ГК В сообществе", 'role_key': None},
+    {'key': 'dayz',   'category_id': VOICE_ROOM_CATEGORY_DAYZ,   'name': "🧟 Создать ГК DayZ",          'role_key': 'voice_dayz'},
+    {'key': 'wow',    'category_id': VOICE_ROOM_CATEGORY_WOW,    'name': "🧌 Создать ГК WoW",           'role_key': 'voice_wow'},
+    {'key': 'squad',  'category_id': VOICE_ROOM_CATEGORY_SQUAD,  'name': "🪖 Создать ГК SQUAD",         'role_key': 'voice_squad'},
 ]
 VOICE_TRIGGER_CHANNEL_IDS = {}   # id триггер-канала -> key из VOICE_TRIGGER_CONFIGS
-
+OLD_VOICE_TRIGGER_NAME_FRAGMENT = "голосовую комнату"
 
 OFFICE_CHANNEL_NAME = "🔵канцелярия-arma"
 # Каждый элемент: (текст с эмодзи, ссылка, номер ряда). Ряды 0 и 1 содержат
@@ -5002,9 +5005,8 @@ async def sync_arma_member_state(uid: str, data: dict):
         return
     member = await find_member_by_discord_username(discord_username)
     if not member:
-        print(f"⚠️ sync_arma_member_state: не найден участник Discord по discordId='{discord_username}' "
-              f"(uid={uid}, callsign='{data.get('callsign', '?')}') — роли/никнейм НЕ синхронизированы. "
-              f"Проверьте, что это поле в профиле соответствует реальному username в Discord.")
+        # Не засоряем Discord-логи, файловый лог и консоль повторяющимися
+        # сообщениями о несовпадении discordId/username в профиле.
         return
     guild = member.guild
 
@@ -9536,79 +9538,250 @@ async def enforce_read_only_channel(guild):
         print(f"⚠️ Ошибка настройки прав канала {READ_ONLY_CHANNEL_ID}: {e}")
 
 
+
 # ============== ВРЕМЕННЫЕ ГОЛОСОВЫЕ КОМНАТЫ ==============
 
+def _build_voice_room_overwrites(guild, cfg, owner=None):
+    """Единая политика доступа для триггера, постоянного и временного голосового канала.
+
+    Если role_key задан, @everyone не видит канал и не может подключиться,
+    а указанная роль получает доступ. При role_key=None канал открыт всем.
+    Владелец временной комнаты сохраняет права управления, но сам по себе
+    не получает обход проверки проектной роли.
+    """
+    is_public = cfg.get('role_key') is None
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(
+            view_channel=is_public,
+            connect=is_public,
+            speak=is_public,
+            stream=is_public,
+            use_voice_activation=is_public,
+        )
+    }
+
+    role_key = cfg.get('role_key')
+    role_id = ROLE_IDS.get(role_key) if role_key else None
+    role = guild.get_role(role_id) if role_id else None
+    if role:
+        overwrites[role] = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+        )
+
+    # Бот всегда сохраняет доступ к своим категориям и каналам, даже если
+    # @everyone закрыт. Администраторы сервера обходят channel overwrites.
+    bot_member = guild.me
+    if bot_member:
+        overwrites[bot_member] = discord.PermissionOverwrite(
+            view_channel=True,
+            connect=True,
+            speak=True,
+            stream=True,
+            use_voice_activation=True,
+            manage_channels=True,
+            manage_roles=True,
+            mute_members=True,
+            deafen_members=True,
+            move_members=True,
+        )
+
+    if owner and owner != bot_member:
+        # Не выдаём владельцу отдельный allow на view/connect: без требуемой
+        # роли он не должен обходить ограничение доступа к проекту.
+        overwrites[owner] = discord.PermissionOverwrite(
+            manage_channels=True,
+            manage_roles=True,
+            mute_members=True,
+            deafen_members=True,
+            move_members=True,
+        )
+
+    return overwrites
+
+
+async def _disconnect_members_without_voice_role(channel, guild, cfg):
+    """Удаляет из закрытой голосовой комнаты участников без требуемой роли.
+
+    Для публичной категории ничего не делает. Discord Administrator сохраняет
+    административный обход ограничений канала.
+    """
+    role_key = cfg.get('role_key')
+    if role_key is None:
+        return
+
+    role_id = ROLE_IDS.get(role_key)
+    required_role = guild.get_role(role_id) if role_id else None
+    for member in list(channel.members):
+        if member.bot or member.guild_permissions.administrator:
+            continue
+        if required_role is not None and required_role in member.roles:
+            continue
+        try:
+            await member.move_to(
+                None,
+                reason=f"Нет роли для доступа к голосовой комнате {cfg['key']}",
+            )
+            print(f"🔒 Участник {member.display_name} отключён от '{channel.name}': отсутствует требуемая роль.")
+        except Exception as e:
+            print(f"⚠️ Не удалось отключить {member.display_name} от '{channel.name}' по ролевому ограничению: {e}")
+
+
 async def setup_voice_room_triggers(guild):
-    """Находит (или создаёт) триггер-каналы 'Создать голосовую комнату' во всех
-    категориях из VOICE_TRIGGER_CONFIGS."""
+    """Удаляет старые триггеры, переименовывает постоянные ГК и приводит
+    триггеры и существующие голосовые каналы внутри категорий к единой политике доступа."""
     VOICE_TRIGGER_CHANNEL_IDS.clear()
+    load_voice_rooms()
+
+    # 1. Удаляем старые триггер-каналы с прежней формулировкой в названии.
+    legacy_channels = [
+        ch for ch in list(guild.voice_channels)
+        if OLD_VOICE_TRIGGER_NAME_FRAGMENT in ch.name.casefold()
+    ]
+    for old_channel in legacy_channels:
+        try:
+            old_name = old_channel.name
+            old_id = old_channel.id
+            await old_channel.delete(reason="Удаление устаревшего триггера создания голосовой комнаты")
+            print(f"🗑️ Удалён старый триггер голосовой комнаты '{old_name}' (ID: {old_id})")
+        except discord.NotFound:
+            pass
+        except Exception as e:
+            print(f"⚠️ Не удалось удалить старый триггер '{old_channel.name}' ({old_channel.id}): {e}")
+
+    # 2. Переименовываем постоянные голосовые комнаты ArmA и применяем к ним
+    #    ту же ролевую политику, что и к категории временных комнат ArmA.
+    army_cfg = next(cfg for cfg in VOICE_TRIGGER_CONFIGS if cfg['key'] == 'army')
+    for channel_id, new_name in (
+        (VOICE_PUBLIC_CHANNEL_ID, "Публичная ГК ArmA"),
+        (VOICE_CHANNEL_ID, "Мероприятие ГК ArmA"),
+    ):
+        channel = guild.get_channel(channel_id)
+        if channel is None:
+            print(f"⚠️ Голосовой канал {channel_id} не найден — переименование пропущено.")
+            continue
+        try:
+            await channel.edit(
+                name=new_name,
+                overwrites=_build_voice_room_overwrites(guild, army_cfg),
+                reason="Обновление названия и доступа к голосовому каналу ArmA",
+            )
+            await _disconnect_members_without_voice_role(channel, guild, army_cfg)
+            print(f"✅ Голосовой канал {channel_id} переименован в '{new_name}' и ограничен ролью 'Клан ArmA'.")
+        except Exception as e:
+            print(f"⚠️ Не удалось обновить голосовой канал {channel_id} ('{new_name}'): {e}")
+
+    # 3. Настраиваем категории, триггеры и все существующие дочерние каналы.
     for cfg in VOICE_TRIGGER_CONFIGS:
         try:
             category = guild.get_channel(cfg['category_id'])
-            if not category:
-                print(f"⚠️ Категория {cfg['category_id']} не найдена ({cfg['key']})")
+            if not isinstance(category, discord.CategoryChannel):
+                print(f"⚠️ Категория {cfg['category_id']} не найдена или имеет неверный тип ({cfg['key']}).")
                 continue
+
+            role_key = cfg.get('role_key')
+            role_id = ROLE_IDS.get(role_key) if role_key else None
+            if role_key and not guild.get_role(role_id):
+                print(f"⚠️ Роль {role_id} ({role_key}) не найдена — категория '{cfg['key']}' останется закрытой для обычных участников.")
+
+            # Не меняем overwrite самой категории: в ней могут находиться
+            # текстовые каналы с отдельными правилами. Настраиваем каждый
+            # голосовой канал явно, чтобы не затронуть текстовые каналы.
+            access_overwrites = _build_voice_room_overwrites(guild, cfg)
 
             existing = discord.utils.get(category.voice_channels, name=cfg['name'])
-            if existing:
-                VOICE_TRIGGER_CHANNEL_IDS[existing.id] = cfg['key']
-                print(f"✅ Найден существующий триггер-канал '{cfg['name']}' ({cfg['key']}): {existing.id}")
-                continue
+            if existing is None:
+                existing = await guild.create_voice_channel(
+                    name=cfg['name'],
+                    category=category,
+                    overwrites=access_overwrites,
+                    user_limit=0,
+                    reason="Создание триггера временной голосовой комнаты",
+                )
+                print(f"✅ Создан триггер-канал '{cfg['name']}' ({cfg['key']}): {existing.id}")
+            else:
+                await existing.edit(
+                    overwrites=access_overwrites,
+                    reason="Обновление доступа к триггеру временной голосовой комнаты",
+                )
+                print(f"✅ Найден и обновлён триггер-канал '{cfg['name']}' ({cfg['key']}): {existing.id}")
 
-            if cfg['mode'] == 'copy_reference':
-                ref_channel = guild.get_channel(VOICE_CHANNEL_ID)
-                overwrites = dict(ref_channel.overwrites) if ref_channel else {}
-            elif cfg['mode'] == 'role':
-                role = guild.get_role(cfg['role_id'])
-                overwrites = {guild.default_role: discord.PermissionOverwrite(view_channel=True, connect=False)}
-                if role:
-                    overwrites[role] = discord.PermissionOverwrite(
-                        view_channel=True, connect=True, speak=True, stream=True, use_voice_activation=True
-                    )
-                else:
-                    print(f"⚠️ Роль {cfg['role_id']} не найдена — триггер '{cfg['key']}' будет недоступен никому!")
-            else:  # open
-                overwrites = {
-                    guild.default_role: discord.PermissionOverwrite(
-                        view_channel=True, connect=True, speak=True, stream=True, use_voice_activation=True
-                    )
-                }
+            VOICE_TRIGGER_CHANNEL_IDS[existing.id] = cfg['key']
+            await _disconnect_members_without_voice_role(existing, guild, cfg)
 
-            new_channel = await guild.create_voice_channel(
-                name=cfg['name'], category=category, overwrites=overwrites, user_limit=0
-            )
-            VOICE_TRIGGER_CHANNEL_IDS[new_channel.id] = cfg['key']
-            print(f"✅ Создан триггер-канал '{cfg['name']}' ({cfg['key']}): {new_channel.id}")
+            # Все голосовые каналы категории получают текущую политику доступа. У временной
+            # комнаты сохраняем owner-права, но не отдельный доступ мимо роли.
+            for child in list(category.voice_channels):
+                if child.id == existing.id:
+                    continue
+
+                owner = None
+                if child.name.startswith(TEMP_ROOM_NAME_PREFIX):
+                    owner_id = (VOICE_ROOMS.get(child.id) or {}).get('owner_id')
+                    if owner_id:
+                        owner = guild.get_member(int(owner_id))
+                    if owner is None:
+                        for target, old_overwrite in child.overwrites.items():
+                            if isinstance(target, discord.Member) and old_overwrite.manage_channels:
+                                owner = target
+                                break
+
+                child_overwrites = _build_voice_room_overwrites(guild, cfg, owner=owner)
+                await child.edit(
+                    overwrites=child_overwrites,
+                    reason=f"Приведение доступа к голосовой комнате к политике {cfg['key']}",
+                )
+                await _disconnect_members_without_voice_role(child, guild, cfg)
+
+                if child.name.startswith(TEMP_ROOM_NAME_PREFIX) and child.id in VOICE_ROOMS:
+                    VOICE_ROOMS[child.id]['is_public'] = cfg.get('role_key') is None
+                    VOICE_ROOMS[child.id]['category_id'] = cfg['category_id']
+
         except Exception as e:
-            print(f"❌ Ошибка настройки триггер-канала '{cfg['key']}': {e}")
+            print(f"❌ Ошибка настройки голосовой категории '{cfg['key']}': {e}")
+
+    save_voice_rooms()
+
 
 async def create_temp_voice_room(member, trigger_channel):
-    """Права комнаты = права триггер-канала своей категории (кто мог зайти
-    в 'Создать голосовую комнату', тот сможет зайти и в созданную комнату)
-    + расширенные права владельца."""
+    """Создаёт временную комнату с той же ролевой политикой доступа,
+    что и у триггера/категории, и выдаёт владельцу права управления."""
     global VOICE_ROOMS
 
     guild = member.guild
     category = trigger_channel.category
-
-    overwrites = dict(trigger_channel.overwrites)
-    overwrites[member] = discord.PermissionOverwrite(
-        view_channel=True, connect=True, speak=True,
-        manage_channels=True, manage_roles=True,
-        mute_members=True, deafen_members=True,
-        move_members=True
+    cfg = next(
+        (item for item in VOICE_TRIGGER_CONFIGS
+         if category and item['category_id'] == category.id),
+        None,
     )
 
+    if cfg is not None:
+        overwrites = _build_voice_room_overwrites(guild, cfg, owner=member)
+        is_public = cfg.get('role_key') is None
+    else:
+        # Резервный путь для неожиданного/ручного триггера вне настроенных категорий.
+        overwrites = dict(trigger_channel.overwrites)
+        overwrites[member] = discord.PermissionOverwrite(
+            manage_channels=True, manage_roles=True,
+            mute_members=True, deafen_members=True, move_members=True,
+        )
+        is_public = False
+
     try:
-        room_name = f"🚪 Голосовая комната {member.display_name}"[:100]
+        room_name = f"🚪 Комната {member.display_name}"[:100]
         temp_channel = await guild.create_voice_channel(
-            name=room_name, category=category, overwrites=overwrites, user_limit=0
+            name=room_name, category=category, overwrites=overwrites, user_limit=0,
+            reason="Создание временной голосовой комнаты",
         )
 
         VOICE_ROOMS[temp_channel.id] = {
             'owner_id': member.id,
             'created_at': datetime.now(MSK).isoformat(),
-            'is_public': (category.id != VOICE_ROOM_CATEGORY_ARMY) if category else False,
+            'is_public': is_public,
             'category_id': category.id if category else None,
         }
         save_voice_rooms()
@@ -9646,7 +9819,7 @@ async def cleanup_empty_temp_room(channel_id):
         print(f"⚠️ Ошибка при удалении временной комнаты: {e}")
 
         
-TEMP_ROOM_NAME_PREFIX = "🚪 Голосовая комната "
+TEMP_ROOM_NAME_PREFIX = "🚪 Комната "
 
 
 def save_voice_rooms():
@@ -9710,7 +9883,7 @@ async def sync_voice_rooms_on_startup(guild):
                 VOICE_ROOMS[ch.id] = {
                     'owner_id': owner_id,
                     'created_at': datetime.now(MSK).isoformat(),
-                    'is_public': cfg['category_id'] != VOICE_ROOM_CATEGORY_ARMY,
+                    'is_public': cfg.get('role_key') is None,
                     'category_id': cfg['category_id'],
                 }
                 print(f"♻️ [Синхронизация] Восстановлено отслеживание непустой комнаты '{ch.name}' (ID: {ch.id})")
@@ -9724,6 +9897,7 @@ async def sweep_empty_voice_rooms():
     поверх обычной логики удаления при выходе из комнаты."""
     for channel_id in list(VOICE_ROOMS.keys()):
         await cleanup_empty_temp_room(channel_id)
+
 
 async def force_restart_bot():
     """Освобождает lock-файл и перезапускает бота. Способ перезапуска
