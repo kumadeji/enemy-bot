@@ -9772,7 +9772,7 @@ async def create_temp_voice_room(member, trigger_channel):
         is_public = False
 
     try:
-        room_name = f"🚪 Комната {member.display_name}"[:100]
+        room_name = f"🚪 Голосовая комната {member.display_name}"[:100]
         temp_channel = await guild.create_voice_channel(
             name=room_name, category=category, overwrites=overwrites, user_limit=0,
             reason="Создание временной голосовой комнаты",
@@ -9819,7 +9819,7 @@ async def cleanup_empty_temp_room(channel_id):
         print(f"⚠️ Ошибка при удалении временной комнаты: {e}")
 
         
-TEMP_ROOM_NAME_PREFIX = "🚪 Комната "
+TEMP_ROOM_NAME_PREFIX = "🚪 Голосовая комната "
 
 
 def save_voice_rooms():
