@@ -871,13 +871,13 @@ VOICE_ROOM_CATEGORY_SQUAD = 908009506657697842
 # в остальных случаях видимость и подключение разрешены только указанной роли.
 VOICE_TRIGGER_CONFIGS = [
     {'key': 'army',   'category_id': VOICE_ROOM_CATEGORY_ARMY,   'name': "🔵 Создать ГК ArmA",          'role_key': 'klan_arma'},
-    {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать ГК В сообществе", 'role_key': None},
+    {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать публичную ГК", 'role_key': None},
     {'key': 'dayz',   'category_id': VOICE_ROOM_CATEGORY_DAYZ,   'name': "🧟 Создать ГК DayZ",          'role_key': 'voice_dayz'},
     {'key': 'wow',    'category_id': VOICE_ROOM_CATEGORY_WOW,    'name': "🧌 Создать ГК WoW",           'role_key': 'voice_wow'},
     {'key': 'squad',  'category_id': VOICE_ROOM_CATEGORY_SQUAD,  'name': "🪖 Создать ГК SQUAD",         'role_key': 'voice_squad'},
 ]
 VOICE_TRIGGER_CHANNEL_IDS = {}   # id триггер-канала -> key из VOICE_TRIGGER_CONFIGS
-OLD_VOICE_TRIGGER_NAME_FRAGMENT = "голосовую комнату"
+OLD_VOICE_TRIGGER_NAME_FRAGMENT = "сообществе"
 
 OFFICE_CHANNEL_NAME = "🔵канцелярия-arma"
 # Каждый элемент: (текст с эмодзи, ссылка, номер ряда). Ряды 0 и 1 содержат
