@@ -859,6 +859,7 @@ VOICE_CHANNEL_ID = 1284893513921728582
 VOICE_ROOM_CATEGORY_ARMY = 1284893244878098464
 VOICE_ROOM_CATEGORY_PUBLIC = 1116656512677445693
 VOICE_ROOM_CATEGORY_DAYZ = 908305448552251392
+VOICE_ROOM_CATEGORY_WOW = 1572603025695047791
 VOICE_ROOM_CATEGORY_SQUAD = 908009506657697842
 SQUAD_ROLE_ID = 908461959794532404
 
@@ -867,10 +868,11 @@ SQUAD_ROLE_ID = 908461959794532404
 # (если канал уже существует — бот его права не трогает, их можно настраивать
 # вручную; временные комнаты наследуют права именно от него).
 VOICE_TRIGGER_CONFIGS = [
-    {'key': 'army',   'category_id': VOICE_ROOM_CATEGORY_ARMY,   'name': "🔵 Создать голосовую комнату", 'mode': 'copy_reference'},
-    {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать голосовую комнату", 'mode': 'open'},
-    {'key': 'dayz',   'category_id': VOICE_ROOM_CATEGORY_DAYZ,   'name': "🧟 Создать голосовую комнату", 'mode': 'open'},
-    {'key': 'squad',  'category_id': VOICE_ROOM_CATEGORY_SQUAD,  'name': "🪖 Создать голосовую комнату", 'mode': 'role', 'role_id': SQUAD_ROLE_ID},
+    {'key': 'army',   'category_id': VOICE_ROOM_CATEGORY_ARMY,   'name': "🔵 Создать ГК ArmA", 'mode': 'copy_reference'},
+    {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать ГК В сообществе", 'mode': 'open'},
+    {'key': 'dayz',   'category_id': VOICE_ROOM_CATEGORY_DAYZ,   'name': "🧟 Создать ГК DayZ", 'mode': 'open'},
+    {'key': 'wow',   'category_id': VOICE_ROOM_CATEGORY_WOW,   'name': "🧌 Создать ГК WoW", 'mode': 'open'},
+    {'key': 'squad',  'category_id': VOICE_ROOM_CATEGORY_SQUAD,  'name': "🪖 Создать ГК SQUAD", 'mode': 'role', 'role_id': SQUAD_ROLE_ID},
 ]
 VOICE_TRIGGER_CHANNEL_IDS = {}   # id триггер-канала -> key из VOICE_TRIGGER_CONFIGS
 
@@ -9599,7 +9601,7 @@ async def create_temp_voice_room(member, trigger_channel):
     )
 
     try:
-        room_name = f"🚪 Комната {member.display_name}"[:100]
+        room_name = f"🚪 Голосовая комната {member.display_name}"[:100]
         temp_channel = await guild.create_voice_channel(
             name=room_name, category=category, overwrites=overwrites, user_limit=0
         )
@@ -9645,7 +9647,7 @@ async def cleanup_empty_temp_room(channel_id):
         print(f"⚠️ Ошибка при удалении временной комнаты: {e}")
 
         
-TEMP_ROOM_NAME_PREFIX = "🚪 Комната "
+TEMP_ROOM_NAME_PREFIX = "🚪 Голосовая комната "
 
 
 def save_voice_rooms():
