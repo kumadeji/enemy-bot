@@ -868,7 +868,7 @@ VOICE_ROOM_CATEGORY_SQUAD = 908009506657697842
 # вручную; временные комнаты наследуют права именно от него).
 VOICE_TRIGGER_CONFIGS = [
     {'key': 'army',   'category_id': VOICE_ROOM_CATEGORY_ARMY,   'name': "🔵 Создать ГК ArmA", 'mode': 'copy_reference'},
-    {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать ГК В сообществе", 'mode': 'open'},
+    {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать ГК в сообществе", 'mode': 'open'},
     {'key': 'dayz',   'category_id': VOICE_ROOM_CATEGORY_DAYZ,   'name': "🧟 Создать ГК DayZ", 'mode': 'open'},
     {'key': 'wow',   'category_id': VOICE_ROOM_CATEGORY_WOW,   'name': "🧌 Создать ГК WoW", 'mode': 'open'},
     {'key': 'squad',  'category_id': VOICE_ROOM_CATEGORY_SQUAD,  'name': "🪖 Создать ГК SQUAD", 'mode': 'open'},
