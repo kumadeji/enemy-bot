@@ -861,7 +861,6 @@ VOICE_ROOM_CATEGORY_PUBLIC = 1116656512677445693
 VOICE_ROOM_CATEGORY_DAYZ = 908305448552251392
 VOICE_ROOM_CATEGORY_WOW = 1572603025695047791
 VOICE_ROOM_CATEGORY_SQUAD = 908009506657697842
-SQUAD_ROLE_ID = 908461959794532404
 
 # Конфигурация триггер-каналов "Создать голосовую комнату" по категориям.
 # mode определяет права ТОЛЬКО при первом создании триггер-канала ботом
@@ -872,7 +871,7 @@ VOICE_TRIGGER_CONFIGS = [
     {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать ГК В сообществе", 'mode': 'open'},
     {'key': 'dayz',   'category_id': VOICE_ROOM_CATEGORY_DAYZ,   'name': "🧟 Создать ГК DayZ", 'mode': 'open'},
     {'key': 'wow',   'category_id': VOICE_ROOM_CATEGORY_WOW,   'name': "🧌 Создать ГК WoW", 'mode': 'open'},
-    {'key': 'squad',  'category_id': VOICE_ROOM_CATEGORY_SQUAD,  'name': "🪖 Создать ГК SQUAD", 'mode': 'role', 'role_id': SQUAD_ROLE_ID},
+    {'key': 'squad',  'category_id': VOICE_ROOM_CATEGORY_SQUAD,  'name': "🪖 Создать ГК SQUAD", 'mode': 'open'},
 ]
 VOICE_TRIGGER_CHANNEL_IDS = {}   # id триггер-канала -> key из VOICE_TRIGGER_CONFIGS
 
