@@ -5,6 +5,7 @@ import time
 import signal
 import atexit
 import socket
+import random
 
 # На Windows, если stdout/stderr перенаправлены в файл (а не в реальную консоль),
 # Python выбирает кодировку по системной ANSI-кодовой странице (часто cp1251),
@@ -994,18 +995,6 @@ def ensure_weekly_events_file():
         seeded['_seeded'] = True
         save_json(WEEKLY_EVENTS_FILE, seeded)
 
-
-def get_next_weekday_datetime(day_key: str, hour: int, minute: int, from_time: datetime = None) -> datetime:
-    """Находит ближайшую дату/время для дня недели (day_key) начиная с from_time (или текущего момента)."""
-    if from_time is None:
-        from_time = datetime.now(MSK)
-    target_weekday = WEEKDAY_INDEX[day_key]
-    days_ahead = (target_weekday - from_time.weekday()) % 7
-    candidate = (from_time + timedelta(days=days_ahead)).replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if candidate <= from_time:
-        candidate += timedelta(days=7)
-    return candidate
-
 MAX_GAMES = 10
 MAX_SELECT_OPTIONS = 25
 
@@ -1033,6 +1022,10 @@ EVENT_IMAGES = {
 ATTENDANCE_ELIGIBLE_IMAGE_KEYS = {'echo', 'asvdv', 'tt', 'ts'}
 # Тип, отметки на который ВСЕГДА необязательны (принудительно, см. create_event/update_event)
 ALWAYS_OPTIONAL_MARKS_IMAGE_KEYS = {'ts'}
+# Учитывать ли отметки «Не приду» на мероприятиях с необязательными отметками.
+# False — список «Не придут» не показывается и новые отказы не сохраняются;
+# если игрок перед этим нажал «Приду», кнопка «Не приду» снимает его с этого списка.
+TRACK_DECLINED_MARKS_FOR_OPTIONAL_EVENTS = False
 # Типы, для которых показывается "Ожидаемый командир отделения" и двигается очередь на командование
 EXPECTED_COMMANDER_IMAGE_KEYS = {'echo', 'asvdv', 'tt'}
 # Эксперимент со скрытием отметок остаётся только на прежних трёх типах
@@ -4010,7 +4003,7 @@ def build_personal_mark_status_text(event: dict, nickname: str) -> str:
             return get_event_project_role_requirement_message(event)
     if nickname in (event.get('accepted') or {}):
         return es("✅ Вы отметились: **Приду**")
-    if nickname in (event.get('declined') or {}):
+    if (event.get('mandatory', True) or TRACK_DECLINED_MARKS_FOR_OPTIONAL_EVENTS) and nickname in (event.get('declined') or {}):
         return es("❌ Вы отметились: **Не приду**")
 
     # Не отмечен: если боец в отпуске на дату мероприятия, отмечаться ему не нужно
@@ -4187,7 +4180,10 @@ async def build_marks_report_embed(event_id: str):
         event_start_dt, registered_before=event_start_dt, vacation_set=vacation_set, event=event
     )
     accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
-    declined = await filter_event_project_nicknames(event.get('declined', {}).keys(), event)
+    if event.get('mandatory', True) or TRACK_DECLINED_MARKS_FOR_OPTIONAL_EVENTS:
+        declined = await filter_event_project_nicknames(event.get('declined', {}).keys(), event)
+    else:
+        declined = []  # необязательные мероприятия не ведут список отказавшихся
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
 
     embed = discord.Embed(title=es(f"📋 Отметки: {build_display_title(event)}"), color=discord.Color.blurple())
@@ -4212,7 +4208,8 @@ async def build_marks_report_embed(event_id: str):
             embed.add_field(name=es(f"{prefix} ({len(names)}){suffix}"), value=">>> " + "\n".join(chunk), inline=False)
 
     add_field("✅ Придут", accepted)
-    add_field("❌ Не придут", declined)
+    if event.get('mandatory', True) or TRACK_DECLINED_MARKS_FOR_OPTIONAL_EVENTS:
+        add_field("❌ Не придут", declined)
     add_field("❓ Не отметились", unmarked)
     embed.set_footer(text=f"Запрошено: {datetime.now(MSK).strftime('%d.%m.%Y %H:%M')} МСК")
     return embed
@@ -7920,21 +7917,59 @@ async def handle_event_response(interaction, event_id, response_type):
         fresh_event.setdefault('accepted', {})
         fresh_event.setdefault('declined', {})
         fresh_event.setdefault('mark_times', {})
-        mark_times = fresh_event['mark_times']
-        # Время фиксируется ТОЛЬКО при первой отметке игрока и дальше не меняется:
-        # смена решения (Приду <-> Не приду) «поздней» отметкой не считается.
-        if nickname not in mark_times:
-            had_answer_before = nickname in fresh_event['accepted'] or nickname in fresh_event['declined']
-            # 0 — отметка поставлена до появления учёта времени, поздней быть не может
-            mark_times[nickname] = 0 if had_answer_before else int(datetime.now(MSK).timestamp())
 
-        if response_type == "accept":
-            fresh_event['accepted'][nickname] = True
-            fresh_event['declined'].pop(nickname, None)
+        # На необязательных мероприятиях список «Не придут» по умолчанию не ведётся.
+        # Если боец ранее нажал «Приду», кнопка «Не приду» лишь снимает эту отметку.
+        optional_decline_not_tracked = (
+            response_type == "decline"
+            and not fresh_event.get('mandatory', True)
+            and not TRACK_DECLINED_MARKS_FOR_OPTIONAL_EVENTS
+        )
+        optional_decline_message = None
+        optional_decline_changed = False
+
+        if optional_decline_not_tracked:
+            had_accepted = nickname in fresh_event['accepted']
+            had_declined = nickname in fresh_event['declined']
+            if had_accepted:
+                fresh_event['accepted'].pop(nickname, None)
+                optional_decline_message = (
+                    "✅ Ваша отметка «Приду» снята. Для необязательного мероприятия "
+                    "список тех, кто не придёт, не ведётся."
+                )
+                optional_decline_changed = True
+            else:
+                optional_decline_message = (
+                    "ℹ️ Это мероприятие необязательно для отметок. "
+                    "Список тех, кто отметился, что не придёт, не ведётся."
+                )
+            if had_declined:
+                fresh_event['declined'].pop(nickname, None)
+                optional_decline_changed = True
+            if optional_decline_changed:
+                save_json(EVENTS_FILE, fresh_events)
         else:
-            fresh_event['declined'][nickname] = True
-            fresh_event['accepted'].pop(nickname, None)
-        save_json(EVENTS_FILE, fresh_events)
+            mark_times = fresh_event['mark_times']
+            # Время фиксируется ТОЛЬКО при первой отметке игрока и дальше не меняется:
+            # смена решения (Приду <-> Не приду) «поздней» отметкой не считается.
+            if nickname not in mark_times:
+                had_answer_before = nickname in fresh_event['accepted'] or nickname in fresh_event['declined']
+                # 0 — отметка поставлена до появления учёта времени, поздней быть не может
+                mark_times[nickname] = 0 if had_answer_before else int(datetime.now(MSK).timestamp())
+
+            if response_type == "accept":
+                fresh_event['accepted'][nickname] = True
+                fresh_event['declined'].pop(nickname, None)
+            else:
+                fresh_event['declined'][nickname] = True
+                fresh_event['accepted'].pop(nickname, None)
+            save_json(EVENTS_FILE, fresh_events)
+
+    if optional_decline_not_tracked:
+        await interaction.followup.send(es(optional_decline_message), ephemeral=True)
+        if optional_decline_changed:
+            await refresh_all_active_event_embeds()
+        return
 
     if response_type == "accept":
         await interaction.followup.send(es("✅ Вы записаны на мероприятие!"), ephemeral=True)
@@ -8292,7 +8327,10 @@ async def build_event_embed(event_id: str) -> discord.Embed:
         event_start_dt, registered_before=event_start_dt, vacation_set=vacation_set, event=event
     )
     accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
-    declined = await filter_event_project_nicknames(event.get('declined', {}).keys(), event)
+    if event.get('mandatory', True) or TRACK_DECLINED_MARKS_FOR_OPTIONAL_EVENTS:
+        declined = await filter_event_project_nicknames(event.get('declined', {}).keys(), event)
+    else:
+        declined = []  # необязательные мероприятия не ведут список отказавшихся
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
 
     status = event.get('status', 'active')
@@ -8381,13 +8419,9 @@ async def build_event_embed(event_id: str) -> discord.Embed:
             field_name = es(f"{name_prefix} ({len(names)}){suffix}")
             embed.add_field(name=field_name, value=">>> " + "\n".join(chunk), inline=inline)
 
-    if is_marks_hidden_for_event(event):
-        embed.add_field(
-            name=es("🔒 Список бойцов"),
-            value=es("Автоматически раскроется ко времени его подачи для бронирования слотов. Отмечаться можно и нужно — ваши отметки сохраняются как обычно. Проверить, отмечались ли вы, можно по кнопке ''Отметки''."),
-            inline=False
-        )
-    else:
+    if not is_marks_hidden_for_event(event):
+        # Пока список скрыт, в embed не выводится ни список участников, ни
+        # поясняющая заглушка. Кнопка «Отметки» остаётся доступной отдельно.
 
         # Поздние отметки (первая отметка поставлена после срока подачи списка):
         # курсив + звёздочка после ника. Только в «Придут» и «Не придут».
@@ -8580,16 +8614,89 @@ def _iso_week_key(dt: datetime) -> str:
     return f"{year}-W{week:02d}"
 
 
+WEEKLY_KICKOFF_MOTIVATION_LINES = (
+    "Большие победы начинаются с простых вещей: быть на связи, держать слово и поддерживать своих.",
+    "Не обязательно быть лучшим во всём — важно становиться сильнее вместе с командой.",
+    "Пусть на этой неделе будет больше сыгранных матчей, хороших решений и поводов гордиться своим отрядом.",
+    "Сильный клан строится не только в бою, но и на взаимовыручке, дисциплине и уважении друг к другу.",
+    "Каждый выход на связь делает нас ближе к общей цели. Увидимся на серверах!",
+    "Планируйте время, собирайте товарищей и не забывайте: лучший момент стать частью команды — прямо сейчас.",
+    "Новая неделя — чистый лист. Заполним его общими победами и хорошими историями.",
+    "Пусть планы превращаются в действия, действия — в результат, а результат — в общую гордость.",
+    "Даже небольшое участие помогает команде. Будьте рядом, поддерживайте друг друга и играйте в удовольствие.",
+    "Держим строй, бережём товарищей и помним: слаженная команда сильнее одиночек.",
+    "Впереди новые задачи и встречи. Выбирайте свои проекты, отмечайтесь в расписании и до встречи в игре!",
+    "Хорошая неделя начинается с хорошей команды. Остальное сделаем вместе.",
+)
+
+_weekly_kickoff_lock = asyncio.Lock()
+
+
+async def publish_weekly_kickoff_announcement(week_key: str) -> bool:
+    """Публикует приветствие новой недели перед еженедельными мероприятиями.
+    Номер недели сохраняется в существующем ADMIN_ANCHORS_FILE, поэтому повторный
+    вызов при reconnect/catch-up не создаёт дубликат."""
+    async with _weekly_kickoff_lock:
+        anchors = load_json(ADMIN_ANCHORS_FILE, {})
+        if anchors.get('weekly_announcement_week') == week_key:
+            return True
+
+        try:
+            week_start = datetime.strptime(f"{week_key}-1", "%G-W%V-%u").date()
+            week_end = week_start + timedelta(days=6)
+            channel = await client.fetch_channel(EVENTS_CHANNEL_ID)
+
+            embed = discord.Embed(
+                title="🌅 Новая неделя в клане ENEMY",
+                description=(
+                    "Бойцы, началась новая неделя! Впереди тренировки, матчи и общие задачи. "
+                    "Загляните в расписание, заранее отметьтесь на мероприятиях и спланируйте время."
+                ),
+                color=discord.Color.blue(),
+            )
+            embed.add_field(
+                name="📅 План на неделю",
+                value=f"{week_start:%d.%m.%Y} — {week_end:%d.%m.%Y}",
+                inline=False,
+            )
+            embed.add_field(
+                name="💬 Настрой недели",
+                value=f"*{random.choice(WEEKLY_KICKOFF_MOTIVATION_LINES)}*",
+                inline=False,
+            )
+            embed.set_footer(text="Увидимся на серверах. ENEMY — сила в команде!")
+
+            message = await channel.send(
+                embed=embed,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+            # Перечитываем якоря перед записью, чтобы не затереть другие ID.
+            anchors = load_json(ADMIN_ANCHORS_FILE, {})
+            anchors['weekly_announcement_week'] = week_key
+            anchors['weekly_announcement_message_id'] = message.id
+            save_json(ADMIN_ANCHORS_FILE, anchors)
+            print(f"✅ Опубликовано приветствие новой недели {week_key} (ID: {message.id}).")
+            return True
+        except Exception as e:
+            print(f"⚠️ Не удалось опубликовать приветствие новой недели {week_key}: {e}")
+            return False
+
+
 async def post_weekly_events(week_key: str = None):
-    """Публикует еженедельные мероприятия. Если week_key не передан —
-    считается для текущего момента. Каждое созданное мероприятие получает
-    поля weekly_id и week_key — по ним can_catch_up_weekly_events() определяет,
-    было ли мероприятие для этой недели уже создано."""
+    """Публикует еженедельные мероприятия. Сначала отправляет одно приветствие
+    новой недели (один раз на ISO-неделю), затем публикует мероприятия в
+    хронологическом порядке. Каждое мероприятие получает weekly_id/week_key."""
     ensure_weekly_events_file()
     weekly_events = load_json(WEEKLY_EVENTS_FILE, {})
     now = datetime.now(MSK)
     if week_key is None:
         week_key = _iso_week_key(now)
+
+    if any(key != '_seeded' for key in weekly_events):
+        # Ошибка отправки приветствия не должна лишать клан расписания;
+        # в штатной ситуации объявление всегда отправляется первым.
+        await publish_weekly_kickoff_announcement(week_key)
 
     existing_events = load_json(EVENTS_FILE, {})
     already_created_weekly_ids = {
@@ -8597,6 +8704,7 @@ async def post_weekly_events(week_key: str = None):
         if e.get('week_key') == week_key and e.get('weekly_id')
     }
 
+    week_monday = MSK.localize(datetime.strptime(f"{week_key}-1", "%G-W%V-%u"))
     prepared = []
     for weekly_id, entry in weekly_events.items():
         if weekly_id == '_seeded':
@@ -8606,10 +8714,14 @@ async def post_weekly_events(week_key: str = None):
         try:
             start_h, start_m = map(int, entry['start_time'].split(':'))
             end_h, end_m = map(int, entry['end_time'].split(':'))
-            event_start = get_next_weekday_datetime(entry['day_of_week'], start_h, start_m, from_time=now)
+            weekday_index = WEEKDAY_INDEX[entry['day_of_week']]
+            event_start = week_monday + timedelta(days=weekday_index, hours=start_h, minutes=start_m)
             event_end = event_start.replace(hour=end_h, minute=end_m)
             if event_end <= event_start:
                 event_end += timedelta(days=1)
+            if event_start <= now:
+                print(f"ℹ️ Еженедельное мероприятие '{entry.get('name', '?')}' уже прошло в неделе {week_key}; публикация пропущена.")
+                continue
             prepared.append((event_start, event_end, weekly_id, entry))
         except Exception as e:
             print(f"❌ Ошибка подготовки еженедельного мероприятия '{entry.get('name', '?')}': {e}")
@@ -8633,15 +8745,11 @@ async def post_weekly_events(week_key: str = None):
 
 
 async def catch_up_weekly_events_on_startup():
-    """Вызывается один раз при старте бота: если сейчас понедельник и
-    текущее время УЖЕ позже 08:00 (момента, когда должен был сработать cron),
-    а мероприятия текущей недели ещё не созданы (например, бот был выключен
-    именно в это время) — публикует их немедленно вместо того, чтобы ждать
-    следующего понедельника."""
+    """После 08:00 МСК наверстывает публикацию актуальных мероприятий текущей
+    недели, если бот был выключен в момент понедельничного запуска."""
     now = datetime.now(MSK)
-    # Раньше наверстывание работало только в понедельник — если бот пролежал
-    # Пн→Вт, вся неделя оставалась без мероприятий. Теперь проверяем любой день:
-    # создаём только те шаблоны, чьё время старта на этой неделе ЕЩЁ НЕ прошло.
+    # Проверяем любой день недели и публикуем только те шаблоны, чьё время
+    # старта на этой ISO-неделе ещё не прошло.
     scheduled_time = now.replace(hour=8, minute=0, second=0, microsecond=0)
     if now < scheduled_time:
         return  # ещё рано, штатный cron сам сработает вовремя
@@ -8664,16 +8772,16 @@ async def catch_up_weekly_events_on_startup():
     for weekly_id in missing:
         tpl = weekly_events.get(weekly_id) or {}
         try:
-            weekday = int(tpl.get('weekday', 0))
-            hh, mm = str(tpl.get('time', '20:00')).split(':')
-            slot = monday + timedelta(days=weekday, hours=int(hh), minutes=int(mm))
+            weekday = WEEKDAY_INDEX[tpl['day_of_week']]
+            hh, mm = map(int, tpl['start_time'].split(':'))
+            slot = monday + timedelta(days=weekday, hours=hh, minutes=mm)
         except Exception:
             continue
         if slot > now:
             still_relevant.add(weekly_id)
     if still_relevant:
         print(f"⚠️ Несозданные еженедельные мероприятия на текущей неделе: {len(still_relevant)}. Запускаю наверстывание.")
-        await post_weekly_events()
+        await post_weekly_events(week_key)
     elif missing:
         print(f"ℹ️ Пропущено еженедельных мероприятий: {len(missing)} — их время на этой неделе уже прошло, наверстывание не требуется.")
 
@@ -8711,7 +8819,9 @@ async def check_event_reminders():
                         if days_to_deadline == expected_days:
                             active_members = await get_active_members(event_start, registered_before=event_start, event=event)
                             accepted = set(event.get('accepted', {}).keys())
-                            declined = set(event.get('declined', {}).keys())
+                            declined = (set(event.get('declined', {}).keys())
+                                        if event.get('mandatory', True) or TRACK_DECLINED_MARKS_FOR_OPTIONAL_EVENTS
+                                        else set())
                             unmarked = [m for m in active_members if m not in accepted and m not in declined]
                             if unmarked:
                                 thread = await get_or_create_thread(event, event_id, event['title'])
@@ -8743,7 +8853,9 @@ async def check_event_reminders():
                             # кто ещё не отметился, и кто не в отпуске.
                             active_members = await get_active_members(event_start, registered_before=event_start, event=event)
                             accepted_keys = set(event.get('accepted', {}).keys())
-                            declined_keys = set(event.get('declined', {}).keys())
+                            declined_keys = (set(event.get('declined', {}).keys())
+                                             if event.get('mandatory', True) or TRACK_DECLINED_MARKS_FOR_OPTIONAL_EVENTS
+                                             else set())
                             unmarked = [m for m in active_members if m not in accepted_keys and m not in declined_keys]
                             mention_block = await build_mentions_for_nicknames(unmarked, event=event)
                             should_send = bool(unmarked)
@@ -9631,50 +9743,29 @@ async def _disconnect_members_without_voice_role(channel, guild, cfg):
 
 
 async def setup_voice_room_triggers(guild):
-    """Удаляет старые триггеры, переименовывает постоянные ГК и приводит
-    триггеры и существующие голосовые каналы внутри категорий к единой политике доступа."""
+    """Поддерживает текущие права постоянных ГК, триггеров и временных комнат
+    в соответствии с конфигурацией категорий. Разовые переименования и удаление
+    устаревших триггеров здесь больше не выполняются."""
     VOICE_TRIGGER_CHANNEL_IDS.clear()
     load_voice_rooms()
 
-    # 1. Удаляем старые триггер-каналы с прежней формулировкой в названии.
-    legacy_channels = [
-        ch for ch in list(guild.voice_channels)
-        if OLD_VOICE_TRIGGER_NAME_FRAGMENT in ch.name.casefold()
-    ]
-    for old_channel in legacy_channels:
-        try:
-            old_name = old_channel.name
-            old_id = old_channel.id
-            await old_channel.delete(reason="Удаление устаревшего триггера создания голосовой комнаты")
-            print(f"🗑️ Удалён старый триггер голосовой комнаты '{old_name}' (ID: {old_id})")
-        except discord.NotFound:
-            pass
-        except Exception as e:
-            print(f"⚠️ Не удалось удалить старый триггер '{old_channel.name}' ({old_channel.id}): {e}")
-
-    # 2. Переименовываем постоянные голосовые комнаты ArmA и применяем к ним
-    #    ту же ролевую политику, что и к категории временных комнат ArmA.
+    # Постоянные голосовые каналы сохраняют заданные названия. Бот только
+    # поддерживает на них действующую ролевую политику доступа.
     army_cfg = next(cfg for cfg in VOICE_TRIGGER_CONFIGS if cfg['key'] == 'army')
-    for channel_id, new_name in (
-        (VOICE_PUBLIC_CHANNEL_ID, "Публичная ГК ArmA"),
-        (VOICE_CHANNEL_ID, "Мероприятие ГК ArmA"),
-    ):
+    for channel_id in (VOICE_PUBLIC_CHANNEL_ID, VOICE_CHANNEL_ID):
         channel = guild.get_channel(channel_id)
         if channel is None:
-            print(f"⚠️ Голосовой канал {channel_id} не найден — переименование пропущено.")
             continue
         try:
             await channel.edit(
-                name=new_name,
                 overwrites=_build_voice_room_overwrites(guild, army_cfg),
-                reason="Обновление названия и доступа к голосовому каналу ArmA",
+                reason="Поддержание прав доступа к постоянному голосовому каналу ArmA",
             )
             await _disconnect_members_without_voice_role(channel, guild, army_cfg)
-            print(f"✅ Голосовой канал {channel_id} переименован в '{new_name}' и ограничен ролью 'Клан ArmA'.")
         except Exception as e:
-            print(f"⚠️ Не удалось обновить голосовой канал {channel_id} ('{new_name}'): {e}")
+            print(f"⚠️ Не удалось обновить права голосового канала {channel_id}: {e}")
 
-    # 3. Настраиваем категории, триггеры и все существующие дочерние каналы.
+    # Настраиваем категории, триггеры и все существующие дочерние каналы.
     for cfg in VOICE_TRIGGER_CONFIGS:
         try:
             category = guild.get_channel(cfg['category_id'])
