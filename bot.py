@@ -8437,26 +8437,26 @@ async def build_event_embed(event_id: str) -> discord.Embed:
         if event.get('mandatory', True):
             add_names_field(get_unmarked_field_title(event), unmarked, inline=False)
 
-        # Приписка про поздние отметки (курсивом)
+        # Текст о поздних отметках выводим в footer — Discord размещает его
+        # под изображением embed'а, а не среди основных полей.
         late_accepted = any(is_late_mark(event, n) for n in accepted)
         late_declined = any(is_late_mark(event, n) for n in declined)
         if late_accepted:
-            embed.add_field(
-                name="\u200b",
-                value="*\\* - отметки, оставленные слишком поздно - после подачи списка; может не хватить места на мероприятии*",
-                inline=False
-            )
+            late_marks_footer = "* - отметки, оставленные слишком поздно - после подачи списка; может не хватить места на мероприятии"
         elif late_declined:
-            embed.add_field(
-                name="\u200b",
-                value="*\\* - отметки, оставленные слишком поздно - после подачи списка*",
-                inline=False
-            )
+            late_marks_footer = "* - отметки, оставленные слишком поздно - после подачи списка"
+        else:
+            late_marks_footer = None
+    else:
+        late_marks_footer = None
 
     image_key = event.get('image_key', 'none')
     if image_key != 'none' and image_key in EVENT_IMAGES:
         filename = EVENT_IMAGES[image_key]['file']
         embed.set_image(url=f'attachment://{filename}')
+
+    if late_marks_footer:
+        embed.set_footer(text=late_marks_footer)
 
     # Предохранитель: Discord отклоняет embed с более чем 25 полями.
     if len(embed.fields) > 24:
