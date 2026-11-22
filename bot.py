@@ -904,6 +904,7 @@ ADMIN_ANCHORS_FILE = os.path.join(BASE_DIR, 'admin_anchors.json')
 ANKETA_MESSAGES_FILE = os.path.join(BASE_DIR, 'anketa_messages.json')
 DISCORD_LINK_CACHE_FILE = os.path.join(BASE_DIR, 'discord_link_cache.json')
 PLAYER_DM_STATE_FILE = os.path.join(BASE_DIR, 'player_dm_state.json')
+TECH_WARNING_STATE_FILE = os.path.join(BASE_DIR, 'technical_warning_state.json')
 CHECK_HISTORY_FILE = os.path.join(BASE_DIR, 'check_history.json')
 PENDING_DISCIPLINE_FILE = os.path.join(BASE_DIR, 'pending_discipline.json')
 
@@ -944,6 +945,7 @@ FIREBASE_DATA_MAP = {
     ANKETA_MESSAGES_FILE: 'anketaMessages',
     DISCORD_LINK_CACHE_FILE: 'discordLinkCache',
     PLAYER_DM_STATE_FILE: 'playerDmState',
+    TECH_WARNING_STATE_FILE: 'technicalWarningState',
     CHECK_HISTORY_FILE: 'checkHistory',
     PENDING_DISCIPLINE_FILE: 'pendingDiscipline',
 }
@@ -1207,6 +1209,7 @@ VACATION_RULES = es("""
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.presences = True  # Требуется для on_presence_update и Member.status
 intents.voice_states = True
 
 client = discord.Client(
@@ -2173,6 +2176,23 @@ class OrderedFirestoreWriter:
                 if doc_name not in self._pending:
                     return
 
+    async def flush_document(self, doc_name: str, timeout: float = 15.0) -> bool:
+        """Дожидается успешной записи одного документа; False при таймауте/ошибке."""
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            task = self._tasks.get(doc_name)
+            if task is None or task.done():
+                return doc_name not in self._pending
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return False
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=remaining)
+            except asyncio.TimeoutError:
+                return False
+            except Exception:
+                return False
+
     async def flush(self, timeout: float = 15.0):
         """Дожидается, пока ВСЕ отложенные записи будут выгружены —
         вызывается перед принудительным перезапуском/остановкой бота,
@@ -2396,6 +2416,646 @@ def save_json(filename, data):
         EXECUTOR.submit(_write_local_backup_sync, filename, data)
     except Exception as e:
         print(f"⚠️ Не удалось запланировать резервную запись '{filename}': {e}")
+
+# ============== ОДНОРАЗОВОЕ ТЕХНИЧЕСКОЕ УВЕДОМЛЕНИЕ УЧАСТНИКАМ ==============
+
+TECH_WARNING_EXCLUDED_ROLE_IDS = {
+    1284456321005129778,
+    1548661262894895104,
+    1557399397753557033,
+}
+TECH_WARNING_ALLOWED_NICK_TAGS = {"en-y", "en-yr"}
+TECH_WARNING_ONLINE_STATUSES = {
+    discord.Status.online,
+    discord.Status.idle,
+    discord.Status.dnd,
+}
+TECH_WARNING_PANEL_TEXT = (
+    "## 📣 Панель технических уведомлений\n"
+    "Здесь запускается адресное техническое уведомление в личные сообщения.\n"
+    "Перед запуском бот покажет предварительный список и попросит подтверждение.\n"
+    "\n"
+    "**Онлайн-группа** — участники, которых бот хотя бы раз наблюдал онлайн "
+    "с момента включения трекера; новые наблюдаемые онлайн-участники добавляются "
+    "в активную кампанию.\n"
+    "**Не наблюдались онлайн** — участники, которых трекер ещё ни разу не видел "
+    "в статусе online / idle / dnd.\n"
+    "\n"
+    "Используйте рассылку только для действительно важных технических сообщений, "
+    "на которые у адресатов есть явное разрешение."
+)
+TECH_WARNING_STATE = {}
+_TECH_WARNING_STATE_READY = False
+_TECH_WARNING_WORKER_TASK = None
+_TECH_WARNING_GUILD_ID = None
+
+
+def _tech_warning_default_state():
+    return {
+        "online_seen": {},
+        "competitor_ids": [],
+        "notice_deliveries": {},
+        "campaign": None,
+        "campaign_history": [],
+        "panel_message_id": None,
+    }
+
+
+def _tech_warning_save_state():
+    save_json(TECH_WARNING_STATE_FILE, TECH_WARNING_STATE)
+
+
+def _tech_warning_write_local_backup_sync(snapshot: dict) -> bool:
+    """Независимо от EXECUTOR создаёт атомарный локальный backup снимка состояния."""
+    tmp_path = f"{TECH_WARNING_STATE_FILE}.tech_tmp_{os.getpid()}_{uuid.uuid4().hex[:8]}"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(snapshot, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, TECH_WARNING_STATE_FILE)
+        return True
+    except Exception as exc:
+        print(f"❌ Не удалось надёжно сохранить локальное состояние тех. уведомлений: {exc}")
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+        return False
+
+
+async def _tech_warning_persist_state_durable() -> bool:
+    """Блокирует DM, пока отметка sending не сохранена в надёжном хранилище."""
+    doc_name = FIREBASE_DATA_MAP.get(TECH_WARNING_STATE_FILE)
+    if USE_FIREBASE_BACKEND:
+        if not fs_db or not doc_name:
+            print("⚠️ Отправка тех. уведомления заблокирована: Firebase-хранилище не инициализировано.")
+            return False
+        saved = await firestore_writer.flush_document(doc_name, timeout=15.0)
+        if not saved:
+            print("⚠️ Отправка тех. уведомления приостановлена: состояние не удалось подтвердить в Firestore.")
+        return saved
+    loop = asyncio.get_running_loop()
+    snapshot = copy.deepcopy(TECH_WARNING_STATE)
+    return await loop.run_in_executor(EXECUTOR, _tech_warning_write_local_backup_sync, snapshot)
+
+
+def _tech_warning_initialize_state():
+    """Загружает отдельное состояние и восстанавливает безопасные статусы после рестарта."""
+    global TECH_WARNING_STATE, _TECH_WARNING_STATE_READY
+    state = load_json(TECH_WARNING_STATE_FILE, _tech_warning_default_state())
+    if not isinstance(state, dict):
+        state = _tech_warning_default_state()
+    defaults = _tech_warning_default_state()
+    for key, value in defaults.items():
+        state.setdefault(key, copy.deepcopy(value))
+
+    # Если процесс оборвался во время HTTP-запроса, нельзя угадывать,
+    # дошло ли сообщение. Такие адресаты переводятся в unknown и не повторяются.
+    deliveries = state.setdefault("notice_deliveries", {})
+    for notice_hash, per_user in list(deliveries.items()):
+        if not isinstance(per_user, dict):
+            deliveries[notice_hash] = {}
+            continue
+        for user_id, record in list(per_user.items()):
+            if isinstance(record, dict) and record.get("status") == "sending":
+                record["status"] = "unknown"
+                record["updated_at"] = datetime.now().astimezone().isoformat()
+
+    campaign = state.get("campaign")
+    if isinstance(campaign, dict):
+        recipients = campaign.setdefault("recipients", {})
+        for user_id, record in recipients.items():
+            if isinstance(record, dict) and record.get("status") == "sending":
+                record["status"] = "unknown"
+                record["reason"] = "Процесс перезапустился во время отправки; проверьте вручную."
+                record["updated_at"] = datetime.now().astimezone().isoformat()
+        if campaign.get("status") == "running":
+            has_queue = any(
+                isinstance(record, dict) and record.get("status") == "queued"
+                for record in recipients.values()
+            )
+            if not has_queue and campaign.get("mode") == "online":
+                campaign["status"] = "waiting_online"
+            elif not has_queue and campaign.get("mode") == "offline":
+                campaign["status"] = "completed"
+
+    TECH_WARNING_STATE = state
+    _TECH_WARNING_STATE_READY = True
+    _tech_warning_save_state()
+
+
+def _tech_warning_timestamp():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _tech_warning_notice_hash(message: str) -> str:
+    # Незначимые различия пробелов/регистра не создают новую кампанию-дубликат.
+    normalized = re.sub(r"\s+", " ", message).strip().casefold()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+
+
+def _tech_warning_competitor_ids() -> set:
+    raw = TECH_WARNING_STATE.get("competitor_ids", [])
+    result = set()
+    if isinstance(raw, (list, tuple, set)):
+        for value in raw:
+            try:
+                result.add(int(value))
+            except (TypeError, ValueError):
+                continue
+    return result
+
+
+def _tech_warning_filter_reason(member: discord.Member) -> str | None:
+    if member.bot:
+        return "бот"
+
+    if any(role.id in TECH_WARNING_EXCLUDED_ROLE_IDS for role in member.roles):
+        return "исключённая роль"
+
+    if member.id in _tech_warning_competitor_ids():
+        return "ID из списка соперников"
+
+    name = member.display_name or member.name or ""
+    bracket_tags = re.findall(r"\[([^\]]+)\]", name)
+    if bracket_tags:
+        normalized = {tag.strip().casefold() for tag in bracket_tags}
+        if not normalized.intersection(TECH_WARNING_ALLOWED_NICK_TAGS):
+            return "квадратный тег ника не [En-Y] / [En-Yr]"
+
+    return None
+
+
+async def _tech_warning_resolve_guild():
+    """Определяет сервер по заданному ADMIN_CHANNEL_ID, не выбирая случайную гильдию."""
+    global _TECH_WARNING_GUILD_ID
+    channel = client.get_channel(ADMIN_CHANNEL_ID)
+    if channel is None:
+        try:
+            channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
+        except Exception as exc:
+            print(f"⚠️ Не удалось получить канал панели технических уведомлений: {exc}")
+            return None
+    guild = getattr(channel, "guild", None)
+    if guild is None:
+        print("⚠️ ADMIN_CHANNEL_ID не является каналом сервера; трекер уведомлений не запущен.")
+        return None
+    _TECH_WARNING_GUILD_ID = guild.id
+    if not guild.chunked:
+        try:
+            await guild.chunk()
+        except Exception as exc:
+            print(f"⚠️ Не удалось загрузить полный список участников для тех. уведомлений: {exc}")
+    return guild
+
+
+def _tech_warning_delivery_record(notice_hash: str, user_id: int):
+    deliveries = TECH_WARNING_STATE.setdefault("notice_deliveries", {})
+    per_user = deliveries.setdefault(notice_hash, {})
+    return per_user.get(str(user_id))
+
+
+def _tech_warning_candidate_snapshot(guild: discord.Guild, mode: str, message: str):
+    notice_hash = _tech_warning_notice_hash(message)
+    seen = TECH_WARNING_STATE.setdefault("online_seen", {})
+    seen_ids = {int(value) for value in seen.keys() if str(value).isdigit()}
+    if mode == "online":
+        candidate_ids = seen_ids
+    else:
+        candidate_ids = {member.id for member in guild.members} - seen_ids
+
+    eligible = []
+    excluded = {}
+    attempted = 0
+    missing = 0
+    for user_id in sorted(candidate_ids):
+        member = guild.get_member(user_id)
+        if member is None:
+            missing += 1
+            continue
+        reason = _tech_warning_filter_reason(member)
+        if reason:
+            excluded[reason] = excluded.get(reason, 0) + 1
+            continue
+        if _tech_warning_delivery_record(notice_hash, user_id) is not None:
+            attempted += 1
+            continue
+        eligible.append(user_id)
+    return {
+        "notice_hash": notice_hash,
+        "candidate_count": len(candidate_ids),
+        "eligible_ids": eligible,
+        "excluded": excluded,
+        "already_attempted": attempted,
+        "missing": missing,
+    }
+
+
+def _tech_warning_preview_text(mode: str, snapshot: dict) -> str:
+    mode_label = "наблюдались онлайн" if mode == "online" else "ещё ни разу не наблюдались онлайн"
+    lines = [
+        "**Предварительный просмотр кампании**",
+        f"Группа: **{mode_label}**",
+        f"Всего в группе: **{snapshot['candidate_count']}**",
+        f"Подходят к отправке: **{len(snapshot['eligible_ids'])}**",
+        f"Ранее уже предпринималась попытка отправки: **{snapshot['already_attempted']}**",
+    ]
+    if snapshot["missing"]:
+        lines.append(f"Уже не найдены на сервере: **{snapshot['missing']}**")
+    if snapshot["excluded"]:
+        lines.append("Исключения:")
+        for reason, count in sorted(snapshot["excluded"].items()):
+            lines.append(f"• {reason}: **{count}**")
+    else:
+        lines.append("Фильтры не исключили дополнительных участников.")
+    lines.append("\nПосле подтверждения очередь сохранится между перезапусками. Успешные и неопределённые попытки повторно не отправляются.")
+    lines.append("Подтверждайте запуск только для адресатов, которые явно приняли правило сервера о получении важных технических DM.")
+    return "\n".join(lines)
+
+
+def _tech_warning_enqueue_new_online(member: discord.Member):
+    """Регистрирует первого наблюдаемого online/idle/dnd и добавляет в текущую online-кампанию."""
+    if not _TECH_WARNING_STATE_READY or member.bot:
+        return False
+
+    seen = TECH_WARNING_STATE.setdefault("online_seen", {})
+    user_key = str(member.id)
+    changed = False
+    if user_key not in seen:
+        seen[user_key] = {"first_seen_at": _tech_warning_timestamp()}
+        changed = True
+
+    campaign = TECH_WARNING_STATE.get("campaign")
+    if campaign and campaign.get("mode") == "online" and campaign.get("status") in {
+        "running", "waiting_online", "paused"
+    }:
+        recipients = campaign.setdefault("recipients", {})
+        previous_delivery = _tech_warning_delivery_record(campaign.get("notice_hash", ""), member.id)
+        if user_key not in recipients:
+            now = _tech_warning_timestamp()
+            if previous_delivery is not None:
+                recipients[user_key] = {
+                    "status": "skipped", "reason": "ранее уже предпринималась попытка отправки", "updated_at": now
+                }
+            else:
+                recipients[user_key] = {"status": "queued", "updated_at": now}
+                if campaign.get("status") == "waiting_online":
+                    campaign["status"] = "running"
+            changed = True
+        else:
+            # Если участника ранее пропустили из-за роли/ника, а затем он
+            # стал подходить под фильтры, разрешаем поставить его в очередь.
+            record = recipients[user_key]
+            filter_reasons = {
+                "бот", "исключённая роль", "ID из списка соперников",
+                "квадратный тег ника не [En-Y] / [En-Yr]",
+            }
+            if (
+                isinstance(record, dict)
+                and record.get("status") == "skipped"
+                and record.get("reason") in filter_reasons
+                and _tech_warning_filter_reason(member) is None
+                and previous_delivery is None
+            ):
+                record.update({"status": "queued", "updated_at": _tech_warning_timestamp()})
+                record.pop("reason", None)
+                if campaign.get("status") == "waiting_online":
+                    campaign["status"] = "running"
+                changed = True
+
+    if changed:
+        _tech_warning_save_state()
+        return True
+    return False
+
+
+async def _tech_warning_scan_current_presence(guild: discord.Guild | None = None):
+    if not _TECH_WARNING_STATE_READY:
+        return
+    if guild is None:
+        guild = await _tech_warning_resolve_guild()
+    if guild is None:
+        return
+    for member in guild.members:
+        if not member.bot and member.status in TECH_WARNING_ONLINE_STATUSES:
+            _tech_warning_enqueue_new_online(member)
+    _tech_warning_ensure_worker()
+
+
+async def _tech_warning_start_campaign(mode: str, message: str, created_by: int):
+    if mode not in {"online", "offline"}:
+        return False, "Неизвестная группа получателей."
+    current = TECH_WARNING_STATE.get("campaign")
+    if current and current.get("status") not in {"completed", "stopped"}:
+        return False, (
+            f"Уже есть активная кампания ({current.get('status')}). "
+            "Сначала поставьте её на паузу и остановите, затем запускайте следующую."
+        )
+
+    guild = await _tech_warning_resolve_guild()
+    if guild is None:
+        return False, "Не удалось определить сервер по каналу панели."
+    snapshot = _tech_warning_candidate_snapshot(guild, mode, message)
+
+    if current:
+        history = TECH_WARNING_STATE.setdefault("campaign_history", [])
+        history.append({
+            "id": current.get("id"), "mode": current.get("mode"),
+            "status": current.get("status"), "created_at": current.get("created_at"),
+            "recipient_count": len(current.get("recipients", {})),
+        })
+        TECH_WARNING_STATE["campaign_history"] = history[-10:]
+
+    campaign = {
+        "id": uuid.uuid4().hex[:12],
+        "mode": mode,
+        "message": message.strip(),
+        "notice_hash": snapshot["notice_hash"],
+        "created_at": _tech_warning_timestamp(),
+        "created_by": int(created_by),
+        "status": "running" if snapshot["eligible_ids"] else ("waiting_online" if mode == "online" else "completed"),
+        "queue_created": len(snapshot["eligible_ids"]),
+        "recipients": {
+            str(user_id): {"status": "queued", "updated_at": _tech_warning_timestamp()}
+            for user_id in snapshot["eligible_ids"]
+        },
+    }
+    TECH_WARNING_STATE["campaign"] = campaign
+    _tech_warning_save_state()
+    if not await _tech_warning_persist_state_durable():
+        # Никаких DM не начинается, пока сам факт создания очереди не подтверждён.
+        campaign["status"] = "paused"
+        _tech_warning_save_state()
+        return False, "Не удалось надёжно сохранить кампанию. Очередь оставлена на паузе; проверьте хранилище и попробуйте продолжить позже."
+    _tech_warning_ensure_worker()
+    return True, campaign
+
+
+def _tech_warning_campaign_counts(campaign: dict):
+    counts = {"queued": 0, "sending": 0, "sent": 0, "failed": 0, "skipped": 0, "unknown": 0}
+    for record in campaign.get("recipients", {}).values():
+        if isinstance(record, dict):
+            status = record.get("status")
+            if status in counts:
+                counts[status] += 1
+    return counts
+
+
+def _tech_warning_stats_text():
+    campaign = TECH_WARNING_STATE.get("campaign")
+    competitor_count = len(_tech_warning_competitor_ids())
+    seen_count = len(TECH_WARNING_STATE.get("online_seen", {}))
+    lines = [
+        "**Трекер технических уведомлений**",
+        f"Наблюдались онлайн хотя бы раз: **{seen_count}**",
+        f"ID соперников в исключениях: **{competitor_count}**",
+    ]
+    if not campaign:
+        lines.append("Активной или последней кампании пока нет.")
+        return "\n".join(lines)
+    counts = _tech_warning_campaign_counts(campaign)
+    mode_label = "онлайн" if campaign.get("mode") == "online" else "никогда не наблюдались онлайн"
+    lines.extend([
+        f"Кампания: `{campaign.get('id', '—')}` · группа: **{mode_label}**",
+        f"Состояние: **{campaign.get('status', '—')}**",
+        f"Создана: {campaign.get('created_at', '—')}",
+        f"В очереди: **{counts['queued']}** · отправляется: **{counts['sending']}** · доставлено: **{counts['sent']}**",
+        f"Ошибки: **{counts['failed']}** · пропущено: **{counts['skipped']}** · неизвестный результат: **{counts['unknown']}**",
+    ])
+    for review_status, label in (("unknown", "Неизвестный результат — проверить вручную"), ("failed", "Не доставлено — проверить вручную")):
+        review_ids = [
+            user_id for user_id, record in campaign.get("recipients", {}).items()
+            if isinstance(record, dict) and record.get("status") == review_status
+        ]
+        if review_ids:
+            lines.append(f"{label}: " + ", ".join(f"`{user_id}`" for user_id in review_ids[:15]))
+            if len(review_ids) > 15:
+                lines.append(f"и ещё {len(review_ids) - 15}.")
+    return "\n".join(lines)
+
+
+async def _tech_warning_mark_result(user_id: int, status: str, reason: str | None = None):
+    campaign = TECH_WARNING_STATE.get("campaign")
+    if not campaign:
+        return
+    record = campaign.setdefault("recipients", {}).setdefault(str(user_id), {})
+    record["status"] = status
+    record["updated_at"] = _tech_warning_timestamp()
+    if reason:
+        record["reason"] = str(reason)[:300]
+    _tech_warning_save_state()
+
+
+async def _tech_warning_worker():
+    """Единственный последовательный worker; discord.py сам обрабатывает обычные REST rate limits."""
+    while not client.is_closed():
+        campaign = TECH_WARNING_STATE.get("campaign")
+        if not campaign or campaign.get("status") in {"paused", "stopped", "completed"}:
+            return
+
+        queued_ids = [
+            int(user_id) for user_id, record in campaign.get("recipients", {}).items()
+            if isinstance(record, dict) and record.get("status") == "queued" and str(user_id).isdigit()
+        ]
+        if not queued_ids:
+            if campaign.get("mode") == "online":
+                # Сохраняем переход только один раз: не создаём лишнюю запись
+                # в Firestore каждые две секунды, пока ждём новых участников.
+                if campaign.get("status") != "waiting_online":
+                    campaign["status"] = "waiting_online"
+                    _tech_warning_save_state()
+                await asyncio.sleep(2)
+                continue
+            campaign["status"] = "completed"
+            _tech_warning_save_state()
+            return
+
+        user_id = queued_ids[0]
+        guild = await _tech_warning_resolve_guild()
+        if guild is None:
+            await asyncio.sleep(5)
+            continue
+        member = guild.get_member(user_id)
+        if member is None:
+            try:
+                member = await guild.fetch_member(user_id)
+            except discord.NotFound:
+                await _tech_warning_mark_result(user_id, "skipped", "Участник больше не состоит на сервере.")
+                continue
+            except discord.HTTPException as exc:
+                print(f"⚠️ Не удалось повторно получить участника {user_id}: {exc}")
+                await asyncio.sleep(5)
+                continue
+
+        # Администратор мог поставить очередь на паузу/остановить её,
+        # пока worker ожидал fetch_member. Не начинаем новый DM после этого.
+        if campaign.get("status") != "running":
+            return
+
+        # Фильтры повторно проверяются непосредственно перед отправкой.
+        reason = _tech_warning_filter_reason(member)
+        if reason:
+            await _tech_warning_mark_result(user_id, "skipped", reason)
+            continue
+
+        notice_hash = campaign.get("notice_hash", "")
+        if _tech_warning_delivery_record(notice_hash, user_id) is not None:
+            await _tech_warning_mark_result(user_id, "skipped", "Для этого текста уже была попытка отправки.")
+            continue
+
+        deliveries = TECH_WARNING_STATE.setdefault("notice_deliveries", {}).setdefault(notice_hash, {})
+        delivery = {"status": "sending", "started_at": _tech_warning_timestamp(), "campaign_id": campaign.get("id")}
+        deliveries[str(user_id)] = delivery
+        recipient_record = campaign.setdefault("recipients", {}).setdefault(str(user_id), {})
+        recipient_record.update({"status": "sending", "updated_at": _tech_warning_timestamp()})
+        _tech_warning_save_state()  # фиксируем до обращения к Discord API
+        if not await _tech_warning_persist_state_durable():
+            deliveries.pop(str(user_id), None)
+            recipient_record.update({"status": "queued", "updated_at": _tech_warning_timestamp()})
+            _tech_warning_save_state()
+            await asyncio.sleep(5)
+            continue
+
+        # Пока ожидали подтверждение Firestore, администратор тоже мог
+        # нажать «Пауза» или «Остановить». В таком случае API-вызов не делаем.
+        if campaign.get("status") != "running":
+            deliveries.pop(str(user_id), None)
+            if campaign.get("status") == "stopped":
+                recipient_record.update({
+                    "status": "skipped", "reason": "Кампания остановлена до начала отправки.",
+                    "updated_at": _tech_warning_timestamp(),
+                })
+            else:
+                recipient_record.update({"status": "queued", "updated_at": _tech_warning_timestamp()})
+            _tech_warning_save_state()
+            await _tech_warning_persist_state_durable()
+            return
+
+        try:
+            await member.send(
+                campaign.get("message", ""),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            delivery["status"] = "sent"
+            delivery["updated_at"] = _tech_warning_timestamp()
+            recipient_record.update({"status": "sent", "updated_at": _tech_warning_timestamp()})
+        except discord.HTTPException as exc:
+            # 429 означает, что запрос отклонён лимитом. Снимаем маркер попытки
+            # и повторяем только после retry_after; не пытаемся обходить лимит.
+            if getattr(exc, "status", None) == 429:
+                deliveries.pop(str(user_id), None)
+                recipient_record.update({"status": "queued", "updated_at": _tech_warning_timestamp()})
+                retry_after = getattr(exc, "retry_after", None)
+                try:
+                    wait_seconds = max(1.0, float(retry_after))
+                except (TypeError, ValueError):
+                    wait_seconds = 5.0
+                _tech_warning_save_state()
+                await asyncio.sleep(wait_seconds)
+                continue
+            delivery.update({"status": "failed", "updated_at": _tech_warning_timestamp(), "error": str(exc)[:300]})
+            recipient_record.update({"status": "failed", "reason": str(exc)[:300], "updated_at": _tech_warning_timestamp()})
+            print(f"⚠️ Не удалось отправить техническое уведомление участнику {user_id}: {exc}")
+        except Exception as exc:
+            delivery.update({"status": "failed", "updated_at": _tech_warning_timestamp(), "error": str(exc)[:300]})
+            recipient_record.update({"status": "failed", "reason": str(exc)[:300], "updated_at": _tech_warning_timestamp()})
+            print(f"⚠️ Ошибка отправки технического уведомления участнику {user_id}: {exc}")
+
+        _tech_warning_save_state()
+        # Последовательная обработка без параллельного шквала запросов.
+        await asyncio.sleep(1.5)
+
+
+def _tech_warning_ensure_worker():
+    global _TECH_WARNING_WORKER_TASK
+    campaign = TECH_WARNING_STATE.get("campaign")
+    if not _TECH_WARNING_STATE_READY or client.is_closed() or not campaign:
+        return
+    if campaign.get("status") not in {"running", "waiting_online"}:
+        return
+    if campaign.get("status") == "running" and not any(
+        isinstance(record, dict) and record.get("status") == "queued"
+        for record in campaign.get("recipients", {}).values()
+    ):
+        return
+    if _TECH_WARNING_WORKER_TASK is None or _TECH_WARNING_WORKER_TASK.done():
+        _TECH_WARNING_WORKER_TASK = asyncio.create_task(
+            _tech_warning_worker(), name="technical-warning-dm-worker"
+        )
+
+
+def _tech_warning_parse_ids(raw: str):
+    valid = set()
+    invalid = []
+    for token in re.split(r"[\s,;]+", raw or ""):
+        token = token.strip()
+        if not token:
+            continue
+        if re.fullmatch(r"\d{15,22}", token):
+            valid.add(int(token))
+        else:
+            invalid.append(token[:40])
+    return valid, invalid
+
+
+async def _tech_warning_set_campaign_status(action: str):
+    campaign = TECH_WARNING_STATE.get("campaign")
+    if not campaign:
+        return False, "Кампания ещё не запускалась."
+    status = campaign.get("status")
+    if action == "pause":
+        if status in {"completed", "stopped"}:
+            return False, "Кампания уже завершена или остановлена."
+        campaign["status"] = "paused"
+        message = "Кампания поставлена на паузу. Новые online-участники всё ещё учитываются; уже начатая отправка может завершиться."
+    elif action == "resume":
+        if status != "paused":
+            return False, "На паузе сейчас ничего нет."
+        campaign["status"] = "running"
+        message = "Кампания продолжена."
+    elif action == "stop":
+        if status in {"completed", "stopped"}:
+            return False, "Кампания уже завершена или остановлена."
+        for record in campaign.get("recipients", {}).values():
+            if isinstance(record, dict) and record.get("status") == "queued":
+                record["status"] = "skipped"
+                record["reason"] = "Кампания остановлена администратором."
+                record["updated_at"] = _tech_warning_timestamp()
+        campaign["status"] = "stopped"
+        message = "Кампания остановлена. Уже начатая отправка может завершиться; успешные и неопределённые попытки повторяться не будут."
+    else:
+        return False, "Неизвестное действие."
+    _tech_warning_save_state()
+    persisted = await _tech_warning_persist_state_durable()
+    _tech_warning_ensure_worker()
+    if not persisted:
+        return False, message + " Внимание: хранилище не подтвердило сохранение изменения."
+    return True, message
+
+
+async def _tech_warning_ensure_panel():
+    if not _TECH_WARNING_STATE_READY:
+        return
+    try:
+        channel = client.get_channel(ADMIN_CHANNEL_ID) or await client.fetch_channel(ADMIN_CHANNEL_ID)
+        message = None
+        message_id = TECH_WARNING_STATE.get("panel_message_id")
+        if message_id:
+            try:
+                message = await channel.fetch_message(int(message_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                message = None
+        if message is None:
+            message = await channel.send(TECH_WARNING_PANEL_TEXT, view=TechnicalWarningPanelView())
+            TECH_WARNING_STATE["panel_message_id"] = message.id
+            _tech_warning_save_state()
+        else:
+            await message.edit(content=TECH_WARNING_PANEL_TEXT, view=TechnicalWarningPanelView())
+    except Exception as exc:
+        print(f"⚠️ Не удалось создать/обновить панель технических уведомлений: {exc}")
+
 
 def build_vacation_set_for_date(vacations: dict, target_date: datetime) -> set:
     """Множество ников (в нижнем регистре), которые находились/находятся
@@ -3536,6 +4196,190 @@ class ConfirmClearLogsView(discord.ui.View):
     @discord.ui.button(label=es("🚫 Отмена"), style=discord.ButtonStyle.secondary)
     async def cancel(self, interaction, button):
         await interaction.response.send_message(es("🚫 Очистка отменена."), ephemeral=True)
+
+
+class TechnicalWarningComposeModal(discord.ui.Modal):
+    def __init__(self, mode: str):
+        title = "Тех. уведомление: онлайн" if mode == "online" else "Тех. уведомление: не наблюдались онлайн"
+        super().__init__(title=es(title))
+        self.mode = mode
+        self.message_text = discord.ui.TextInput(
+            label="Текст важного технического уведомления",
+            style=discord.TextStyle.paragraph,
+            placeholder="Введите полный текст сообщения для личных сообщений...",
+            required=True,
+            min_length=5,
+            max_length=1900,
+        )
+        self.add_item(self.message_text)
+
+    async def on_submit(self, interaction):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Доступно только администраторам."), ephemeral=True)
+            return
+        message = self.message_text.value.strip()
+        if len(message) < 5:
+            await interaction.response.send_message(es("❌ Текст слишком короткий."), ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = await _tech_warning_resolve_guild()
+        if guild is None:
+            await interaction.followup.send(es("❌ Не удалось определить сервер."), ephemeral=True)
+            return
+        snapshot = _tech_warning_candidate_snapshot(guild, self.mode, message)
+        preview = _tech_warning_preview_text(self.mode, snapshot)
+        preview_embed = discord.Embed(
+            title=es("Предпросмотр технического уведомления"),
+            description=preview,
+            color=discord.Color.orange(),
+        )
+        for index in range(0, len(message), 1024):
+            chunk = message[index:index + 1024]
+            field_name = "Текст сообщения" if index == 0 else "Текст сообщения (продолжение)"
+            preview_embed.add_field(name=field_name, value=chunk, inline=False)
+        await interaction.followup.send(
+            embed=preview_embed,
+            view=TechnicalWarningConfirmView(self.mode, message, interaction.user.id),
+            ephemeral=True,
+        )
+
+
+class TechnicalWarningConfirmView(discord.ui.View):
+    def __init__(self, mode: str, message: str, author_id: int):
+        super().__init__(timeout=300)
+        self.mode = mode
+        self.message = message
+        self.author_id = author_id
+
+    @discord.ui.button(label=es("✅ Подтвердить запуск"), style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction, button):
+        if interaction.user.id not in ADMIN_USER_IDS or interaction.user.id != self.author_id:
+            await interaction.response.send_message(es("⛔ Подтвердить запуск может только открывший предпросмотр администратор."), ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        success, result = await _tech_warning_start_campaign(self.mode, self.message, interaction.user.id)
+        if not success:
+            await interaction.followup.send(f"❌ {result}", ephemeral=True)
+            return
+        counts = _tech_warning_campaign_counts(result)
+        await interaction.followup.send(
+            es(f"✅ Кампания `{result['id']}` создана. В очередь добавлено: **{counts['queued']}**.\nСостояние: **{result['status']}**."),
+            ephemeral=True,
+        )
+        self.stop()
+
+    @discord.ui.button(label=es("Отмена"), style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction, button):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Доступно только администраторам."), ephemeral=True)
+            return
+        await interaction.response.send_message(es("🚫 Запуск отменён. Никакие сообщения не отправлены."), ephemeral=True)
+        self.stop()
+
+
+class TechnicalWarningCompetitorIdsModal(discord.ui.Modal):
+    def __init__(self):
+        super().__init__(title=es("🚫 ID соперников — исключения"))
+        self.add_ids = discord.ui.TextInput(
+            label="Добавить ID (по одному в строке)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=3500,
+        )
+        self.remove_ids = discord.ui.TextInput(
+            label="Удалить ID (по одному в строке)",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=3500,
+        )
+        self.add_item(self.add_ids)
+        self.add_item(self.remove_ids)
+
+    async def on_submit(self, interaction):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Доступно только администраторам."), ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        add_ids, invalid_add = _tech_warning_parse_ids(self.add_ids.value)
+        remove_ids, invalid_remove = _tech_warning_parse_ids(self.remove_ids.value)
+        current = _tech_warning_competitor_ids()
+        before = set(current)
+        add_ids.difference_update(remove_ids)
+        added_count = len(add_ids - before)
+        removed_count = len(remove_ids.intersection(before))
+        current.update(add_ids)
+        current.difference_update(remove_ids)
+        TECH_WARNING_STATE["competitor_ids"] = sorted(current)
+        _tech_warning_save_state()
+        persisted = await _tech_warning_persist_state_durable()
+        details = [
+            ("✅ Список сохранён." if persisted else "⚠️ Список изменён в памяти, но хранилище не подтвердило запись."),
+            f"Сейчас в нём **{len(current)}** ID.",
+            f"Новых ID добавлено: **{added_count}**, удалено: **{removed_count}**.",
+        ]
+        invalid = invalid_add + invalid_remove
+        if invalid:
+            details.append("Некорректных значений пропущено: " + str(len(invalid)) + ".")
+            details.append("Примеры: " + ", ".join(invalid[:5]))
+        details.append("ID соперников исключаются из будущих кампаний и перепроверяются перед отправкой.")
+        await interaction.followup.send("\n".join(details), ephemeral=True)
+
+
+class TechnicalWarningPanelView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    async def _admin_check(self, interaction):
+        if interaction.user.id not in ADMIN_USER_IDS:
+            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label=es("📨 Уведомить наблюдавшихся онлайн"), style=discord.ButtonStyle.primary, custom_id="technical_warning_start_online", row=0)
+    async def start_online(self, interaction, button):
+        if await self._admin_check(interaction):
+            await interaction.response.send_modal(TechnicalWarningComposeModal("online"))
+
+    @discord.ui.button(label=es("🌙 Не наблюдались онлайн"), style=discord.ButtonStyle.secondary, custom_id="technical_warning_start_offline", row=0)
+    async def start_offline(self, interaction, button):
+        if await self._admin_check(interaction):
+            await interaction.response.send_modal(TechnicalWarningComposeModal("offline"))
+
+    @discord.ui.button(label=es("⏸ Пауза"), style=discord.ButtonStyle.secondary, custom_id="technical_warning_pause", row=1)
+    async def pause_campaign(self, interaction, button):
+        if not await self._admin_check(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        success, message = await _tech_warning_set_campaign_status("pause")
+        await interaction.followup.send(("✅ " if success else "⚠️ ") + message, ephemeral=True)
+
+    @discord.ui.button(label=es("▶ Продолжить"), style=discord.ButtonStyle.success, custom_id="technical_warning_resume", row=1)
+    async def resume_campaign(self, interaction, button):
+        if not await self._admin_check(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        success, message = await _tech_warning_set_campaign_status("resume")
+        await interaction.followup.send(("✅ " if success else "⚠️ ") + message, ephemeral=True)
+
+    @discord.ui.button(label=es("⏹ Остановить"), style=discord.ButtonStyle.danger, custom_id="technical_warning_stop", row=1)
+    async def stop_campaign(self, interaction, button):
+        if not await self._admin_check(interaction):
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        success, message = await _tech_warning_set_campaign_status("stop")
+        await interaction.followup.send(("✅ " if success else "⚠️ ") + message, ephemeral=True)
+
+    @discord.ui.button(label=es("📊 Статистика"), style=discord.ButtonStyle.primary, custom_id="technical_warning_stats", row=2)
+    async def show_stats(self, interaction, button):
+        if not await self._admin_check(interaction):
+            return
+        await interaction.response.send_message(_tech_warning_stats_text(), ephemeral=True)
+
+    @discord.ui.button(label=es("🚫 ID соперников"), style=discord.ButtonStyle.secondary, custom_id="technical_warning_competitor_ids", row=2)
+    async def manage_competitors(self, interaction, button):
+        if not await self._admin_check(interaction):
+            return
+        await interaction.response.send_modal(TechnicalWarningCompetitorIdsModal())
 
 
 class AdminMainMenuView(discord.ui.View):
@@ -10075,6 +10919,9 @@ async def force_restart_bot():
 @client.event
 async def on_member_join(member: discord.Member):
     member_index.upsert(member)
+    if _TECH_WARNING_STATE_READY and member.guild.id == _TECH_WARNING_GUILD_ID and member.status in TECH_WARNING_ONLINE_STATUSES:
+        _tech_warning_enqueue_new_online(member)
+        _tech_warning_ensure_worker()
     try:
         await relink_discord_id_on_join(member)
     except Exception as e:
@@ -10103,6 +10950,10 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         member_index.remove(before)
     member_index.upsert(after)
 
+    if _TECH_WARNING_STATE_READY and after.guild.id == _TECH_WARNING_GUILD_ID and after.status in TECH_WARNING_ONLINE_STATUSES:
+        _tech_warning_enqueue_new_online(after)
+        _tech_warning_ensure_worker()
+
     project_role_ids = {ROLE_IDS[key] for key in PROJECT_ROLE_KEYS if ROLE_IDS.get(key)}
     before_role_ids = {role.id for role in before.roles}
     after_role_ids = {role.id for role in after.roles}
@@ -10118,6 +10969,16 @@ async def on_member_update(before: discord.Member, after: discord.Member):
 async def _delayed_cleanup_temp_room(channel_id: int):
     await asyncio.sleep(2)
     await cleanup_empty_temp_room(channel_id)
+
+
+@client.event
+async def on_presence_update(before: discord.Member, after: discord.Member):
+    # В реестр попадают только участники целевого сервера, впервые замеченные
+    # в online / idle / dnd. Текущее состояние offline не удаляет их из реестра.
+    if _TECH_WARNING_STATE_READY and after.guild.id == _TECH_WARNING_GUILD_ID:
+        if after.status in TECH_WARNING_ONLINE_STATUSES:
+            _tech_warning_enqueue_new_online(after)
+            _tech_warning_ensure_worker()
 
 
 @client.event
@@ -10171,10 +11032,13 @@ async def on_ready():
             if len(client.guilds) > 1:
                 print(f"⚠️ Бот состоит более чем в одной гильдии ({len(client.guilds)}) — "
                       f"member_index поддерживает индекс только ПОСЛЕДНЕЙ гильдии из списка.")
+        await _tech_warning_scan_current_presence()
+        await _tech_warning_ensure_panel()
         print("ℹ️ Повторный on_ready (восстановление соединения) — тяжёлая инициализация пропущена, индекс участников пересобран.")
         return
 
     await load_all_firebase_data()
+    _tech_warning_initialize_state()
     ensure_weekly_events_file()
     await load_clan_members_from_firebase()
     
@@ -10196,6 +11060,8 @@ async def on_ready():
         await setup_voice_room_triggers(guild)
         await sync_voice_rooms_on_startup(guild)
         await enforce_read_only_channel(guild)
+
+    await _tech_warning_scan_current_presence()
 
     try:
         await catch_up_weekly_events_on_startup()
@@ -10252,6 +11118,7 @@ async def on_ready():
     await flush_log_buffer_to_discord()
     
     client.add_view(AdminMainMenuView())
+    client.add_view(TechnicalWarningPanelView())
     client.add_view(VacationRequestView())
     client.add_view(VacationApprovalView())
     client.add_view(VacationMessageView())
@@ -10279,6 +11146,8 @@ async def on_ready():
         await ensure_office_message()
     except Exception as e:
         print(f"⚠️ Не удалось создать/обновить канал канцелярии для игроков: {e}")
+
+    await _tech_warning_ensure_panel()
 
     # Печатаем ЭТОТ лог последним — только после того, как ветка "🔧 Логирование"
     # уже гарантированно найдена/создана (ensure_admin_channel_anchors выше)
