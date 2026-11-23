@@ -905,6 +905,15 @@ ANKETA_MESSAGES_FILE = os.path.join(BASE_DIR, 'anketa_messages.json')
 DISCORD_LINK_CACHE_FILE = os.path.join(BASE_DIR, 'discord_link_cache.json')
 PLAYER_DM_STATE_FILE = os.path.join(BASE_DIR, 'player_dm_state.json')
 TECH_WARNING_STATE_FILE = os.path.join(BASE_DIR, 'technical_warning_state.json')
+# Ограничения технических уведомлений. Время — московское (MSK).
+TECH_WARNING_SEND_WINDOW_START_HOUR = 18  # 18:00 включительно
+TECH_WARNING_SEND_WINDOW_END_HOUR = 22    # 22:00 исключительно
+TECH_WARNING_DAILY_LIMIT_MIN = 21
+TECH_WARNING_DAILY_LIMIT_MAX = 25
+TECH_WARNING_PAUSE_MIN_MINUTES = 5
+TECH_WARNING_PAUSE_MAX_MINUTES = 15
+# Консервативная пауза, сохраняемая ДО HTTP-запроса на случай падения процесса.
+TECH_WARNING_RECOVERY_PAUSE_MINUTES = 15
 CHECK_HISTORY_FILE = os.path.join(BASE_DIR, 'check_history.json')
 PENDING_DISCIPLINE_FILE = os.path.join(BASE_DIR, 'pending_discipline.json')
 
@@ -2458,6 +2467,16 @@ def _tech_warning_default_state():
         "campaign": None,
         "campaign_history": [],
         "panel_message_id": None,
+        "daily_throttle": {
+            "date": None,
+            "limit": None,
+            # used_count — зарезервированные слоты. Неизвестная отправка
+            # после сбоя тоже занимает слот, чтобы не превысить дневной максимум.
+            "used_count": 0,
+            "sent_count": 0,
+            # Сохраняется между перезапусками и не сбрасывается в полночь.
+            "next_send_at": None,
+        },
     }
 
 
@@ -2514,12 +2533,14 @@ def _tech_warning_initialize_state():
     # Если процесс оборвался во время HTTP-запроса, нельзя угадывать,
     # дошло ли сообщение. Такие адресаты переводятся в unknown и не повторяются.
     deliveries = state.setdefault("notice_deliveries", {})
+    recovered_inflight = False
     for notice_hash, per_user in list(deliveries.items()):
         if not isinstance(per_user, dict):
             deliveries[notice_hash] = {}
             continue
         for user_id, record in list(per_user.items()):
             if isinstance(record, dict) and record.get("status") == "sending":
+                recovered_inflight = True
                 record["status"] = "unknown"
                 record["updated_at"] = datetime.now().astimezone().isoformat()
 
@@ -2528,6 +2549,7 @@ def _tech_warning_initialize_state():
         recipients = campaign.setdefault("recipients", {})
         for user_id, record in recipients.items():
             if isinstance(record, dict) and record.get("status") == "sending":
+                recovered_inflight = True
                 record["status"] = "unknown"
                 record["reason"] = "Процесс перезапустился во время отправки; проверьте вручную."
                 record["updated_at"] = datetime.now().astimezone().isoformat()
@@ -2540,6 +2562,32 @@ def _tech_warning_initialize_state():
                 campaign["status"] = "waiting_online"
             elif not has_queue and campaign.get("mode") == "offline":
                 campaign["status"] = "completed"
+
+# Если процесс оборвался во время отправки, неизвестный результат
+    # считается занятым дневным слотом, а следующая отправка откладывается.
+    if recovered_inflight:
+        throttle = state.setdefault("daily_throttle", {})
+        if not isinstance(throttle, dict):
+            throttle = {}
+            state["daily_throttle"] = throttle
+
+        recovery_target = datetime.now(MSK) + timedelta(
+            minutes=TECH_WARNING_RECOVERY_PAUSE_MINUTES
+        )
+
+        try:
+            saved_target = datetime.fromisoformat(
+                str(throttle.get("next_send_at"))
+            )
+            if saved_target.tzinfo is None:
+                saved_target = MSK.localize(saved_target)
+            else:
+                saved_target = saved_target.astimezone(MSK)
+        except (TypeError, ValueError):
+            saved_target = None
+
+        if saved_target is None or saved_target < recovery_target:
+            throttle["next_send_at"] = recovery_target.isoformat()
 
     TECH_WARNING_STATE = state
     _TECH_WARNING_STATE_READY = True
@@ -2848,124 +2896,446 @@ async def _tech_warning_mark_result(user_id: int, status: str, reason: str | Non
     _tech_warning_save_state()
 
 
+def _tech_warning_get_daily_throttle():
+    """Возвращает общий дневной лимит для всех кампаний технических уведомлений."""
+    throttle = TECH_WARNING_STATE.setdefault("daily_throttle", {})
+    if not isinstance(throttle, dict):
+        throttle = {}
+        TECH_WARNING_STATE["daily_throttle"] = throttle
+
+    today = datetime.now(MSK).date().isoformat()
+    if throttle.get("date") != today:
+        # next_send_at намеренно сохраняем: интервал между отправками
+        # должен соблюдаться и при переходе через полночь.
+        next_send_at = throttle.get("next_send_at")
+        throttle.update({
+            "date": today,
+            "limit": random.randint(
+                TECH_WARNING_DAILY_LIMIT_MIN,
+                TECH_WARNING_DAILY_LIMIT_MAX,
+            ),
+            "used_count": 0,
+            "sent_count": 0,
+            "next_send_at": next_send_at,
+        })
+        _tech_warning_save_state()
+
+    try:
+        throttle["limit"] = int(throttle.get("limit"))
+    except (TypeError, ValueError):
+        throttle["limit"] = random.randint(
+            TECH_WARNING_DAILY_LIMIT_MIN,
+            TECH_WARNING_DAILY_LIMIT_MAX,
+        )
+
+    if not TECH_WARNING_DAILY_LIMIT_MIN <= throttle["limit"] <= TECH_WARNING_DAILY_LIMIT_MAX:
+        throttle["limit"] = random.randint(
+            TECH_WARNING_DAILY_LIMIT_MIN,
+            TECH_WARNING_DAILY_LIMIT_MAX,
+        )
+
+    for key in ("used_count", "sent_count"):
+        try:
+            throttle[key] = max(0, int(throttle.get(key, 0)))
+        except (TypeError, ValueError):
+            throttle[key] = 0
+
+    throttle.setdefault("next_send_at", None)
+    return throttle
+
+
+def _tech_warning_is_sending_time(now=None):
+    """Разрешает начало отправки с 18:00:00 до 21:59:59.999 по Москве."""
+    now = now or datetime.now(MSK)
+    start = now.replace(
+        hour=TECH_WARNING_SEND_WINDOW_START_HOUR,
+        minute=0, second=0, microsecond=0,
+    )
+    end = now.replace(
+        hour=TECH_WARNING_SEND_WINDOW_END_HOUR,
+        minute=0, second=0, microsecond=0,
+    )
+    return start <= now < end
+
+
+def _tech_warning_next_window_start(now=None, tomorrow=False):
+    """Ближайшее 18:00 MSK; при tomorrow=True — 18:00 следующего дня."""
+    now = now or datetime.now(MSK)
+    target_date = now.date()
+    if tomorrow or now.hour >= TECH_WARNING_SEND_WINDOW_END_HOUR:
+        target_date += timedelta(days=1)
+    target_naive = datetime.combine(target_date, datetime.min.time()).replace(
+        hour=TECH_WARNING_SEND_WINDOW_START_HOUR
+    )
+    return MSK.localize(target_naive)
+
+
+def _tech_warning_parse_throttle_datetime(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+        if parsed.tzinfo is None:
+            parsed = MSK.localize(parsed)
+        else:
+            parsed = parsed.astimezone(MSK)
+        return parsed
+    except (TypeError, ValueError):
+        return None
+
+
+async def _tech_warning_wait_until(target, campaign):
+    """Ожидает до времени target, проверяя паузу/остановку не реже раза в 5 секунд."""
+    if target.tzinfo is None:
+        target = MSK.localize(target)
+    else:
+        target = target.astimezone(MSK)
+
+    while not client.is_closed():
+        status = campaign.get("status")
+        if status in {"stopped", "completed"}:
+            return False
+        if status == "paused":
+            await asyncio.sleep(1)
+            continue
+
+        remaining = (target - datetime.now(MSK)).total_seconds()
+        if remaining <= 0:
+            return True
+        await asyncio.sleep(min(remaining, 5))
+
+    return False
+
+
 async def _tech_warning_worker():
-    """Единственный последовательный worker; discord.py сам обрабатывает обычные REST rate limits."""
+    """Последовательная отправка с дневным лимитом, временным окном и паузой."""
     while not client.is_closed():
         campaign = TECH_WARNING_STATE.get("campaign")
-        if not campaign or campaign.get("status") in {"paused", "stopped", "completed"}:
+        if not campaign:
             return
 
+        status = campaign.get("status")
+        if status in {"stopped", "completed"}:
+            return
+        if status == "paused":
+            # Не завершаем задачу на паузе: после Resume она продолжит работу.
+            await asyncio.sleep(1)
+            continue
+
         queued_ids = [
-            int(user_id) for user_id, record in campaign.get("recipients", {}).items()
-            if isinstance(record, dict) and record.get("status") == "queued" and str(user_id).isdigit()
+            int(user_id)
+            for user_id, record in campaign.get("recipients", {}).items()
+            if isinstance(record, dict)
+            and record.get("status") == "queued"
+            and str(user_id).isdigit()
         ]
+
         if not queued_ids:
             if campaign.get("mode") == "online":
-                # Сохраняем переход только один раз: не создаём лишнюю запись
-                # в Firestore каждые две секунды, пока ждём новых участников.
                 if campaign.get("status") != "waiting_online":
                     campaign["status"] = "waiting_online"
                     _tech_warning_save_state()
                 await asyncio.sleep(2)
                 continue
+
             campaign["status"] = "completed"
             _tech_warning_save_state()
+            await _tech_warning_persist_state_durable()
             return
+
+        if campaign.get("status") == "waiting_online":
+            campaign["status"] = "running"
+            _tech_warning_save_state()
+
+        # Сначала завершаем очередь, затем проверяем расписание: пустая offline-
+        # кампания должна стать completed даже ночью.
+        now = datetime.now(MSK)
+        if not _tech_warning_is_sending_time(now):
+            next_open = _tech_warning_next_window_start(now)
+            print(
+                "⏰ Техническая рассылка вне окна 18:00–22:00 MSK. "
+                f"Следующее окно: {next_open.strftime('%d.%m.%Y %H:%M')} MSK"
+            )
+            if not await _tech_warning_wait_until(next_open, campaign):
+                return
+            continue
+
+        throttle = _tech_warning_get_daily_throttle()
+        if throttle["used_count"] >= throttle["limit"]:
+            next_open = _tech_warning_next_window_start(now, tomorrow=True)
+            print(
+                "📊 Дневной лимит технических уведомлений исчерпан: "
+                f"{throttle['used_count']}/{throttle['limit']}. "
+                f"Следующее окно: {next_open.strftime('%d.%m.%Y %H:%M')} MSK"
+            )
+            if not await _tech_warning_wait_until(next_open, campaign):
+                return
+            continue
+
+        next_send = _tech_warning_parse_throttle_datetime(throttle.get("next_send_at"))
+        if next_send and next_send > now:
+            if not await _tech_warning_wait_until(next_send, campaign):
+                return
+            continue
 
         user_id = queued_ids[0]
         guild = await _tech_warning_resolve_guild()
         if guild is None:
             await asyncio.sleep(5)
             continue
+
         member = guild.get_member(user_id)
         if member is None:
             try:
                 member = await guild.fetch_member(user_id)
             except discord.NotFound:
-                await _tech_warning_mark_result(user_id, "skipped", "Участник больше не состоит на сервере.")
+                await _tech_warning_mark_result(
+                    user_id, "skipped", "Участник больше не состоит на сервере."
+                )
                 continue
             except discord.HTTPException as exc:
                 print(f"⚠️ Не удалось повторно получить участника {user_id}: {exc}")
                 await asyncio.sleep(5)
                 continue
 
-        # Администратор мог поставить очередь на паузу/остановить её,
-        # пока worker ожидал fetch_member. Не начинаем новый DM после этого.
         if campaign.get("status") != "running":
-            return
+            continue
 
-        # Фильтры повторно проверяются непосредственно перед отправкой.
         reason = _tech_warning_filter_reason(member)
         if reason:
             await _tech_warning_mark_result(user_id, "skipped", reason)
             continue
 
         notice_hash = campaign.get("notice_hash", "")
-        if _tech_warning_delivery_record(notice_hash, user_id) is not None:
-            await _tech_warning_mark_result(user_id, "skipped", "Для этого текста уже была попытка отправки.")
+        previous_delivery = _tech_warning_delivery_record(notice_hash, user_id)
+        if previous_delivery is not None:
+            await _tech_warning_mark_result(
+                user_id, "skipped", "Для этого текста уже была попытка отправки."
+            )
             continue
 
-        deliveries = TECH_WARNING_STATE.setdefault("notice_deliveries", {}).setdefault(notice_hash, {})
-        delivery = {"status": "sending", "started_at": _tech_warning_timestamp(), "campaign_id": campaign.get("id")}
+        # Повторная проверка всех ограничений после получения участника.
+        now = datetime.now(MSK)
+        if not _tech_warning_is_sending_time(now):
+            next_open = _tech_warning_next_window_start(now)
+            if not await _tech_warning_wait_until(next_open, campaign):
+                return
+            continue
+
+        throttle = _tech_warning_get_daily_throttle()
+        if throttle["used_count"] >= throttle["limit"]:
+            next_open = _tech_warning_next_window_start(now, tomorrow=True)
+            if not await _tech_warning_wait_until(next_open, campaign):
+                return
+            continue
+
+        next_send = _tech_warning_parse_throttle_datetime(throttle.get("next_send_at"))
+        if next_send and next_send > now:
+            if not await _tech_warning_wait_until(next_send, campaign):
+                return
+            continue
+
+        # Резервируем слот ДО HTTP-запроса. Если процесс упадёт после того,
+        # как Discord принял DM, лимит всё равно не будет превышен.
+        previous_used_count = throttle["used_count"]
+        previous_next_send_at = throttle.get("next_send_at")
+        reservation_date = throttle["date"]
+        throttle["used_count"] = previous_used_count + 1
+        throttle["next_send_at"] = (
+            now + timedelta(minutes=TECH_WARNING_RECOVERY_PAUSE_MINUTES)
+        ).isoformat()
+
+        deliveries = TECH_WARNING_STATE.setdefault("notice_deliveries", {}).setdefault(
+            notice_hash, {}
+        )
+        delivery = {
+            "status": "sending",
+            "started_at": _tech_warning_timestamp(),
+            "campaign_id": campaign.get("id"),
+            "daily_reservation_date": reservation_date,
+        }
         deliveries[str(user_id)] = delivery
         recipient_record = campaign.setdefault("recipients", {}).setdefault(str(user_id), {})
-        recipient_record.update({"status": "sending", "updated_at": _tech_warning_timestamp()})
-        _tech_warning_save_state()  # фиксируем до обращения к Discord API
+        recipient_record.update({
+            "status": "sending",
+            "updated_at": _tech_warning_timestamp(),
+        })
+        _tech_warning_save_state()
+
         if not await _tech_warning_persist_state_durable():
+            # API ещё не вызывался — возвращаем слот и адресата в очередь.
+            throttle["used_count"] = previous_used_count
+            throttle["next_send_at"] = previous_next_send_at
             deliveries.pop(str(user_id), None)
-            recipient_record.update({"status": "queued", "updated_at": _tech_warning_timestamp()})
+            recipient_record.update({
+                "status": "queued",
+                "updated_at": _tech_warning_timestamp(),
+            })
             _tech_warning_save_state()
             await asyncio.sleep(5)
             continue
 
-        # Пока ожидали подтверждение Firestore, администратор тоже мог
-        # нажать «Пауза» или «Остановить». В таком случае API-вызов не делаем.
+        # Администратор мог нажать Pause/Stop во время сохранения резерва.
         if campaign.get("status") != "running":
+            throttle["used_count"] = previous_used_count
+            throttle["next_send_at"] = previous_next_send_at
             deliveries.pop(str(user_id), None)
             if campaign.get("status") == "stopped":
                 recipient_record.update({
-                    "status": "skipped", "reason": "Кампания остановлена до начала отправки.",
+                    "status": "skipped",
+                    "reason": "Кампания остановлена до начала отправки.",
                     "updated_at": _tech_warning_timestamp(),
                 })
             else:
-                recipient_record.update({"status": "queued", "updated_at": _tech_warning_timestamp()})
+                recipient_record.update({
+                    "status": "queued",
+                    "updated_at": _tech_warning_timestamp(),
+                })
             _tech_warning_save_state()
             await _tech_warning_persist_state_durable()
-            return
+            if campaign.get("status") == "stopped":
+                return
+            continue
+
+        # Последняя проверка окна — непосредственно перед member.send().
+        now = datetime.now(MSK)
+        if not _tech_warning_is_sending_time(now):
+            throttle["used_count"] = previous_used_count
+            throttle["next_send_at"] = previous_next_send_at
+            deliveries.pop(str(user_id), None)
+            recipient_record.update({
+                "status": "queued",
+                "updated_at": _tech_warning_timestamp(),
+            })
+            _tech_warning_save_state()
+            await _tech_warning_persist_state_durable()
+            next_open = _tech_warning_next_window_start(now)
+            if not await _tech_warning_wait_until(next_open, campaign):
+                return
+            continue
 
         try:
             await member.send(
                 campaign.get("message", ""),
                 allowed_mentions=discord.AllowedMentions.none(),
             )
-            delivery["status"] = "sent"
-            delivery["updated_at"] = _tech_warning_timestamp()
-            recipient_record.update({"status": "sent", "updated_at": _tech_warning_timestamp()})
-        except discord.HTTPException as exc:
-            # 429 означает, что запрос отклонён лимитом. Снимаем маркер попытки
-            # и повторяем только после retry_after; не пытаемся обходить лимит.
-            if getattr(exc, "status", None) == 429:
-                deliveries.pop(str(user_id), None)
-                recipient_record.update({"status": "queued", "updated_at": _tech_warning_timestamp()})
-                retry_after = getattr(exc, "retry_after", None)
-                try:
-                    wait_seconds = max(1.0, float(retry_after))
-                except (TypeError, ValueError):
-                    wait_seconds = 5.0
-                _tech_warning_save_state()
-                await asyncio.sleep(wait_seconds)
-                continue
-            delivery.update({"status": "failed", "updated_at": _tech_warning_timestamp(), "error": str(exc)[:300]})
-            recipient_record.update({"status": "failed", "reason": str(exc)[:300], "updated_at": _tech_warning_timestamp()})
-            print(f"⚠️ Не удалось отправить техническое уведомление участнику {user_id}: {exc}")
-        except Exception as exc:
-            delivery.update({"status": "failed", "updated_at": _tech_warning_timestamp(), "error": str(exc)[:300]})
-            recipient_record.update({"status": "failed", "reason": str(exc)[:300], "updated_at": _tech_warning_timestamp()})
-            print(f"⚠️ Ошибка отправки технического уведомления участнику {user_id}: {exc}")
 
-        _tech_warning_save_state()
-        # Последовательная обработка без параллельного шквала запросов.
-        await asyncio.sleep(1.5)
+            sent_at = datetime.now(MSK)
+            pause_minutes = random.randint(
+                TECH_WARNING_PAUSE_MIN_MINUTES,
+                TECH_WARNING_PAUSE_MAX_MINUTES,
+            )
+            next_allowed = sent_at + timedelta(minutes=pause_minutes)
+
+            delivery.update({
+                "status": "sent",
+                "updated_at": _tech_warning_timestamp(),
+            })
+            recipient_record.update({
+                "status": "sent",
+                "updated_at": _tech_warning_timestamp(),
+            })
+            if throttle.get("date") == sent_at.date().isoformat():
+                throttle["sent_count"] += 1
+            throttle["next_send_at"] = next_allowed.isoformat()
+
+            _tech_warning_save_state()
+            if not await _tech_warning_persist_state_durable():
+                # До отправки уже был надёжно сохранён резерв + 15-минутный
+                # защитный интервал. При рестарте sending станет unknown.
+                print(
+                    "⚠️ DM отправлен, но сохранение результата не подтверждено. "
+                    "Слот дневного лимита оставлен занятым для безопасности."
+                )
+
+            print(
+                f"📨 Техническое уведомление отправлено участнику {user_id}. "
+                f"Дневной лимит: {throttle['used_count']}/{throttle['limit']}. "
+                f"Следующая отправка не ранее чем через {pause_minutes} мин."
+            )
+            if not await _tech_warning_wait_until(next_allowed, campaign):
+                return
+
+        except discord.HTTPException as exc:
+            status_code = getattr(exc, "status", None)
+
+            if status_code == 429:
+                # Discord явно отклонил запрос по rate limit: сообщение не отправлено.
+                throttle["used_count"] = previous_used_count
+                throttle["next_send_at"] = previous_next_send_at
+                deliveries.pop(str(user_id), None)
+                recipient_record.update({
+                    "status": "queued",
+                    "updated_at": _tech_warning_timestamp(),
+                })
+                try:
+                    retry_after = max(1.0, float(getattr(exc, "retry_after", 5.0)))
+                except (TypeError, ValueError):
+                    retry_after = 5.0
+                _tech_warning_save_state()
+                await _tech_warning_persist_state_durable()
+                print(f"⏳ Discord вернул 429; соблюдаю Retry-After: {retry_after:.1f} сек.")
+                retry_target = datetime.now(MSK) + timedelta(seconds=retry_after)
+                if not await _tech_warning_wait_until(retry_target, campaign):
+                    return
+                continue
+
+            if isinstance(status_code, int) and 400 <= status_code < 500:
+                # Явный отказ 4xx: DM не принят Discord, слот можно вернуть.
+                throttle["used_count"] = previous_used_count
+                throttle["next_send_at"] = previous_next_send_at
+                delivery.update({
+                    "status": "failed",
+                    "updated_at": _tech_warning_timestamp(),
+                    "error": str(exc)[:300],
+                })
+                recipient_record.update({
+                    "status": "failed",
+                    "reason": str(exc)[:300],
+                    "updated_at": _tech_warning_timestamp(),
+                })
+            else:
+                # 5xx/необычный ответ может означать неопределённый результат.
+                # Слот не возвращаем, повторно этому участнику не отправляем.
+                delivery.update({
+                    "status": "unknown",
+                    "updated_at": _tech_warning_timestamp(),
+                    "error": str(exc)[:300],
+                })
+                recipient_record.update({
+                    "status": "unknown",
+                    "reason": "Неопределённый ответ Discord; проверьте вручную.",
+                    "updated_at": _tech_warning_timestamp(),
+                })
+                throttle["next_send_at"] = (
+                    datetime.now(MSK)
+                    + timedelta(minutes=TECH_WARNING_RECOVERY_PAUSE_MINUTES)
+                ).isoformat()
+
+            _tech_warning_save_state()
+            await _tech_warning_persist_state_durable()
+            print(f"⚠️ Ошибка Discord при отправке участнику {user_id}: {exc}")
+
+        except Exception as exc:
+            # Неизвестная ошибка: нельзя утверждать, что DM точно не дошёл.
+            # Поэтому сохраняем слот и не повторяем сообщение этому участнику.
+            delivery.update({
+                "status": "unknown",
+                "updated_at": _tech_warning_timestamp(),
+                "error": str(exc)[:300],
+            })
+            recipient_record.update({
+                "status": "unknown",
+                "reason": "Неопределённый результат отправки; проверьте вручную.",
+                "updated_at": _tech_warning_timestamp(),
+            })
+            throttle["next_send_at"] = (
+                datetime.now(MSK)
+                + timedelta(minutes=TECH_WARNING_RECOVERY_PAUSE_MINUTES)
+            ).isoformat()
+            _tech_warning_save_state()
+            await _tech_warning_persist_state_durable()
+            print(f"⚠️ Неопределённая ошибка при отправке участнику {user_id}: {exc}")
 
 
 def _tech_warning_ensure_worker():
