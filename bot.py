@@ -569,7 +569,9 @@ _ES_REPLACEMENTS = {
     '▶ ': '▶ㅤ', '♻️ ': '♻️ㅤ', '⚙️ ': '⚙️ㅤ', '➕ ': '➕ㅤ',
     '⬅️ ': '⬅️ㅤ', '🌙 ': '🌙ㅤ', '🏕️ ': '🏕️ㅤ', '📊 ': '📊ㅤ',
     '📣 ': '📣ㅤ', '📦 ': '📦ㅤ', '📨 ': '📨ㅤ', '🖱️ ': '🖱️ㅤ',
-    '🗄️ ': '🗄️ㅤ', '🛟 ': '🛟ㅤ', '🧌 ': '🧌ㅤ', '🧟 ': '🧟ㅤ',
+    '🗄️ ': '🗄ㅤ', '🛟 ': '🛟ㅤ', '🧌 ': '🧌ㅤ', '🧟 ': '🧟ㅤ',
+    '🛠️ ': '🛠️ㅤ', '📅 ': '📅ㅤ', '💬 ': '💬ㅤ', '🏖️ ': '🏖️ㅤ',
+    '🔍️ ': '🔍ㅤ', '⚙️ ': '⚙️ㅤ', '🚩 ': '🚩ㅤ',
 }
 # Один скомпилированный regex вместо последовательных str.replace()
 # на каждый вызов es(); длинные emoji-последовательности сортируются первыми.
@@ -8647,7 +8649,7 @@ class OfficeMenuView(discord.ui.LayoutView):
         # выбранная отметка означает выдать роль, снятая — удалить её.
         outings_role_options = ((OUTINGS_ARMA_ROLE_ID, OUTINGS_ARMA_ROLE_NAME),)
         outings_roles_select = discord.ui.Select(
-            placeholder="Участие в вылазках (чтобы снять - уберите галочку)",
+            placeholder="Роль для вылазок (чтобы снять - уберите галочку)",
             options=[
                 discord.SelectOption(label=name, value=str(role_id))
                 for role_id, name in outings_role_options
@@ -8713,7 +8715,7 @@ class OfficeMenuView(discord.ui.LayoutView):
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
             discord.ui.TextDisplay(
                 "### Участие в вылазках\n"
-                "Отметьте пункт «Вылазки ArmA», если хотите участвовать в клановых вылазках. "
+                "Отметьте пункт, если хотите участвовать в клановых вылазках. "
                 "Чтобы отказаться от участия, уберите соответствующую отметку."
             ),
             discord.ui.ActionRow(outings_roles_select),
@@ -8727,8 +8729,8 @@ class OfficeMenuView(discord.ui.LayoutView):
         self.add_item(discord.ui.Container(
             discord.ui.TextDisplay(
                 "### Оформление отпуска\n"
-                "Вы можете оформить отпуск в специальном канале. Там опубликованы правила "
-                "и форма для подачи заявки."
+                "Вы можете оформить отпуск в специальном канале. Нажмите, чтобы перейти "
+                "к правилам и форме подачи заявки."
             ),
             discord.ui.ActionRow(vacation_btn),
             accent_color=accent,
@@ -8738,7 +8740,7 @@ class OfficeMenuView(discord.ui.LayoutView):
                 "### Создание мероприятия\n"
                 "Вы можете самостоятельно создать мероприятие в расписании и пригласить на него "
                 "других игроков. Например, чтобы собраться на игру на публичном сервере "
-                "или провести собственное мероприятие."
+                "(клановую вылазку) или провести другое мероприятие."
             ),
             discord.ui.ActionRow(create_btn),
             accent_color=accent,
@@ -10221,7 +10223,7 @@ async def publish_weekly_kickoff_announcement(week_key: str) -> bool:
             kickoff_view = discord.ui.LayoutView(timeout=None)
             kickoff_view.add_item(
                 discord.ui.Container(
-                    discord.ui.TextDisplay("# 🪖 Новая неделя в клане!"),
+                    discord.ui.TextDisplay("# 🚩🚩🚩 Новая неделя в клане!"),
                     discord.ui.Separator(
                         visible=True,
                         spacing=discord.SeparatorSpacing.large,
