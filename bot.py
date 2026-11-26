@@ -340,51 +340,65 @@ def _requeue_unsent_log_text(full_text: str, sent_chars: int):
 
 
 async def flush_log_buffer_to_discord():
-    """Периодически отправляет накопленные строки логов пачками в ветку
-    якорного сообщения '🔧 Логирование'. До того, как якорь создан — строки
-    копятся в буфере. При ЛЮБОЙ ошибке отправки неотправленный хвост
-    возвращается в буфер, а не теряется."""
+    """Отправляет накопленные логи небольшими последовательными пачками.
+
+    Защищено async-lock от одновременного вызова scheduler/on_ready.
+    За один запуск отправляется не более трёх сообщений; остаток возвращается
+    в начало буфера и будет обработан следующим запуском. Это не позволяет
+    большому буферу удерживать задачу дольше интервала APScheduler.
+    """
     global _log_forward_thread_cache, _FLUSHING_LOG_BUFFER
-    with _log_forward_lock:
-        if not _log_forward_buffer:
-            return
-        lines = list(_log_forward_buffer)
-        _log_forward_buffer.clear()
-    if not lines:
-        return
 
-    _FLUSHING_LOG_BUFFER = True
-    text = "\n".join(lines)
-    chunk_size = 1900
-    sent_chars = 0
-    try:
-        if _log_forward_thread_cache is None:
-            thread_id = await get_logging_thread_id()
-            if not thread_id:
-                with _log_forward_lock:
-                    for line in reversed(lines):
-                        _log_forward_buffer.appendleft(line)
+    async with _log_forward_async_lock:
+        with _log_forward_lock:
+            if not _log_forward_buffer:
                 return
-            _log_forward_thread_cache = await client.fetch_channel(thread_id)
+            lines = list(_log_forward_buffer)
+            _log_forward_buffer.clear()
 
-        thread = _log_forward_thread_cache
-        for i in range(0, len(text), chunk_size):
-            chunk = text[i:i + chunk_size]
-            await thread.send(f"```\n{chunk}\n```")
-            sent_chars = i + len(chunk)
-            await asyncio.sleep(0.5)
-    except (discord.NotFound, discord.Forbidden) as e:
-        # Ветка удалена/заархивирована без прав на снятие блокировки, либо
-        # у бота отозван доступ — сбрасываем кэш, иначе логи в Discord
-        # перестанут идти ВООБЩЕ до следующего перезапуска процесса.
-        _log_forward_thread_cache = None
-        _original_print(f"⚠️ Ветка логирования недоступна ({e}), кэш сброшен — будет переискана.")
-        _requeue_unsent_log_text(text, sent_chars)
-    except Exception as e:
-        _original_print(f"⚠️ Не удалось отправить логи в Discord-ветку: {e}")
-        _requeue_unsent_log_text(text, sent_chars)
-    finally:
-        _FLUSHING_LOG_BUFFER = False
+        if not lines:
+            return
+
+        _FLUSHING_LOG_BUFFER = True
+        full_text = "\n".join(lines)
+        chunk_size = 1900  # запас до лимита Discord в 2000 символов
+        max_chunks_per_flush = 3
+        sent_chars = 0
+
+        try:
+            if _log_forward_thread_cache is None:
+                thread_id = await get_logging_thread_id()
+                if not thread_id:
+                    with _log_forward_lock:
+                        for line in reversed(lines):
+                            _log_forward_buffer.appendleft(line)
+                    return
+                _log_forward_thread_cache = await client.fetch_channel(thread_id)
+
+            thread = _log_forward_thread_cache
+            for chunk_index, i in enumerate(range(0, len(full_text), chunk_size)):
+                if chunk_index >= max_chunks_per_flush:
+                    break
+                chunk = full_text[i:i + chunk_size]
+                await thread.send(f"```\n{chunk}\n```")
+                sent_chars = i + len(chunk)
+                if sent_chars < len(full_text):
+                    await asyncio.sleep(0.5)
+
+            # Остаток не теряем: он будет отправлен следующим циклом.
+            if sent_chars < len(full_text):
+                _requeue_unsent_log_text(full_text, sent_chars)
+
+        except (discord.NotFound, discord.Forbidden) as e:
+            # Ветка удалена/недоступна — сбрасываем кэш, чтобы она была найдена заново.
+            _log_forward_thread_cache = None
+            _original_print(f"⚠️ Ветка логирования недоступна ({e}), кэш сброшен — будет переискана.")
+            _requeue_unsent_log_text(full_text, sent_chars)
+        except Exception as e:
+            _original_print(f"⚠️ Не удалось отправить логи в Discord-ветку: {e}")
+            _requeue_unsent_log_text(full_text, sent_chars)
+        finally:
+            _FLUSHING_LOG_BUFFER = False
 
 
 import gspread
@@ -400,6 +414,8 @@ from collections import deque
 import pytz
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import asyncio
+# Не допускаем одновременную отправку логов из scheduler и on_ready.
+_log_forward_async_lock = asyncio.Lock()
 from concurrent.futures import ThreadPoolExecutor
 import firebase_admin
 from firebase_admin import credentials as firebase_credentials, firestore
@@ -867,20 +883,17 @@ VOICE_ROOM_CATEGORY_DAYZ = 908305448552251392
 VOICE_ROOM_CATEGORY_WOW = 1572603025695047791
 VOICE_ROOM_CATEGORY_SQUAD = 908009506657697842
 
-# Конфигурация категорий временных голосовых комнат.
-# role_key=None означает открытый доступ всем участникам сервера;
-# в остальных случаях видимость и подключение разрешены только указанной роли.
+# Справочник категорий используется только для обнаружения уже настроенных
+# вручную каналов-триггеров. Политика доступа из кода здесь не задаётся.
 VOICE_TRIGGER_CONFIGS = [
-    {'key': 'army',   'category_id': VOICE_ROOM_CATEGORY_ARMY,   'name': "🔵 Создать ГК ArmA",          'role_key': 'klan_arma'},
-    {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать публичную ГК", 'role_key': None},
-    {'key': 'dayz',   'category_id': VOICE_ROOM_CATEGORY_DAYZ,   'name': "🧟 Создать ГК DayZ",          'role_key': 'voice_dayz'},
-    {'key': 'wow',    'category_id': VOICE_ROOM_CATEGORY_WOW,    'name': "🧌 Создать ГК WoW",           'role_key': 'voice_wow'},
-    {'key': 'squad',  'category_id': VOICE_ROOM_CATEGORY_SQUAD,  'name': "🪖 Создать ГК SQUAD",         'role_key': 'voice_squad'},
+    {'key': 'army',   'category_id': VOICE_ROOM_CATEGORY_ARMY,   'name': "🔵 Создать ГК ArmA"},
+    {'key': 'public', 'category_id': VOICE_ROOM_CATEGORY_PUBLIC, 'name': "🍻 Создать публичную ГК"},
+    {'key': 'dayz',   'category_id': VOICE_ROOM_CATEGORY_DAYZ,   'name': "🧟 Создать ГК DayZ"},
+    {'key': 'wow',    'category_id': VOICE_ROOM_CATEGORY_WOW,    'name': "🧌 Создать ГК WoW"},
+    {'key': 'squad',  'category_id': VOICE_ROOM_CATEGORY_SQUAD,  'name': "🪖 Создать ГК SQUAD"},
 ]
 VOICE_TRIGGER_CHANNEL_IDS = {}   # id триггер-канала -> key из VOICE_TRIGGER_CONFIGS
-OLD_VOICE_TRIGGER_NAME_FRAGMENT = "сообществе"
 
-OFFICE_CHANNEL_NAME = "🔵канцелярия-arma"
 # Каждый элемент: (текст с эмодзи, ссылка, номер ряда). Ряды 0 и 1 содержат
 # по 2 кнопки, ряд 2 — одну, ряд 3 зарезервирован под кнопку создания
 # мероприятия (добавляется отдельно в OfficeMenuView, см. ниже).
@@ -5116,18 +5129,50 @@ async def reveal_event_marks(event_id: str, reason: str):
 
 # --- Коллбэки кнопок (standalone-функции, чтобы работать в разных сочетаниях View) ---
 
+async def _defer_ui_interaction(interaction: discord.Interaction, operation: str) -> bool:
+    """Подтверждает interaction до любых потенциально медленных действий.
+
+    Код 10062 означает, что Discord уже считает interaction неизвестным
+    (обычно истёк 3-секундный срок первого ответа). Такой запрос уже нельзя
+    восстановить через followup, поэтому штатно прекращаем обработку и
+    записываем предупреждение вместо необработанного traceback.
+    """
+    if interaction.response.is_done():
+        return True
+
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        return True
+    except discord.NotFound as exc:
+        if getattr(exc, "code", None) == 10062:
+            logging.getLogger("enemy_bot.interactions").warning(
+                "Interaction %s для операции '%s' истёк до подтверждения Discord; действие пропущено.",
+                interaction.id,
+                operation,
+            )
+            return False
+        raise
+    except discord.InteractionResponded:
+        # Защита от повторного подтверждения, если ответ уже отправил другой путь.
+        return True
+
+
 async def on_accept_button(interaction: discord.Interaction):
+    if not await _defer_ui_interaction(interaction, "event_accept"):
+        return
     event_id = get_event_id_by_message_id(interaction.message.id)
     if not event_id:
-        await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        await interaction.followup.send(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
     await handle_event_response(interaction, event_id, "accept")
 
 
 async def on_decline_button(interaction: discord.Interaction):
+    if not await _defer_ui_interaction(interaction, "event_decline"):
+        return
     event_id = get_event_id_by_message_id(interaction.message.id)
     if not event_id:
-        await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        await interaction.followup.send(es("❌ Мероприятие не найдено!"), ephemeral=True)
         return
     await handle_event_response(interaction, event_id, "decline")
 
@@ -5282,54 +5327,72 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление д
         self.event_id = event_id
 
     async def on_submit(self, interaction):
-        events = load_json(EVENTS_FILE, {})
-        event = events.get(self.event_id)
-        if not event:
-            await interaction.response.send_message(es("❌ Мероприятие не найдено!"), ephemeral=True)
+        # Сначала подтверждаем отправку формы: ниже есть несколько запросов к
+        # Discord/Firebase и они могут занять больше разрешённых Discord 3 секунд.
+        if not await _defer_ui_interaction(interaction, "mods_announcement"):
             return
 
-        thread = await get_or_create_thread(event, self.event_id, event['title'])
-        if not thread:
-            await interaction.response.send_message(es("❌ Не удалось получить ветку мероприятия!"), ephemeral=True)
-            return
+        try:
+            events = load_json(EVENTS_FILE, {})
+            event = events.get(self.event_id)
+            if not event:
+                await interaction.followup.send(es("❌ Мероприятие не найдено!"), ephemeral=True)
+                return
 
-        event_start = datetime.fromtimestamp(event['start_time'], MSK)
+            thread = await get_or_create_thread(event, self.event_id, event['title'])
+            if not thread:
+                await interaction.followup.send(es("❌ Не удалось получить ветку мероприятия!"), ephemeral=True)
+                return
 
-        if event_created_late(event):
-            # Мероприятие создано менее чем за сутки — тегаем всех активных,
-            # кто не в отпуске (роль 'Боец ArmA' целиком больше не пингуется).
-            # Отпуска считаются НА ДАТУ МЕРОПРИЯТИЯ, а не на "сейчас": иначе
-            # боец, уходящий в отпуск до старта, получал бы объявление о модах
-            # для мероприятия, на котором его заведомо не будет, а тот, кто
-            # к старту уже вернётся, — не получал бы его вовсе.
-            mention_block = await get_all_active_members_mentions(event_start, event=event)
-        else:
-            # По умолчанию — только тем, кто отметился "Приду"
-            accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
-            if accepted:
-                mention_block = await build_mentions_for_nicknames(accepted, event=event)
-            else:
-                # Никто ещё не отметился — тегаем всех активных, кто не в отпуске
+            event_start = datetime.fromtimestamp(event['start_time'], MSK)
+
+            if event_created_late(event):
+                # Мероприятие создано менее чем за сутки — тегаем всех активных,
+                # кто не в отпуске (роль 'Боец ArmA' целиком больше не пингуется).
+                # Отпуска считаются НА ДАТУ МЕРОПРИЯТИЯ, а не на "сейчас": иначе
+                # боец, уходящий в отпуск до старта, получал бы объявление о модах
+                # для мероприятия, на котором его заведомо не будет, а тот, кто
+                # к старту уже вернётся, — не получал бы его вовсе.
                 mention_block = await get_all_active_members_mentions(event_start, event=event)
+            else:
+                # По умолчанию — только тем, кто отметился "Приду"
+                accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
+                if accepted:
+                    mention_block = await build_mentions_for_nicknames(accepted, event=event)
+                else:
+                    # Никто ещё не отметился — тегаем всех активных, кто не в отпуске
+                    mention_block = await get_all_active_members_mentions(event_start, event=event)
 
-        server_name = self.server_name.value.strip()
-        server_ip = self.server_ip.value.strip()
-        server_port = self.server_port.value.strip()
-        password = self.password.value.strip()
-        text = render_mods_message(mention_block, event, server_name, password, server_ip, server_port)
+            server_name = self.server_name.value.strip()
+            server_ip = self.server_ip.value.strip()
+            server_port = self.server_port.value.strip()
+            password = self.password.value.strip()
+            text = render_mods_message(mention_block, event, server_name, password, server_ip, server_port)
 
-        msg = await thread.send(text)
-        events_fresh = load_json(EVENTS_FILE, {})
-        fresh_event = events_fresh.get(self.event_id)
-        if fresh_event:
-            record_thread_message(fresh_event, msg.id, 'mods', mention_block=mention_block,
-                                   extra={'server_name': server_name, 'password': password,
-                                          'server_ip': server_ip, 'server_port': server_port})
-            save_json(EVENTS_FILE, events_fresh)
-        # Эксперимент (п.2): публикация объявления о модах — один из
-        # триггеров раскрытия списка отметок для всех.
-        await reveal_event_marks(self.event_id, 'mods_announcement')
-        await interaction.response.send_message(es("✅ Объявление для скачивания модов отправлено!"), ephemeral=True)
+            msg = await thread.send(text)
+            events_fresh = load_json(EVENTS_FILE, {})
+            fresh_event = events_fresh.get(self.event_id)
+            if fresh_event:
+                record_thread_message(fresh_event, msg.id, 'mods', mention_block=mention_block,
+                                       extra={'server_name': server_name, 'password': password,
+                                              'server_ip': server_ip, 'server_port': server_port})
+                save_json(EVENTS_FILE, events_fresh)
+            # Публикация объявления о модах — один из триггеров раскрытия отметок.
+            await reveal_event_marks(self.event_id, 'mods_announcement')
+            await interaction.followup.send(
+                es("✅ Объявление для скачивания модов отправлено!"), ephemeral=True
+            )
+        except Exception as exc:
+            logging.getLogger("enemy_bot.interactions").exception(
+                "Ошибка публикации объявления о модах для мероприятия %s", self.event_id
+            )
+            try:
+                await interaction.followup.send(
+                    f"❌ Не удалось отправить объявление: {exc}", ephemeral=True
+                )
+            except discord.NotFound:
+                # Если истёк и webhook-token followup, повторно ответить уже нельзя.
+                pass
 
 # --- Фабрики кнопок ---
 
@@ -9066,11 +9129,8 @@ async def send_vacation_return_message(nickname):
 # ============== ФУНКЦИИ МЕРОПРИЯТИЙ ==============
 
 async def handle_event_response(interaction, event_id, response_type):
-    # defer() в самом начале — до чтения roster из Firebase (может быть
-    # медленным при холодном кэше) и до любых других сетевых операций,
-    # чтобы не рисковать 3-секундным лимитом Discord на первый ответ.
-    await interaction.response.defer(ephemeral=True, thinking=True)
-
+    # Interaction уже подтверждён в on_accept_button/on_decline_button,
+    # до чтения локального файла и любых сетевых операций.
     events = load_json(EVENTS_FILE, {})
     if event_id not in events:
         await interaction.followup.send(es("❌ Мероприятие не найдено!"), ephemeral=True)
@@ -10731,366 +10791,142 @@ async def extract_message_structure(interaction, channel_id, message_id):
         return None
 
 
-OFFICE_CATEGORY_ID = 1284893244878098464
-# Канал, НАД которым должен встать новый канал канцелярии (т.е. канцелярия
-# будет отображаться непосредственно ПЕРЕД ним в списке каналов категории).
-OFFICE_CHANNEL_AFTER_ID = 1297102560305614891
-
 def member_has_klan_arma_role(member) -> bool:
-    """Надёжный маркер 'состав Запас или выше' — роль 'Клан ArmA' выдаётся
-    автоматически именно и только составам 'Запас'/'Личный состав'
-    (см. compute_arma_role_keys), поэтому проверка её наличия эквивалентна
-    проверке состава на сайте, но не требует обращения к Firebase."""
+    """Проверяет наличие роли «Клан ArmA» у участника.
+
+    Используется бизнес-логикой доступа к функциям бота; настройки каналов
+    эта функция не читает и не изменяет.
+    """
     if not member:
         return False
     role_id = ROLE_IDS.get('klan_arma')
     if not role_id:
         return False
-    return any(r.id == role_id for r in member.roles)
+    return any(role.id == role_id for role in member.roles)
 
 
 async def setup_office_channel(guild):
-    """Находит существующую канцелярию по ID (или создаёт канал, если его нет)
-    в категории OFFICE_CATEGORY_ID. Доступен составу 'Запас' и выше."""
-    existing = guild.get_channel(OFFICE_PANEL_CHANNEL_ID)
-    if existing:
-        return existing
-    category = guild.get_channel(OFFICE_CATEGORY_ID)
-    if not category:
-        print(f"⚠️ Категория {OFFICE_CATEGORY_ID} не найдена — канал '{OFFICE_CHANNEL_NAME}' не создан")
-        return None
+    """Возвращает только уже существующий канал канцелярии по ID.
 
-    existing = discord.utils.get(category.text_channels, name=OFFICE_CHANNEL_NAME)
-    if existing:
-        return existing
-
-    klan_role = guild.get_role(ROLE_IDS.get('klan_arma')) if ROLE_IDS.get('klan_arma') else None
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(view_channel=False),
-    }
-    if klan_role:
-        overwrites[klan_role] = discord.PermissionOverwrite(view_channel=True, send_messages=True, read_message_history=True)
-    else:
-        print("⚠️ Роль 'Клан ArmA' не найдена на сервере — канал канцелярии будет создан без ограничения доступа!")
-
-    try:
-        channel = await category.create_text_channel(name=OFFICE_CHANNEL_NAME, overwrites=overwrites)
-        print(f"✅ Создан канал '{OFFICE_CHANNEL_NAME}' (ID: {channel.id})")
-    except Exception as e:
-        print(f"❌ Ошибка создания канала '{OFFICE_CHANNEL_NAME}': {e}")
-        return None
-
-    try:
-        anchor_channel = guild.get_channel(OFFICE_CHANNEL_AFTER_ID)
-        if anchor_channel:
-            # position = anchor.position (а не +1) — новый канал ЗАНИМАЕТ эту
-            # позицию, а якорный канал и всё, что идёт после него, сдвигается
-            # на один пункт вниз. Таким образом канцелярия оказывается СРАЗУ
-            # НАД якорным каналом.
-            await channel.edit(position=anchor_channel.position)
-    except Exception as e:
-        print(f"⚠️ Не удалось расположить канал '{OFFICE_CHANNEL_NAME}' на нужную позицию: {e}")
-
+    Канал должен быть заранее создан и настроен вручную в Discord.
+    Бот не создаёт его, не переименовывает, не перемещает и не меняет права.
+    """
+    channel = guild.get_channel(OFFICE_PANEL_CHANNEL_ID)
+    if channel is None:
+        print(
+            f"⚠️ Канал канцелярии {OFFICE_PANEL_CHANNEL_ID} не найден. "
+            "Бот не будет создавать или настраивать текстовые каналы автоматически."
+        )
     return channel
-
-
-# ============== ПРИНУДИТЕЛЬНО "ТОЛЬКО ЧТЕНИЕ" ДЛЯ КОНКРЕТНОГО КАНАЛА ==============
-
-READ_ONLY_CHANNEL_ID = OFFICE_PANEL_CHANNEL_ID
-READ_ONLY_CHANNEL_WRITER_ROLE_IDS = {1252277370711441429, 1470351490005729383}  # Комбат ArmA, Зам. комбата ArmA
-
-
-async def enforce_read_only_channel(guild):
-    """Гарантирует, что в READ_ONLY_CHANNEL_ID писать могут ТОЛЬКО роли из
-    READ_ONLY_CHANNEL_WRITER_ROLE_IDS — у всех, кто видит канал (включая
-    @everyone и ЛЮБЫЕ другие роли с уже существующими permission overwrite),
-    отправка сообщений принудительно запрещается, а чтение и история
-    сообщений остаются разрешены (view_channel НЕ трогается вообще — этим
-    управляет видимость канала, не входящая в эту задачу).
-
-    Идемпотентно: безопасно вызывать при каждом старте бота — если права
-    кто-то случайно сбросит вручную в Discord, при следующем рестарте бота
-    они будут восстановлены автоматически."""
-    channel = guild.get_channel(READ_ONLY_CHANNEL_ID)
-    if not channel:
-        print(f"⚠️ Канал {READ_ONLY_CHANNEL_ID} не найден — принудительное 'только чтение' не применено")
-        return
-
-    try:
-        # @everyone: запрет писать, разрешено читать историю (не трогаем
-        # view_channel — видимость канала определяется отдельно, не здесь).
-        everyone_overwrite = channel.overwrites_for(guild.default_role)
-        everyone_overwrite.send_messages = False
-        everyone_overwrite.read_message_history = True
-        await channel.set_permissions(guild.default_role, overwrite=everyone_overwrite,
-                                       reason="Принудительное 'только чтение' канала")
-
-        # Любая ДРУГАЯ роль/участник, у которых уже есть persistent overwrite
-        # на этом канале (не входящие в разрешённый список писать) — явно
-        # запрещаем send_messages, не трогая остальные их права.
-        for target, overwrite in list(channel.overwrites.items()):
-            if target.id == guild.default_role.id:
-                continue
-            if isinstance(target, discord.Role) and target.id in READ_ONLY_CHANNEL_WRITER_ROLE_IDS:
-                continue
-            if overwrite.send_messages is not False:
-                overwrite.send_messages = False
-                overwrite.read_message_history = True
-                await channel.set_permissions(target, overwrite=overwrite,
-                                               reason="Принудительное 'только чтение' канала")
-
-        # Разрешённые роли: явно разрешаем писать и читать историю.
-        for role_id in READ_ONLY_CHANNEL_WRITER_ROLE_IDS:
-            role = guild.get_role(role_id)
-            if not role:
-                continue
-            writer_overwrite = channel.overwrites_for(role)
-            writer_overwrite.send_messages = True
-            writer_overwrite.read_message_history = True
-            await channel.set_permissions(role, overwrite=writer_overwrite,
-                                           reason="Разрешение писать в 'только чтение' канал")
-
-        print(f"✅ Права канала {READ_ONLY_CHANNEL_ID} приведены в состояние 'только чтение' (кроме {len(READ_ONLY_CHANNEL_WRITER_ROLE_IDS)} ролей)")
-    except discord.Forbidden:
-        print(f"⚠️ Недостаточно прав для настройки канала {READ_ONLY_CHANNEL_ID} "
-              f"(роль бота должна быть выше затрагиваемых ролей и иметь право 'Manage Channels')")
-    except Exception as e:
-        print(f"⚠️ Ошибка настройки прав канала {READ_ONLY_CHANNEL_ID}: {e}")
-
 
 
 # ============== ВРЕМЕННЫЕ ГОЛОСОВЫЕ КОМНАТЫ ==============
 
-def _build_voice_room_overwrites(guild, cfg, owner=None):
-    """Единая политика доступа для триггера, постоянного и временного голосового канала.
-
-    Если role_key задан, @everyone не видит канал и не может подключиться,
-    а указанная роль получает доступ. При role_key=None канал открыт всем.
-    Владелец временной комнаты сохраняет права управления, но сам по себе
-    не получает обход проверки проектной роли.
-    """
-    is_public = cfg.get('role_key') is None
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(
-            view_channel=is_public,
-            connect=is_public,
-            speak=is_public,
-            stream=is_public,
-            use_voice_activation=is_public,
-        )
-    }
-
-    role_key = cfg.get('role_key')
-    role_id = ROLE_IDS.get(role_key) if role_key else None
-    role = guild.get_role(role_id) if role_id else None
-    if role:
-        overwrites[role] = discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-        )
-
-    # Бот всегда сохраняет доступ к своим категориям и каналам, даже если
-    # @everyone закрыт. Администраторы сервера обходят channel overwrites.
-    bot_member = guild.me
-    if bot_member:
-        overwrites[bot_member] = discord.PermissionOverwrite(
-            view_channel=True,
-            connect=True,
-            speak=True,
-            stream=True,
-            use_voice_activation=True,
-            manage_channels=True,
-            manage_roles=True,
-            mute_members=True,
-            deafen_members=True,
-            move_members=True,
-        )
-
-    if owner and owner != bot_member:
-        # Не выдаём владельцу отдельный allow на view/connect: без требуемой
-        # роли он не должен обходить ограничение доступа к проекту.
-        overwrites[owner] = discord.PermissionOverwrite(
-            manage_channels=True,
-            manage_roles=True,
-            mute_members=True,
-            deafen_members=True,
-            move_members=True,
-        )
-
-    return overwrites
-
-
-async def _disconnect_members_without_voice_role(channel, guild, cfg):
-    """Удаляет из закрытой голосовой комнаты участников без требуемой роли.
-
-    Для публичной категории ничего не делает. Discord Administrator сохраняет
-    административный обход ограничений канала.
-    """
-    role_key = cfg.get('role_key')
-    if role_key is None:
-        return
-
-    role_id = ROLE_IDS.get(role_key)
-    required_role = guild.get_role(role_id) if role_id else None
-    for member in list(channel.members):
-        if member.bot or member.guild_permissions.administrator:
-            continue
-        if required_role is not None and required_role in member.roles:
-            continue
-        try:
-            await member.move_to(
-                None,
-                reason=f"Нет роли для доступа к голосовой комнате {cfg['key']}",
-            )
-            print(f"🔒 Участник {member.display_name} отключён от '{channel.name}': отсутствует требуемая роль.")
-        except Exception as e:
-            print(f"⚠️ Не удалось отключить {member.display_name} от '{channel.name}' по ролевому ограничению: {e}")
-
-
 async def setup_voice_room_triggers(guild):
-    """Поддерживает текущие права постоянных ГК, триггеров и временных комнат
-    в соответствии с конфигурацией категорий. Разовые переименования и удаление
-    устаревших триггеров здесь больше не выполняются."""
+    """Только обнаруживает уже настроенные вручную каналы-триггеры.
+
+    Не создаёт, не редактирует, не переименовывает и не меняет права
+    голосовых/текстовых каналов. Если триггер не найден или найден неоднозначно,
+    он пропускается; настройки сервера остаются нетронутыми.
+    """
     VOICE_TRIGGER_CHANNEL_IDS.clear()
-    load_voice_rooms()
 
-    # Постоянные голосовые каналы сохраняют заданные названия. Бот только
-    # поддерживает на них действующую ролевую политику доступа.
-    army_cfg = next(cfg for cfg in VOICE_TRIGGER_CONFIGS if cfg['key'] == 'army')
-    for channel_id in (VOICE_PUBLIC_CHANNEL_ID, VOICE_CHANNEL_ID):
-        channel = guild.get_channel(channel_id)
-        if channel is None:
-            continue
-        try:
-            await channel.edit(
-                overwrites=_build_voice_room_overwrites(guild, army_cfg),
-                reason="Поддержание прав доступа к постоянному голосовому каналу ArmA",
-            )
-            await _disconnect_members_without_voice_role(channel, guild, army_cfg)
-        except Exception as e:
-            print(f"⚠️ Не удалось обновить права голосового канала {channel_id}: {e}")
-
-    # Настраиваем категории, триггеры и все существующие дочерние каналы.
     for cfg in VOICE_TRIGGER_CONFIGS:
-        try:
-            category = guild.get_channel(cfg['category_id'])
-            if not isinstance(category, discord.CategoryChannel):
-                print(f"⚠️ Категория {cfg['category_id']} не найдена или имеет неверный тип ({cfg['key']}).")
-                continue
+        category = guild.get_channel(cfg['category_id'])
+        if not isinstance(category, discord.CategoryChannel):
+            print(
+                f"⚠️ Категория {cfg['category_id']} не найдена или недоступна "
+                f"({cfg['key']}); каналы не изменяются."
+            )
+            continue
 
-            role_key = cfg.get('role_key')
-            role_id = ROLE_IDS.get(role_key) if role_key else None
-            if role_key and not guild.get_role(role_id):
-                print(f"⚠️ Роль {role_id} ({role_key}) не найдена — категория '{cfg['key']}' останется закрытой для обычных участников.")
+        trigger = discord.utils.get(category.voice_channels, name=cfg['name'])
+        if trigger is None:
+            # Допускаем вручную заданное короткое имя «Создать ГК».
+            # Выбираем его только при единственном совпадении в категории.
+            candidates = [
+                channel for channel in category.voice_channels
+                if 'создать' in channel.name.casefold()
+                and 'гк' in channel.name.casefold()
+            ]
+            if len(candidates) == 1:
+                trigger = candidates[0]
 
-            # Не меняем overwrite самой категории: в ней могут находиться
-            # текстовые каналы с отдельными правилами. Настраиваем каждый
-            # голосовой канал явно, чтобы не затронуть текстовые каналы.
-            access_overwrites = _build_voice_room_overwrites(guild, cfg)
+        if trigger is None:
+            print(
+                f"ℹ️ Канал-триггер для категории '{cfg['key']}' не найден "
+                "или найден неоднозначно; автоматическое создание отключено."
+            )
+            continue
 
-            existing = discord.utils.get(category.voice_channels, name=cfg['name'])
-            if existing is None:
-                existing = await guild.create_voice_channel(
-                    name=cfg['name'],
-                    category=category,
-                    overwrites=access_overwrites,
-                    user_limit=0,
-                    reason="Создание триггера временной голосовой комнаты",
-                )
-                print(f"✅ Создан триггер-канал '{cfg['name']}' ({cfg['key']}): {existing.id}")
-            else:
-                await existing.edit(
-                    overwrites=access_overwrites,
-                    reason="Обновление доступа к триггеру временной голосовой комнаты",
-                )
-                print(f"✅ Найден и обновлён триггер-канал '{cfg['name']}' ({cfg['key']}): {existing.id}")
-
-            VOICE_TRIGGER_CHANNEL_IDS[existing.id] = cfg['key']
-            await _disconnect_members_without_voice_role(existing, guild, cfg)
-
-            # Все голосовые каналы категории получают текущую политику доступа. У временной
-            # комнаты сохраняем owner-права, но не отдельный доступ мимо роли.
-            for child in list(category.voice_channels):
-                if child.id == existing.id:
-                    continue
-
-                owner = None
-                if child.name.startswith(TEMP_ROOM_NAME_PREFIX):
-                    owner_id = (VOICE_ROOMS.get(child.id) or {}).get('owner_id')
-                    if owner_id:
-                        owner = guild.get_member(int(owner_id))
-                    if owner is None:
-                        for target, old_overwrite in child.overwrites.items():
-                            if isinstance(target, discord.Member) and old_overwrite.manage_channels:
-                                owner = target
-                                break
-
-                child_overwrites = _build_voice_room_overwrites(guild, cfg, owner=owner)
-                await child.edit(
-                    overwrites=child_overwrites,
-                    reason=f"Приведение доступа к голосовой комнате к политике {cfg['key']}",
-                )
-                await _disconnect_members_without_voice_role(child, guild, cfg)
-
-                if child.name.startswith(TEMP_ROOM_NAME_PREFIX) and child.id in VOICE_ROOMS:
-                    VOICE_ROOMS[child.id]['is_public'] = cfg.get('role_key') is None
-                    VOICE_ROOMS[child.id]['category_id'] = cfg['category_id']
-
-        except Exception as e:
-            print(f"❌ Ошибка настройки голосовой категории '{cfg['key']}': {e}")
-
-    save_voice_rooms()
+        VOICE_TRIGGER_CHANNEL_IDS[trigger.id] = cfg['key']
+        print(
+            f"✅ Найден канал-триггер '{trigger.name}' ({trigger.id}); "
+            "настройки доступа не изменяются."
+        )
 
 
 async def create_temp_voice_room(member, trigger_channel):
-    """Создаёт временную комнату с той же ролевой политикой доступа,
-    что и у триггера/категории, и выдаёт владельцу права управления."""
+    """Создаёт временную комнату клонированием канала-триггера.
+
+    Все исходные настройки и разрешения копируются с триггера. Единственное
+    дополнительное разрешение — manage_channels для конкретного создателя,
+    чтобы он мог переименовывать собственную временную комнату стандартными
+    средствами Discord. Другие права не добавляются и не меняются.
+    """
     global VOICE_ROOMS
-
-    guild = member.guild
-    category = trigger_channel.category
-    cfg = next(
-        (item for item in VOICE_TRIGGER_CONFIGS
-         if category and item['category_id'] == category.id),
-        None,
-    )
-
-    if cfg is not None:
-        overwrites = _build_voice_room_overwrites(guild, cfg, owner=member)
-        is_public = cfg.get('role_key') is None
-    else:
-        # Резервный путь для неожиданного/ручного триггера вне настроенных категорий.
-        overwrites = dict(trigger_channel.overwrites)
-        overwrites[member] = discord.PermissionOverwrite(
-            manage_channels=True, manage_roles=True,
-            mute_members=True, deafen_members=True, move_members=True,
-        )
-        is_public = False
 
     try:
         room_name = f"🚪 Голосовая комната {member.display_name}"[:100]
-        temp_channel = await guild.create_voice_channel(
-            name=room_name, category=category, overwrites=overwrites, user_limit=0,
-            reason="Создание временной голосовой комнаты",
+        temp_channel = await trigger_channel.clone(
+            name=room_name,
+            reason="Создание временной голосовой комнаты — копирование настроек канала-триггера",
         )
+
+        # Дополнительное Manage Channels выдаётся только создателю и только
+        # на эту клонированную комнату. Остальные индивидуальные overwrite,
+        # если они были у этого участника на триггере, сохраняются.
+        owner_overwrite = temp_channel.overwrites_for(member)
+        owner_overwrite.manage_channels = True
+        try:
+            await temp_channel.set_permissions(
+                member,
+                overwrite=owner_overwrite,
+                reason="Разрешение создателю переименовывать собственную временную комнату",
+            )
+        except Exception:
+            # Не оставляем комнату без зарегистрированного владельца, если
+            # бот не смог выдать создателю запрошенное разрешение.
+            try:
+                await temp_channel.delete(
+                    reason="Не удалось выдать создателю Manage Channels"
+                )
+            except Exception as cleanup_error:
+                print(
+                    f"⚠️ Не удалось удалить комнату {temp_channel.id} после "
+                    f"ошибки выдачи прав: {cleanup_error}"
+                )
+            raise
 
         VOICE_ROOMS[temp_channel.id] = {
             'owner_id': member.id,
             'created_at': datetime.now(MSK).isoformat(),
-            'is_public': is_public,
-            'category_id': category.id if category else None,
+            'trigger_channel_id': trigger_channel.id,
+            'category_id': trigger_channel.category_id,
         }
         save_voice_rooms()
 
         await member.move_to(temp_channel, reason="Создание временной голосовой комнаты")
-        print(f"✅ Создана временная комната '{room_name}' для {member.display_name} (ID: {temp_channel.id})")
+        print(
+            f"✅ Создана временная комната '{room_name}' для {member.display_name} "
+            f"(ID: {temp_channel.id}); настройки скопированы с триггера {trigger_channel.id}, "
+            "создателю выдано Manage Channels только на этой комнате."
+        )
         return temp_channel
     except Exception as e:
         print(f"❌ Ошибка создания временной комнаты: {e}")
         return None
+
 
 async def cleanup_empty_temp_room(channel_id):
     global VOICE_ROOMS
@@ -11134,7 +10970,12 @@ def load_voice_rooms():
 
 
 async def sync_voice_rooms_on_startup(guild):
-    """Сверяет состояние временных комнат с реальностью при старте бота."""
+    """Сверяет реестр временных комнат с Discord при старте бота.
+
+    Удаляет пустые зависшие комнаты с уникальным префиксом временных комнат,
+    восстанавливает отслеживание непустых комнат после перезапуска.
+    Права доступа и названия существующих каналов не меняет.
+    """
     load_voice_rooms()
 
     ids_to_remove = []
@@ -11150,42 +10991,55 @@ async def sync_voice_rooms_on_startup(guild):
             except Exception as e:
                 print(f"⚠️ [Синхронизация] Не удалось удалить зависшую комнату {channel_id}: {e}")
             ids_to_remove.append(channel_id)
+
     for channel_id in ids_to_remove:
         VOICE_ROOMS.pop(channel_id, None)
 
+    # Восстанавливаем учёт комнат, которые бот создал до предыдущего рестарта,
+    # но не успел сохранить в JSON. Неизвестные каналы без специального префикса
+    # не затрагиваются.
     for cfg in VOICE_TRIGGER_CONFIGS:
         category = guild.get_channel(cfg['category_id'])
-        if not category:
+        if not isinstance(category, discord.CategoryChannel):
             continue
-        for ch in category.voice_channels:
-            if ch.id in VOICE_TRIGGER_CHANNEL_IDS:
+
+        for channel in category.voice_channels:
+            if channel.id in VOICE_TRIGGER_CHANNEL_IDS or channel.id in VOICE_ROOMS:
                 continue
-            if not ch.name.startswith(TEMP_ROOM_NAME_PREFIX):
-                continue
-            if ch.id in VOICE_ROOMS:
+            if not channel.name.startswith(TEMP_ROOM_NAME_PREFIX):
                 continue
 
-            if len(ch.members) == 0:
+            if len(channel.members) == 0:
                 try:
-                    await ch.delete(reason="Обнаружена бесхозная пустая временная комната — очистка при запуске бота")
-                    print(f"🗑️ [Синхронизация] Удалена бесхозная пустая комната '{ch.name}' (ID: {ch.id})")
+                    await channel.delete(
+                        reason="Обнаружена бесхозная пустая временная комната — очистка при запуске бота"
+                    )
+                    print(
+                        f"🗑️ [Синхронизация] Удалена бесхозная комната "
+                        f"'{channel.name}' (ID: {channel.id})"
+                    )
                 except Exception as e:
-                    print(f"⚠️ [Синхронизация] Не удалось удалить бесхозную комнату {ch.id}: {e}")
-            else:
-                owner_id = None
-                for target, overwrite in ch.overwrites.items():
-                    if isinstance(target, discord.Member) and overwrite.manage_channels:
-                        owner_id = target.id
-                        break
-                if owner_id is None and ch.members:
-                    owner_id = ch.members[0].id
-                VOICE_ROOMS[ch.id] = {
-                    'owner_id': owner_id,
-                    'created_at': datetime.now(MSK).isoformat(),
-                    'is_public': cfg.get('role_key') is None,
-                    'category_id': cfg['category_id'],
-                }
-                print(f"♻️ [Синхронизация] Восстановлено отслеживание непустой комнаты '{ch.name}' (ID: {ch.id})")
+                    print(f"⚠️ [Синхронизация] Не удалось удалить бесхозную комнату {channel.id}: {e}")
+                continue
+
+            owner_id = None
+            for target, overwrite in channel.overwrites.items():
+                if isinstance(target, discord.Member) and overwrite.manage_channels:
+                    owner_id = target.id
+                    break
+            if owner_id is None and channel.members:
+                owner_id = channel.members[0].id
+
+            VOICE_ROOMS[channel.id] = {
+                'owner_id': owner_id,
+                'created_at': datetime.now(MSK).isoformat(),
+                'category_id': cfg['category_id'],
+                'trigger_channel_id': None,
+            }
+            print(
+                f"♻️ [Синхронизация] Восстановлено отслеживание непустой комнаты "
+                f"'{channel.name}' (ID: {channel.id})"
+            )
 
     save_voice_rooms()
 
@@ -11429,7 +11283,6 @@ async def on_ready():
                   f"member_index поддерживает индекс только ПОСЛЕДНЕЙ гильдии из списка.")
         await setup_voice_room_triggers(guild)
         await sync_voice_rooms_on_startup(guild)
-        await enforce_read_only_channel(guild)
 
     await _tech_warning_scan_current_presence()
 
@@ -11475,7 +11328,11 @@ async def on_ready():
     if not scheduler.get_job('voice_rooms_sweep'):
         scheduler.add_job(sweep_empty_voice_rooms, 'interval', minutes=10, id='voice_rooms_sweep', replace_existing=True)
     if not scheduler.get_job('log_forward_flush'):
-        scheduler.add_job(flush_log_buffer_to_discord, 'interval', seconds=15, id='log_forward_flush', replace_existing=True)
+        scheduler.add_job(
+            flush_log_buffer_to_discord, 'interval', seconds=30,
+            id='log_forward_flush', replace_existing=True,
+            max_instances=2, coalesce=True, misfire_grace_time=30
+        )
     if not scheduler.get_job('disciplinary_cleanup'):
         scheduler.add_job(cleanup_expired_disciplinary_actions, 'interval', hours=6, id='disciplinary_cleanup', replace_existing=True)
     if not scheduler.get_job('discipline_recovery'):
