@@ -2502,18 +2502,15 @@ TECH_WARNING_ONLINE_STATUSES = {
     discord.Status.dnd,
 }
 TECH_WARNING_PANEL_TEXT = (
-    "## 📣 Панель технических уведомлений\n"
-    "Здесь запускается адресное техническое уведомление в личные сообщения.\n"
+    "## 📣 Панель рассылки\n"
+    "Здесь запускается рассылка приглашений вступить в клан в личных сообщениях.\n"
     "Перед запуском бот покажет предварительный список и попросит подтверждение.\n"
     "\n"
-    "**Онлайн-группа** — участники, которых бот хотя бы раз наблюдал онлайн "
+    "**Наблюдавшиеся онлайн** — участники, которых бот хотя бы раз наблюдал онлайн "
     "с момента включения трекера; новые наблюдаемые онлайн-участники добавляются "
     "в активную кампанию.\n"
     "**Не наблюдались онлайн** — участники, которых трекер ещё ни разу не видел "
-    "в статусе online / idle / dnd.\n"
-    "\n"
-    "Используйте рассылку только для действительно важных технических сообщений, "
-    "на которые у адресатов есть явное разрешение."
+    "в сети."
 )
 TECH_WARNING_STATE = {}
 _TECH_WARNING_STATE_READY = False
@@ -2686,7 +2683,7 @@ def _tech_warning_filter_reason(member: discord.Member) -> str | None:
         return "исключённая роль"
 
     if member.id in _tech_warning_competitor_ids():
-        return "ID из списка соперников"
+        return "ID из черного списка"
 
     name = member.display_name or member.name or ""
     bracket_tags = re.findall(r"\[([^\]]+)\]", name)
@@ -2819,7 +2816,7 @@ def _tech_warning_enqueue_new_online(member: discord.Member):
             # стал подходить под фильтры, разрешаем поставить его в очередь.
             record = recipients[user_key]
             filter_reasons = {
-                "бот", "исключённая роль", "ID из списка соперников",
+                "бот", "исключённая роль", "ID из черного списка",
                 "квадратный тег ника не [En-Y] / [En-Yr]",
             }
             if (
@@ -2920,7 +2917,7 @@ def _tech_warning_stats_text():
     lines = [
         "**Трекер технических уведомлений**",
         f"Наблюдались онлайн хотя бы раз: **{seen_count}**",
-        f"ID соперников в исключениях: **{competitor_count}**",
+        f"ID из черного списка: **{competitor_count}**",
     ]
     if not campaign:
         lines.append("Активной или последней кампании пока нет.")
@@ -4785,7 +4782,7 @@ class TechnicalWarningConfirmView(discord.ui.View):
 
 class TechnicalWarningCompetitorIdsModal(discord.ui.Modal):
     def __init__(self):
-        super().__init__(title=es("🚫 ID соперников — исключения"))
+        super().__init__(title=es("🚫 Черный список ID — исключения"))
         self.add_ids = discord.ui.TextInput(
             label="Добавить ID (по одному в строке)",
             style=discord.TextStyle.paragraph,
@@ -4827,7 +4824,7 @@ class TechnicalWarningCompetitorIdsModal(discord.ui.Modal):
         if invalid:
             details.append("Некорректных значений пропущено: " + str(len(invalid)) + ".")
             details.append("Примеры: " + ", ".join(invalid[:5]))
-        details.append("ID соперников исключаются из будущих кампаний и перепроверяются перед отправкой.")
+        details.append("ID из черного списка исключаются из будущих кампаний и перепроверяются перед отправкой.")
         await interaction.followup.send("\n".join(details), ephemeral=True)
 
 
@@ -4857,7 +4854,7 @@ class TechnicalWarningPanelView(discord.ui.LayoutView):
                     "technical_warning_start_online", self.start_online
                 ),
                 _make_layout_button(
-                    "🌙 Не наблюдались онлайн", discord.ButtonStyle.secondary,
+                    "🌙 Уведомить не наблюдавшихся онлайн", discord.ButtonStyle.secondary,
                     "technical_warning_start_offline", self.start_offline
                 ),
             ),
@@ -4876,7 +4873,7 @@ class TechnicalWarningPanelView(discord.ui.LayoutView):
             discord.ui.ActionRow(
                 _make_layout_button("📊 Статистика", discord.ButtonStyle.primary,
                                     "technical_warning_stats", self.show_stats),
-                _make_layout_button("🚫 ID соперников", discord.ButtonStyle.secondary,
+                _make_layout_button("🚫 Черный список", discord.ButtonStyle.secondary,
                                     "technical_warning_competitor_ids", self.manage_competitors),
             ),
         ]
@@ -8689,10 +8686,11 @@ class OfficeMenuView(discord.ui.LayoutView):
                 "Чтобы отказаться от игр на проекте, уберите соответствующую отметку."
             ),
             discord.ui.ActionRow(project_roles_select),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
             discord.ui.TextDisplay(
-                "### 🏕️ Участие на вылазках\n"
-                "Если хотите участвовать в клановых вылазках на публичных серверах, "
-                "нажмите кнопку. Повторное нажатие снимет отметку."
+                "### Участие на вылазках\n"
+                "Отметьте, хотите ли вы участвовать в клановых вылазках на публичных серверах. "
+                "Чтобы отказаться от вылазок, уберите отметку."
             ),
             discord.ui.ActionRow(outings_button),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
