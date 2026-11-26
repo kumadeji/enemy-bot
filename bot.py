@@ -961,7 +961,7 @@ ANKETA_MESSAGES_FILE = os.path.join(BASE_DIR, 'anketa_messages.json')
 DISCORD_LINK_CACHE_FILE = os.path.join(BASE_DIR, 'discord_link_cache.json')
 PLAYER_DM_STATE_FILE = os.path.join(BASE_DIR, 'player_dm_state.json')
 TECH_WARNING_STATE_FILE = os.path.join(BASE_DIR, 'technical_warning_state.json')
-# Ограничения технических уведомлений. Время — московское (MSK).
+# Ограничения рассылки. Время — московское (MSK).
 TECH_WARNING_SEND_WINDOW_START_HOUR = 18  # 18:00 включительно
 TECH_WARNING_SEND_WINDOW_END_HOUR = 22    # 22:00 исключительно
 TECH_WARNING_DAILY_LIMIT_MIN = 21
@@ -2488,7 +2488,7 @@ def save_json(filename, data):
     except Exception as e:
         print(f"⚠️ Не удалось запланировать резервную запись '{filename}': {e}")
 
-# ============== ОДНОРАЗОВОЕ ТЕХНИЧЕСКОЕ УВЕДОМЛЕНИЕ УЧАСТНИКАМ ==============
+# ============== ОДНОРАЗОВАЯ РАССЫЛКА УЧАСТНИКАМ ==============
 
 TECH_WARNING_EXCLUDED_ROLE_IDS = {
     1284456321005129778,
@@ -2554,7 +2554,7 @@ def _tech_warning_write_local_backup_sync(snapshot: dict) -> bool:
         os.replace(tmp_path, TECH_WARNING_STATE_FILE)
         return True
     except Exception as exc:
-        print(f"❌ Не удалось надёжно сохранить локальное состояние тех. уведомлений: {exc}")
+        print(f"❌ Не удалось надёжно сохранить локальное состояние рассылки: {exc}")
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
@@ -2568,11 +2568,11 @@ async def _tech_warning_persist_state_durable() -> bool:
     doc_name = FIREBASE_DATA_MAP.get(TECH_WARNING_STATE_FILE)
     if USE_FIREBASE_BACKEND:
         if not fs_db or not doc_name:
-            print("⚠️ Отправка тех. уведомления заблокирована: Firebase-хранилище не инициализировано.")
+            print("⚠️ Отправка рассылки заблокирована: Firebase-хранилище не инициализировано.")
             return False
         saved = await firestore_writer.flush_document(doc_name, timeout=15.0)
         if not saved:
-            print("⚠️ Отправка тех. уведомления приостановлена: состояние не удалось подтвердить в Firestore.")
+            print("⚠️ Отправка рассылки приостановлена: состояние не удалось подтвердить в Firestore.")
         return saved
     loop = asyncio.get_running_loop()
     snapshot = copy.deepcopy(TECH_WARNING_STATE)
@@ -2703,7 +2703,7 @@ async def _tech_warning_resolve_guild():
         try:
             channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
         except Exception as exc:
-            print(f"⚠️ Не удалось получить канал панели технических уведомлений: {exc}")
+            print(f"⚠️ Не удалось получить канал панели рассылки: {exc}")
             return None
     guild = getattr(channel, "guild", None)
     if guild is None:
@@ -2714,7 +2714,7 @@ async def _tech_warning_resolve_guild():
         try:
             await guild.chunk()
         except Exception as exc:
-            print(f"⚠️ Не удалось загрузить полный список участников для тех. уведомлений: {exc}")
+            print(f"⚠️ Не удалось загрузить полный список участников для рассылки: {exc}")
     return guild
 
 
@@ -2778,7 +2778,6 @@ def _tech_warning_preview_text(mode: str, snapshot: dict) -> str:
     else:
         lines.append("Фильтры не исключили дополнительных участников.")
     lines.append("\nПосле подтверждения очередь сохранится между перезапусками. Успешные и неопределённые попытки повторно не отправляются.")
-    lines.append("Подтверждайте запуск только для адресатов, которые явно приняли правило сервера о получении важных технических DM.")
     return "\n".join(lines)
 
 
@@ -2915,7 +2914,7 @@ def _tech_warning_stats_text():
     competitor_count = len(_tech_warning_competitor_ids())
     seen_count = len(TECH_WARNING_STATE.get("online_seen", {}))
     lines = [
-        "**Трекер технических уведомлений**",
+        "**Трекер рассылки**",
         f"Наблюдались онлайн хотя бы раз: **{seen_count}**",
         f"ID из черного списка: **{competitor_count}**",
     ]
@@ -2956,7 +2955,7 @@ async def _tech_warning_mark_result(user_id: int, status: str, reason: str | Non
 
 
 def _tech_warning_get_daily_throttle():
-    """Возвращает общий дневной лимит для всех кампаний технических уведомлений."""
+    """Возвращает общий дневной лимит для всех кампаний рассылок."""
     throttle = TECH_WARNING_STATE.setdefault("daily_throttle", {})
     if not isinstance(throttle, dict):
         throttle = {}
@@ -3112,7 +3111,7 @@ async def _tech_warning_worker():
         if not _tech_warning_is_sending_time(now):
             next_open = _tech_warning_next_window_start(now)
             print(
-                "⏰ Техническая рассылка вне окна 18:00–22:00 MSK. "
+                "⏰ Рассылка вне окна 18:00–22:00 MSK. "
                 f"Следующее окно: {next_open.strftime('%d.%m.%Y %H:%M')} MSK"
             )
             if not await _tech_warning_wait_until(next_open, campaign):
@@ -3123,7 +3122,7 @@ async def _tech_warning_worker():
         if throttle["used_count"] >= throttle["limit"]:
             next_open = _tech_warning_next_window_start(now, tomorrow=True)
             print(
-                "📊 Дневной лимит технических уведомлений исчерпан: "
+                "📊 Дневной лимит для рассылки исчерпан: "
                 f"{throttle['used_count']}/{throttle['limit']}. "
                 f"Следующее окно: {next_open.strftime('%d.%m.%Y %H:%M')} MSK"
             )
@@ -3303,12 +3302,12 @@ async def _tech_warning_worker():
                 # До отправки уже был надёжно сохранён резерв + 15-минутный
                 # защитный интервал. При рестарте sending станет unknown.
                 print(
-                    "⚠️ DM отправлен, но сохранение результата не подтверждено. "
+                    "⚠️ Сообщение отправлено, но сохранение результата не подтверждено. "
                     "Слот дневного лимита оставлен занятым для безопасности."
                 )
 
             print(
-                f"📨 Техническое уведомление отправлено участнику {user_id}. "
+                f"📨 Сообщение для рассылки отправлено участнику {user_id}. "
                 f"Дневной лимит: {throttle['used_count']}/{throttle['limit']}. "
                 f"Следующая отправка не ранее чем через {pause_minutes} мин."
             )
@@ -3465,7 +3464,7 @@ async def _tech_warning_set_campaign_status(action: str):
 
 
 async def _tech_warning_ensure_panel():
-    """Находит и обновляет постоянную панель технических уведомлений в Components V2."""
+    """Находит и обновляет постоянную панель для рассылки в Components V2."""
     if not _TECH_WARNING_STATE_READY:
         return
     try:
@@ -3491,11 +3490,11 @@ async def _tech_warning_ensure_panel():
                     allowed_mentions=discord.AllowedMentions.none()
                 )
             except Exception as edit_error:
-                print(f"⚠️ Не удалось преобразовать панель технических уведомлений в Components V2: {edit_error}")
+                print(f"⚠️ Не удалось преобразовать панель рассылки в Components V2: {edit_error}")
                 try:
                     await message.delete()
                 except Exception as delete_error:
-                    print(f"❌ Не удалось удалить старую панель тех. уведомлений: {delete_error}")
+                    print(f"❌ Не удалось удалить старую панель рассылки: {delete_error}")
                     return
                 message = None
 
@@ -3507,9 +3506,9 @@ async def _tech_warning_ensure_panel():
 
         TECH_WARNING_STATE["panel_message_id"] = message.id
         _tech_warning_save_state()
-        print(f"✅ Панель технических уведомлений готова в Components V2 (ID: {message.id})")
+        print(f"✅ Панель рассылки готова в Components V2 (ID: {message.id})")
     except Exception as exc:
-        print(f"⚠️ Не удалось создать/обновить панель технических уведомлений: {exc}")
+        print(f"⚠️ Не удалось создать/обновить панель рассылки: {exc}")
 
 
 def build_vacation_set_for_date(vacations: dict, target_date: datetime) -> set:
@@ -4703,11 +4702,11 @@ class ConfirmClearLogsView(discord.ui.View):
 
 class TechnicalWarningComposeModal(discord.ui.Modal):
     def __init__(self, mode: str):
-        title = "Тех. уведомление: онлайн" if mode == "online" else "Тех. уведомление: не наблюдались онлайн"
+        title = "Рассылка: онлайн" if mode == "online" else "Рассылка: не наблюдались онлайн"
         super().__init__(title=es(title))
         self.mode = mode
         self.message_text = discord.ui.TextInput(
-            label="Текст важного технического уведомления",
+            label="Текст для рассылки",
             style=discord.TextStyle.paragraph,
             placeholder="Введите полный текст сообщения для личных сообщений...",
             required=True,
@@ -4732,7 +4731,7 @@ class TechnicalWarningComposeModal(discord.ui.Modal):
         snapshot = _tech_warning_candidate_snapshot(guild, self.mode, message)
         preview = _tech_warning_preview_text(self.mode, snapshot)
         preview_embed = discord.Embed(
-            title=es("Предпросмотр технического уведомления"),
+            title=es("Предпросмотр сообщения для рассылки"),
             description=preview,
             color=discord.Color.orange(),
         )
@@ -4840,14 +4839,14 @@ def _make_layout_button(label, style, custom_id, callback):
 
 
 class TechnicalWarningPanelView(discord.ui.LayoutView):
-    """Панель технических уведомлений на Components V2."""
+    """Панель рассылки на Components V2."""
     def __init__(self):
         super().__init__(timeout=None)
 
         children = [
             discord.ui.TextDisplay(TECH_WARNING_PANEL_TEXT),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
-            discord.ui.TextDisplay("### Запуск уведомлений"),
+            discord.ui.TextDisplay("### Запуск рассылки"),
             discord.ui.ActionRow(
                 _make_layout_button(
                     "📨 Уведомить наблюдавшихся онлайн", discord.ButtonStyle.primary,
@@ -4859,7 +4858,7 @@ class TechnicalWarningPanelView(discord.ui.LayoutView):
                 ),
             ),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
-            discord.ui.TextDisplay("### Управление кампанией"),
+            discord.ui.TextDisplay("### Управление рассылкой"),
             discord.ui.ActionRow(
                 _make_layout_button("⏸ Пауза", discord.ButtonStyle.secondary,
                                     "technical_warning_pause", self.pause_campaign),
