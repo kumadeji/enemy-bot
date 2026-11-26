@@ -10223,7 +10223,7 @@ async def publish_weekly_kickoff_announcement(week_key: str) -> bool:
             kickoff_view = discord.ui.LayoutView(timeout=None)
             kickoff_view.add_item(
                 discord.ui.Container(
-                    discord.ui.TextDisplay("# 🚩🚩🚩 Новая неделя в клане!"),
+                    discord.ui.TextDisplay("# 🚩🚩🚩 Новая неделя в клане! 🚩🚩🚩"),
                     discord.ui.Separator(
                         visible=True,
                         spacing=discord.SeparatorSpacing.large,
