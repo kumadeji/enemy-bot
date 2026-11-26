@@ -3702,12 +3702,28 @@ def _message_has_component_custom_id(message, target_custom_id: str) -> bool:
     return False
 
 
+def _message_has_component_text(message, marker: str) -> bool:
+    """Ищет текстовый маркер в дереве Components V2 (например, заголовок якоря)."""
+    if not marker:
+        return False
+    pending = list(getattr(message, "components", ()) or ())
+    while pending:
+        component = pending.pop()
+        for attribute in ("content", "text", "label", "placeholder"):
+            value = getattr(component, attribute, None)
+            if isinstance(value, str) and marker in value:
+                return True
+        pending.extend(getattr(component, "children", ()) or ())
+    return False
+
+
 async def _find_persistent_bot_message(
     channel,
     *,
     saved_message_ids=(),
     fallback_message_ids=(),
     component_custom_ids=(),
+    component_text_markers=(),
     legacy_titles=(),
     history_limit=100,
 ):
@@ -3742,8 +3758,9 @@ async def _find_persistent_bot_message(
             return candidate
 
     custom_ids = tuple(component_custom_ids or ())
+    text_markers = tuple(component_text_markers or ())
     titles = set(legacy_titles or ())
-    if not custom_ids and not titles:
+    if not custom_ids and not text_markers and not titles:
         return None
 
     async for candidate in channel.history(limit=history_limit):
@@ -3756,7 +3773,11 @@ async def _find_persistent_bot_message(
             _message_has_component_custom_id(candidate, custom_id)
             for custom_id in custom_ids
         )
-        if has_legacy_title or has_component:
+        has_component_text = any(
+            _message_has_component_text(candidate, marker)
+            for marker in text_markers
+        )
+        if has_legacy_title or has_component or has_component_text:
             return candidate
 
     return None
@@ -3778,47 +3799,57 @@ async def _edit_persistent_components_v2_message(message, view, *, attachments=N
     )
 
 
-def build_notifications_anchor_embed():
-    return discord.Embed(title=es("ℹ️ Уведомления"),
-                          description=NOTIFICATIONS_ANCHOR_DESCRIPTION, color=ANCHOR_EMBED_COLOR)
+def _build_admin_thread_anchor_view(title: str, description: str):
+    """Строит компактный якорь ветки админ-канала на Components V2."""
+    view = discord.ui.LayoutView(timeout=None)
+    view.add_item(discord.ui.Container(
+        discord.ui.TextDisplay(f"## {title}\n{description}"),
+        accent_color=ANCHOR_EMBED_COLOR.value,
+    ))
+    return view
 
 
-def build_logging_anchor_embed():
-    return discord.Embed(title=es("🔧 Логирование"),
-                          description=LOGGING_ANCHOR_DESCRIPTION, color=ANCHOR_EMBED_COLOR)
+def build_notifications_anchor_view():
+    return _build_admin_thread_anchor_view(
+        es("ℹ️ Уведомления"), NOTIFICATIONS_ANCHOR_DESCRIPTION
+    )
 
 
-async def _find_or_create_anchor(channel, title: str, embed_builder, thread_name: str = None, view=None, saved_message_id: int = None):
-    """Находит якорь, обновляет его содержимое и при необходимости ветку.
+def build_logging_anchor_view():
+    return _build_admin_thread_anchor_view(
+        es("🔧 Логирование"), LOGGING_ANCHOR_DESCRIPTION
+    )
 
-    Сохранённый ID является главным идентификатором: смена заголовка или
-    описания не должна приводить к публикации нового сообщения. История
-    используется только как fallback, если сохранённое сообщение удалено.
-    Возвращает (message, thread_or_None).
+
+async def _find_or_create_anchor(
+    channel,
+    title: str,
+    view_builder,
+    thread_name: str = None,
+    saved_message_id: int = None,
+):
+    """Находит якорь по ID/содержимому и обновляет его в Components V2.
+
+    Существующее сообщение редактируется на месте: его ID, закрепление и
+    существующая ветка сохраняются. Новое сообщение создаётся только если
+    старое действительно отсутствует.
     """
-    message = None
-    if saved_message_id:
-        try:
-            candidate = await channel.fetch_message(int(saved_message_id))
-            if client.user and candidate.author.id == client.user.id:
-                message = candidate
-        except discord.NotFound:
-            pass
-        except (TypeError, ValueError):
-            pass
+    message = await _find_persistent_bot_message(
+        channel,
+        saved_message_ids=(saved_message_id,),
+        component_text_markers=(title,),
+        legacy_titles=(title,),
+        history_limit=150,
+    )
 
+    view = view_builder()
     if message is None:
-        async for candidate in channel.history(limit=100):
-            if not client.user or candidate.author.id != client.user.id:
-                continue
-            if candidate.embeds and candidate.embeds[0].title == title:
-                message = candidate
-                break
-
-    if message is None:
-        message = await channel.send(embed=embed_builder(), view=view)
+        message = await channel.send(
+            view=view,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
     else:
-        await message.edit(embed=embed_builder(), view=view)
+        await _edit_persistent_components_v2_message(message, view)
 
     thread = None
     if thread_name:
@@ -3875,23 +3906,33 @@ async def ensure_admin_channel_anchors():
         # Не удаляем найденную панель и не публикуем копию при ошибке edit/fetch.
         print(f"⚠️ Не удалось обновить панель управления: {e}")
 
-    notif_msg, notif_thread = await _find_or_create_anchor(
-        channel, es("ℹ️ Уведомления"),
-        build_notifications_anchor_embed, thread_name="ℹ️ Уведомления",
-        saved_message_id=anchors.get('notifications_message_id')
-    )
-    anchors['notifications_message_id'] = notif_msg.id
-    if notif_thread:
-        anchors['notifications_thread_id'] = notif_thread.id
+    try:
+        notif_msg, notif_thread = await _find_or_create_anchor(
+            channel,
+            es("ℹ️ Уведомления"),
+            build_notifications_anchor_view,
+            thread_name="ℹ️ Уведомления",
+            saved_message_id=anchors.get('notifications_message_id'),
+        )
+        anchors['notifications_message_id'] = notif_msg.id
+        if notif_thread:
+            anchors['notifications_thread_id'] = notif_thread.id
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить якорь 'Уведомления': {e}")
 
-    log_msg, log_thread = await _find_or_create_anchor(
-        channel, es("🔧 Логирование"),
-        build_logging_anchor_embed, thread_name="🔧 Логирование",
-        saved_message_id=anchors.get('logging_message_id')
-    )
-    anchors['logging_message_id'] = log_msg.id
-    if log_thread:
-        anchors['logging_thread_id'] = log_thread.id
+    try:
+        log_msg, log_thread = await _find_or_create_anchor(
+            channel,
+            es("🔧 Логирование"),
+            build_logging_anchor_view,
+            thread_name="🔧 Логирование",
+            saved_message_id=anchors.get('logging_message_id'),
+        )
+        anchors['logging_message_id'] = log_msg.id
+        if log_thread:
+            anchors['logging_thread_id'] = log_thread.id
+    except Exception as e:
+        print(f"⚠️ Не удалось обновить якорь 'Логирование': {e}")
 
     save_json(ADMIN_ANCHORS_FILE, anchors)
     print("✅ Якорные сообщения админ-канала проверены (панель, уведомления, логирование)")
@@ -3954,7 +3995,8 @@ SERVER_INTRO_LINKS = [
 
 async def process_self_assign_selection(interaction: discord.Interaction, selected_values,
                                         role_choices=None, require_clan_member=False,
-                                        selection_context="самостоятельный выбор роли"):
+                                        selection_context="самостоятельный выбор роли",
+                                        clan_member_required_message=None):
     """Единая логика самостоятельной выдачи/снятия ролей в существующих меню.
     По умолчанию сохраняет прежнее поведение гостевого меню; для меню проектов
     получает соответствующий список ролей и проверяет членство в ArmA."""
@@ -3965,10 +4007,10 @@ async def process_self_assign_selection(interaction: discord.Interaction, select
     role_choices = role_choices if role_choices is not None else SELF_ASSIGN_ROLES
 
     if require_clan_member and not member_has_klan_arma_role(member):
-        await interaction.followup.send(
-            es("⛔ Выбор проектных ролей доступен только бойцам составов «Запас» и «Личный состав» ArmA."),
-            ephemeral=True
+        denial_text = clan_member_required_message or es(
+            "⛔ Выбор проектных ролей доступен только бойцам составов «Запас» и «Личный состав» ArmA."
         )
+        await interaction.followup.send(denial_text, ephemeral=True)
         return
 
     # Роль 'Клан ArmA' автоматически есть у действующих бойцов 'Запаса' и
@@ -8575,17 +8617,10 @@ VACATION_RULES_MESSAGE_LINK = (
 
 
 class OfficeMenuView(discord.ui.LayoutView):
-    """Единая панель канцелярии на Components V2.
-
-    Описание, выбор проектных ролей, полезные ссылки и кнопки действий
-    находятся внутри одного Container. Выпадающий список расположен
-    сразу под описанием и выше всех кнопок.
-    """
+    """Панель для бойцов клана: проекты, вылазки, ссылки и отдельные действия."""
     def __init__(self):
         super().__init__(timeout=None)
 
-        # Выбор проектных ролей: тот же callback и та же общая функция,
-        # которые уже используются для выдачи/снятия остальных ролей.
         project_roles_select = discord.ui.Select(
             placeholder="Роли для проектов (чтобы снять - уберите галочку)",
             options=[
@@ -8594,7 +8629,7 @@ class OfficeMenuView(discord.ui.LayoutView):
             ],
             min_values=0,
             max_values=len(PROJECT_ROLE_OPTIONS),
-            custom_id="office_project_roles_select"
+            custom_id="office_project_roles_select",
         )
 
         async def _project_roles_callback(interaction: discord.Interaction):
@@ -8603,60 +8638,70 @@ class OfficeMenuView(discord.ui.LayoutView):
                 project_roles_select.values,
                 role_choices=PROJECT_ROLE_OPTIONS,
                 require_clan_member=True,
-                selection_context="Самостоятельный выбор проектных ролей ArmA"
+                selection_context="Самостоятельный выбор проектных ролей ArmA",
             )
 
         project_roles_select.callback = _project_roles_callback
 
-        outings_select = discord.ui.Select(
-            placeholder="Участие в вылазках",
+        # Меню вылазок работает по той же схеме, что и выбор проектов:
+        # выбранная отметка означает выдать роль, снятая — удалить её.
+        outings_role_options = ((OUTINGS_ARMA_ROLE_ID, OUTINGS_ARMA_ROLE_NAME),)
+        outings_roles_select = discord.ui.Select(
+            placeholder="Участие в вылазках (чтобы снять - уберите галочку)",
             options=[
-                discord.SelectOption(
-                    label="Переключить участие в вылазках",
-                    value="toggle_outings_role",
-                )
+                discord.SelectOption(label=name, value=str(role_id))
+                for role_id, name in outings_role_options
             ],
-            min_values=1,
+            min_values=0,
             max_values=1,
             custom_id="office_outings_role_select",
         )
 
-        async def _outings_select_callback(interaction: discord.Interaction):
-            await self._toggle_outings_role_callback(interaction)
+        async def _outings_roles_callback(interaction: discord.Interaction):
+            await process_self_assign_selection(
+                interaction,
+                outings_roles_select.values,
+                role_choices=outings_role_options,
+                require_clan_member=True,
+                selection_context="Самостоятельный выбор участия в клановых вылазках",
+                clan_member_required_message=es(
+                    "⛔ Выбор участия в вылазках доступен только бойцам составов «Запас» и «Личный состав» ArmA."
+                ),
+            )
 
-        outings_select.callback = _outings_select_callback
+        outings_roles_select.callback = _outings_roles_callback
 
-        # Ссылки остаются обычными link-кнопками Discord, но теперь находятся
-        # в том же визуальном контейнере, сразу после выбора проектов.
         site_link_buttons = [
             discord.ui.Button(
                 label=es(label),
                 style=discord.ButtonStyle.link,
-                url=url
+                url=url,
             )
             for label, url, _row in OFFICE_SITE_LINKS
         ]
 
         vacation_btn = discord.ui.Button(
-            label=es("🏖️ Оформление отпуска"),
+            label=es("🏖️ Оформить отпуск"),
             style=discord.ButtonStyle.primary,
-            custom_id="office_vacation_link"
+            custom_id="office_vacation_link",
         )
         vacation_btn.callback = self._vacation_link_callback
 
         create_btn = discord.ui.Button(
-            label=es("📅 Создание мероприятия"),
+            label=es("📅 Создать мероприятие"),
             style=discord.ButtonStyle.success,
-            custom_id="office_create_event"
+            custom_id="office_create_event",
         )
         create_btn.callback = self._create_event_callback
 
-        children = [
+        # Действия разнесены по отдельным контейнерам: так разделы визуально
+        # самостоятельны и не превышают лимит вложенных компонентов Discord.
+        accent = 9881319
+        self.add_item(discord.ui.Container(
             discord.ui.TextDisplay(
-                "## 🛠️  Панель бота для бойцов клана\n"
-                "Здесь есть полезные ссылки на сайте клана, а также можно "
-                "самостоятельно выбрать проекты, отметить участие в вылазках "
-                "или создать мероприятие."
+                "## 🛠️ Панель бота для бойцов клана\n"
+                "Здесь можно выбрать игровые проекты, отметить участие в клановых вылазках, "
+                "перейти к полезным разделам сайта и воспользоваться возможностями бота."
             ),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
             discord.ui.TextDisplay(
@@ -8667,92 +8712,56 @@ class OfficeMenuView(discord.ui.LayoutView):
             discord.ui.ActionRow(project_roles_select),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
             discord.ui.TextDisplay(
-                "### Участие на вылазках\n"
-                "Чтобы изменить отметку участия в клановых вылазках на публичных серверах, "
-                "откройте список и выберите единственный пункт. Повторный выбор переключает статус."
+                "### Участие в вылазках\n"
+                "Отметьте пункт «Вылазки ArmA», если хотите участвовать в клановых вылазках. "
+                "Чтобы отказаться от участия, уберите соответствующую отметку."
             ),
-            discord.ui.ActionRow(outings_select),
-            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
+            discord.ui.ActionRow(outings_roles_select),
+            accent_color=accent,
+        ))
+        self.add_item(discord.ui.Container(
             discord.ui.TextDisplay("### Полезные ссылки"),
             discord.ui.ActionRow(*site_link_buttons),
-            discord.ui.ActionRow(vacation_btn, create_btn),
-        ]
-        self.add_item(discord.ui.Container(*children, accent_color=9881319))
+            accent_color=accent,
+        ))
+        self.add_item(discord.ui.Container(
+            discord.ui.TextDisplay(
+                "### Оформление отпуска\n"
+                "Вы можете оформить отпуск в специальном канале. Там опубликованы правила "
+                "и форма для подачи заявки."
+            ),
+            discord.ui.ActionRow(vacation_btn),
+            accent_color=accent,
+        ))
+        self.add_item(discord.ui.Container(
+            discord.ui.TextDisplay(
+                "### Создание мероприятия\n"
+                "Вы можете самостоятельно создать мероприятие в расписании и пригласить на него "
+                "других игроков. Например, чтобы собраться на игру на публичном сервере "
+                "или провести собственное мероприятие."
+            ),
+            discord.ui.ActionRow(create_btn),
+            accent_color=accent,
+        ))
 
     async def _vacation_link_callback(self, interaction: discord.Interaction):
         await interaction.response.send_message(
             es(f"🏖️ Оформить отпуск можно здесь: {VACATION_RULES_MESSAGE_LINK}"),
-            ephemeral=True
+            ephemeral=True,
         )
-
-    async def _toggle_outings_role_callback(self, interaction: discord.Interaction):
-        member = interaction.user
-        guild = interaction.guild
-
-        if not guild:
-            await interaction.response.send_message(
-                es("⛔ Эта функция доступна только на сервере клана."),
-                ephemeral=True
-            )
-            return
-
-        role = guild.get_role(OUTINGS_ARMA_ROLE_ID)
-        if role is None:
-            await interaction.response.send_message(
-                es(f"❌ Роль «{OUTINGS_ARMA_ROLE_NAME}» не найдена на сервере. Обратитесь к командованию."),
-                ephemeral=True
-            )
-            return
-
-        already_has_role = role in member.roles
-        # Новую отметку могут поставить только действующие бойцы ArmA.
-        # Снять ранее выданную отметку можно и после выхода из состава,
-        # чтобы роль не оставалась у человека навсегда.
-        if not already_has_role and not member_has_klan_arma_role(member):
-            await interaction.response.send_message(
-                es("⛔ Отметка участия в вылазках доступна только бойцам клана ArmA."),
-                ephemeral=True
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-        try:
-            if already_has_role:
-                await member.remove_roles(
-                    role,
-                    reason="Самостоятельный отказ от участия в клановых вылазках"
-                )
-                result = f"Вы сняли отметку участия в вылазках. Роль «{OUTINGS_ARMA_ROLE_NAME}» удалена."
-            else:
-                await member.add_roles(
-                    role,
-                    reason="Самостоятельная отметка участия в клановых вылазках"
-                )
-                result = f"Вы отметились для участия в клановых вылазках. Роль «{OUTINGS_ARMA_ROLE_NAME}» выдана."
-            await interaction.followup.send(es("✅ ") + result, ephemeral=True)
-        except discord.Forbidden:
-            await interaction.followup.send(
-                es(f"❌ Не удалось изменить роль «{OUTINGS_ARMA_ROLE_NAME}». Проверьте права бота и положение роли в иерархии."),
-                ephemeral=True
-            )
-        except discord.HTTPException as exc:
-            await interaction.followup.send(
-                f"❌ Discord не разрешил изменить роль «{OUTINGS_ARMA_ROLE_NAME}»: {exc}",
-                ephemeral=True
-            )
 
     async def _create_event_callback(self, interaction: discord.Interaction):
         if not member_has_klan_arma_role(interaction.user):
             await interaction.response.send_message(
                 es("⛔ Создание мероприятий доступно только бойцам состава 'Запас' и выше!"),
-                ephemeral=True
+                ephemeral=True,
             )
             return
         view = EventSetupView(player_mode=True, created_by_discord_id=interaction.user.id)
         await interaction.response.send_message(
             es("📅 Выберите картинку для мероприятия и нажмите Далее:"),
             view=view,
-            ephemeral=True
+            ephemeral=True,
         )
 
 
@@ -8773,7 +8782,6 @@ async def ensure_office_message():
             component_custom_ids=(
                 "office_project_roles_select",
                 "office_outings_role_select",
-                "office_toggle_outings_role",
             ),
             legacy_titles=(es("🛠️ Панель бота для бойцов клана"),),
             history_limit=150,
@@ -10213,7 +10221,7 @@ async def publish_weekly_kickoff_announcement(week_key: str) -> bool:
             kickoff_view = discord.ui.LayoutView(timeout=None)
             kickoff_view.add_item(
                 discord.ui.Container(
-                    discord.ui.TextDisplay("# 🚩🚩🚩 Новая неделя в клане!"),
+                    discord.ui.TextDisplay("# 🪖 Новая неделя в клане!"),
                     discord.ui.Separator(
                         visible=True,
                         spacing=discord.SeparatorSpacing.large,
@@ -10705,21 +10713,37 @@ async def update_all_templates():
         except Exception as e:
             print(f"⚠️ Не удалось обновить якорь 'Панель управления': {e}")
 
-        if anchors.get('notifications_message_id'):
-            try:
-                msg = await admin_channel.fetch_message(anchors['notifications_message_id'])
-                await msg.edit(embed=build_notifications_anchor_embed())
-                anchors_fixed += 1
-            except Exception as e:
-                print(f"⚠️ Не удалось обновить якорь 'Уведомления': {e}")
+        try:
+            notif_msg, notif_thread = await _find_or_create_anchor(
+                admin_channel,
+                es("ℹ️ Уведомления"),
+                build_notifications_anchor_view,
+                thread_name="ℹ️ Уведомления",
+                saved_message_id=anchors.get('notifications_message_id'),
+            )
+            anchors['notifications_message_id'] = notif_msg.id
+            if notif_thread:
+                anchors['notifications_thread_id'] = notif_thread.id
+            anchors_fixed += 1
+        except Exception as e:
+            print(f"⚠️ Не удалось обновить якорь 'Уведомления': {e}")
 
-        if anchors.get('logging_message_id'):
-            try:
-                msg = await admin_channel.fetch_message(anchors['logging_message_id'])
-                await msg.edit(embed=build_logging_anchor_embed())
-                anchors_fixed += 1
-            except Exception as e:
-                print(f"⚠️ Не удалось обновить якорь 'Логирование': {e}")
+        try:
+            log_msg, log_thread = await _find_or_create_anchor(
+                admin_channel,
+                es("🔧 Логирование"),
+                build_logging_anchor_view,
+                thread_name="🔧 Логирование",
+                saved_message_id=anchors.get('logging_message_id'),
+            )
+            anchors['logging_message_id'] = log_msg.id
+            if log_thread:
+                anchors['logging_thread_id'] = log_thread.id
+            anchors_fixed += 1
+        except Exception as e:
+            print(f"⚠️ Не удалось обновить якорь 'Логирование': {e}")
+
+        save_json(ADMIN_ANCHORS_FILE, anchors)
     except Exception as e:
         print(f"❌ Ошибка синхронизации якорных сообщений: {e}")
 
