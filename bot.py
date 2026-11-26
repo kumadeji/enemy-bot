@@ -570,7 +570,7 @@ _ES_REPLACEMENTS = {
 	'🎯': '🎯ㅤ',
 	'🏆': '🏆ㅤ',
 	'🏕️': '🏕️ㅤ',
-	'🏖': '🏖ㅤ',
+	'🏖️': '🏖️ㅤ',
 	'👉': '👉ㅤ',
 	'👋': '👋ㅤ',
 	'👤': '👤ㅤ',
@@ -8766,7 +8766,7 @@ class OfficeMenuView(discord.ui.LayoutView):
             ),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
             discord.ui.TextDisplay(
-                "### Выбор проектов\n"
+                "### Участие на проектах\n"
                 "Отметьте проекты, на которых вы хотите играть. "
                 "Чтобы отказаться от игр на проекте, уберите соответствующую отметку."
             ),
