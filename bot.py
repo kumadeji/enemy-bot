@@ -663,6 +663,7 @@ ROLE_IDS = {
     'project_echo': 1571912196106223686,               # "Проект ECHO в ArmA"
     'project_as_vdv': 1571912244013301881,             # "Проект AS VDV в ArmA"
     'project_triad_tactics': 1571912290452902008,      # "Проект Triad Tactics в ArmA"
+    'outings_arma': 1575563761903730758,                # "Вылазки ArmA"
     'voice_dayz': 908462339089641522,                  # Доступ к голосовым комнатам DayZ
     'voice_wow': 1557399397753557033,                   # Доступ к голосовым комнатам WoW
     'voice_squad': 908461959794532404,                  # Доступ к голосовым комнатам SQUAD
@@ -687,6 +688,15 @@ PROJECT_ROLE_LABELS = {
 PROJECT_ROLE_KEYS = tuple(PROJECT_ROLE_LABELS.keys())
 PROJECT_ROLE_OPTIONS = [(ROLE_IDS[key], PROJECT_ROLE_LABELS[key]) for key in PROJECT_ROLE_KEYS]
 
+# Роли, которые автоматически выдаются при переходе из «Отбор» в «Запас».
+# После выдачи игрок управляет ими самостоятельно через панель канцелярии.
+CLAN_ENTRY_OPTIONAL_ROLE_KEYS = (*PROJECT_ROLE_KEYS, 'outings_arma')
+
+# Самостоятельная роль для участия в клановых вылазках на публичных серверах.
+# Не включаем её в ARMA_MANAGED_ROLE_KEYS / обычную синхронизацию состава.
+OUTINGS_ARMA_ROLE_ID = ROLE_IDS['outings_arma']
+OUTINGS_ARMA_ROLE_NAME = "Вылазки ArmA"
+
 # Роли, снимаемые при достижении 3 предупреждений + 3 выговоров (сценарий,
 # где взыскание выносит САМ БОТ, см. process_inactivity_discipline_for_event).
 # Этот набор снимается при дисциплинарном исключении; проектные роли также
@@ -696,6 +706,7 @@ EXPULSION_ROLE_KEYS = [
     'zapas_arma', 'lichnyj_sostav_arma', 'kombat_arma', 'zam_kombat_arma',
     'boec_arma', 'klan_arma', 'klan_enemy',
     *PROJECT_ROLE_KEYS,
+    'outings_arma',
 ]
 
 
@@ -735,24 +746,56 @@ def get_event_project_role_key(event: dict | None):
     return PROJECT_ROLE_KEYS_BY_IMAGE.get(event.get('image_key'))
 
 
-def member_has_event_project_role(member, event: dict) -> bool:
-    """Проверяет право бойца участвовать в мероприятии конкретного проекта.
-    Для обычных мероприятий без проектной картинки ограничений нет."""
-    role_key = get_event_project_role_key(event)
-    if role_key is None:
+OUTINGS_EVENT_IMAGE_KEYS = {'vylazka'}
+
+
+def get_event_required_role(event: dict | None):
+    """Возвращает (role_id, название) для мероприятий с ограничением по роли.
+    Проектные картинки требуют соответствующую проектную роль, а «Клановая
+    вылазка» (vylazka) — роль «Вылазки ArmA». Для остальных мероприятий роли
+    для допуска не требуются."""
+    if not event:
+        return None
+
+    project_role_key = get_event_project_role_key(event)
+    if project_role_key:
+        return (
+            ROLE_IDS.get(project_role_key),
+            PROJECT_ROLE_LABELS.get(project_role_key, project_role_key),
+        )
+
+    if event.get('image_key') in OUTINGS_EVENT_IMAGE_KEYS:
+        return OUTINGS_ARMA_ROLE_ID, OUTINGS_ARMA_ROLE_NAME
+
+    return None
+
+
+def member_has_event_required_role(member, event: dict) -> bool:
+    """Проверяет обязательную роль для конкретного типа мероприятия.
+    Если мероприятие не привязано к проекту или вылазкам, ограничений нет."""
+    requirement = get_event_required_role(event)
+    if requirement is None:
         return True
-    role_id = ROLE_IDS.get(role_key)
+    role_id, _role_name = requirement
     return bool(member and role_id and any(role.id == role_id for role in member.roles))
 
 
-def get_event_project_role_requirement_message(event: dict) -> str | None:
-    """Пояснение игроку, которому не хватает роли проекта для отметки."""
-    role_key = get_event_project_role_key(event)
-    if not role_key:
+def get_event_role_requirement_message(event: dict) -> str | None:
+    """Пояснение игроку, какой роли не хватает для отметки на мероприятии."""
+    requirement = get_event_required_role(event)
+    if requirement is None:
         return None
-    project_name = PROJECT_ROLE_LABELS.get(role_key, role_key)
+    _role_id, role_name = requirement
+
+    if event.get('image_key') in OUTINGS_EVENT_IMAGE_KEYS:
+        return es(
+            f"⛔ Для участия в клановых вылазках нужна роль «{role_name}». "
+            f"Нажмите «Переключить участие в вылазках» в панели канцелярии: "
+            f"<#{OFFICE_PANEL_CHANNEL_ID}>."
+        )
+
     return es(
-        f"⛔ Вы не указали, что хотите играть на проекте «{project_name}». "
+        f"⛔ Вы не указали, что хотите играть на проекте «{role_name}». "
         f"Чтобы отмечаться на мероприятиях этого проекта, выберите соответствующую роль "
         f"в канале <#{OFFICE_PANEL_CHANNEL_ID}>."
     )
@@ -1035,15 +1078,16 @@ EVENT_IMAGES = {
     'mangust': {'file': 'mangust-rounded.png', 'title': 'Операция «Мангуст»'},
 }
 
-# Картинки, наличие которых делает доступной кнопку "📝 Явка" под мероприятием
-# (см. build_event_view). Также используется для ограничения выбора картинки
-# при создании мероприятия ИГРОКАМИ (состав "Запас"+) — эти три варианта
-# зарезервированы за официальными клановыми матчами, создаваемыми командованием.
+# Допуск к мероприятию по роли и доступность отчёта о явке задаются
+# отдельными настройками ниже: это не меняет права создания мероприятий игроками.
 
-# Типы мероприятий, для которых доступна кнопка "Явка" и "Ожидаемый командир
-# отделения". Это же множество исключается из выбора картинки для игроков
-# в канцелярии (ts, как и остальные, создаётся только командованием).
-ATTENDANCE_ELIGIBLE_IMAGE_KEYS = {'echo', 'asvdv', 'tt', 'ts'}
+# Типы мероприятий, для которых доступна кнопка «Явка».
+# Клановые вылазки тоже используют мастер явки: он нужен в том числе для
+# проверки «отметился Приду, но не пришёл».
+ATTENDANCE_ELIGIBLE_IMAGE_KEYS = {'echo', 'asvdv', 'tt', 'ts', *OUTINGS_EVENT_IMAGE_KEYS}
+# Официальные типы мероприятий, картинки которых нельзя выбирать при
+# создании пользовательских мероприятий. Вылазки сюда намеренно не входят.
+COMMAND_ONLY_EVENT_IMAGE_KEYS = {'echo', 'asvdv', 'tt', 'ts'}
 # Тип, отметки на который ВСЕГДА необязательны (принудительно, см. create_event/update_event)
 ALWAYS_OPTIONAL_MARKS_IMAGE_KEYS = {'ts'}
 # Учитывать ли отметки «Не приду» на мероприятиях с необязательными отметками.
@@ -1617,7 +1661,7 @@ async def compute_expected_squad_commanders() -> dict:
     vacations = read_json(VACATIONS_FILE, {})
     result = {}
     for event_id, event in active_events:
-        accepted = set(await filter_event_project_nicknames(
+        accepted = set(await filter_event_eligible_nicknames(
             event.get('accepted', {}).keys(), event
         ))
         event_start_dt = datetime.fromtimestamp(event['start_time'], MSK)
@@ -1725,21 +1769,26 @@ async def find_member_by_nickname(nickname: str):
         print(f"Ошибка поиска участника: {e}")
         return None
 
-async def filter_event_project_nicknames(nicknames, event: dict) -> list:
-    """Оставляет только тех игроков из списка, у кого есть роль проекта
-    мероприятия. Для обычных мероприятий возвращает исходный список."""
-    role_key = get_event_project_role_key(event)
-    if role_key is None:
+async def filter_event_eligible_nicknames(nicknames, event: dict) -> list:
+    """Оставляет только игроков, имеющих обязательную роль мероприятия.
+    Для проектных событий это роль соответствующего проекта, для «vylazka» —
+    «Вылазки ArmA». Для остальных мероприятий возвращает исходный список."""
+    requirement = get_event_required_role(event)
+    if requirement is None:
         return list(nicknames)
-    role_id = ROLE_IDS.get(role_key)
+
+    role_id, role_name = requirement
     if not role_id:
-        print(f"⚠️ Не задан ID проектной роли для image_key='{event.get('image_key')}' — игроки исключены из списков.")
+        print(
+            f"⚠️ Не задан ID требуемой роли «{role_name}» для image_key="
+            f"'{event.get('image_key')}' — игроки исключены из списков."
+        )
         return []
 
     eligible = []
     for nickname in nicknames:
         member = await find_member_by_nickname(nickname)
-        if member_has_event_project_role(member, event):
+        if member_has_event_required_role(member, event):
             eligible.append(nickname)
     return eligible
 
@@ -3419,6 +3468,7 @@ async def _tech_warning_set_campaign_status(action: str):
 
 
 async def _tech_warning_ensure_panel():
+    """Находит и обновляет постоянную панель технических уведомлений в Components V2."""
     if not _TECH_WARNING_STATE_READY:
         return
     try:
@@ -3427,15 +3477,40 @@ async def _tech_warning_ensure_panel():
         message_id = TECH_WARNING_STATE.get("panel_message_id")
         if message_id:
             try:
-                message = await channel.fetch_message(int(message_id))
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                candidate = await channel.fetch_message(int(message_id))
+                if candidate.author.id == client.user.id:
+                    message = candidate
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
                 message = None
+
+        if message is not None:
+            try:
+                await message.edit(
+                    content=None,
+                    embed=None,
+                    embeds=[],
+                    attachments=[],
+                    view=TechnicalWarningPanelView(),
+                    allowed_mentions=discord.AllowedMentions.none()
+                )
+            except Exception as edit_error:
+                print(f"⚠️ Не удалось преобразовать панель технических уведомлений в Components V2: {edit_error}")
+                try:
+                    await message.delete()
+                except Exception as delete_error:
+                    print(f"❌ Не удалось удалить старую панель тех. уведомлений: {delete_error}")
+                    return
+                message = None
+
         if message is None:
-            message = await channel.send(TECH_WARNING_PANEL_TEXT, view=TechnicalWarningPanelView())
-            TECH_WARNING_STATE["panel_message_id"] = message.id
-            _tech_warning_save_state()
-        else:
-            await message.edit(content=TECH_WARNING_PANEL_TEXT, view=TechnicalWarningPanelView())
+            message = await channel.send(
+                view=TechnicalWarningPanelView(),
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+
+        TECH_WARNING_STATE["panel_message_id"] = message.id
+        _tech_warning_save_state()
+        print(f"✅ Панель технических уведомлений готова в Components V2 (ID: {message.id})")
     except Exception as exc:
         print(f"⚠️ Не удалось создать/обновить панель технических уведомлений: {exc}")
 
@@ -3549,7 +3624,7 @@ async def get_active_members(current_date: datetime, registered_before: datetime
             if get_member_created_at(m) is None or get_member_created_at(m) <= registered_before
         ]
     if event is not None:
-        filtered = await filter_event_project_nicknames(filtered, event)
+        filtered = await filter_event_eligible_nicknames(filtered, event)
     return filtered
 
 
@@ -3559,7 +3634,7 @@ async def build_mentions_for_nicknames(nicknames: list, event: dict = None) -> s
     mentions = []
     for nickname in nicknames:
         member = await find_member_by_nickname(nickname)
-        if event is not None and not member_has_event_project_role(member, event):
+        if event is not None and not member_has_event_required_role(member, event):
             continue
         mentions.append(member.mention if member else f"**{nickname}**")
     return " ".join(mentions)
@@ -3639,11 +3714,23 @@ LOGGING_ANCHOR_DESCRIPTION = (
 BOT_STARTED_AT = datetime.now(MSK)
 
 def build_admin_panel_embed():
+    """Legacy embed builder retained only for identifying old panel messages."""
     embed = discord.Embed(title=es("🛠️ Панель бота для комбата и заместителей"),
                            description=ADMIN_PANEL_DESCRIPTION, color=ANCHOR_EMBED_COLOR)
     started_str = BOT_STARTED_AT.strftime('%d.%m.%Y %H:%M')
     embed.set_footer(text=f"Последний запуск бота: {started_str} МСК")
     return embed
+
+
+def _message_has_component_custom_id(message, target_custom_id: str) -> bool:
+    """Ищет custom_id рекурсивно в обычных и Components V2 компонентах сообщения."""
+    pending = list(getattr(message, "components", ()) or ())
+    while pending:
+        component = pending.pop()
+        if getattr(component, "custom_id", None) == target_custom_id:
+            return True
+        pending.extend(getattr(component, "children", ()) or ())
+    return False
 
 
 def build_notifications_anchor_embed():
@@ -3722,16 +3809,16 @@ KNOWN_ADMIN_PANEL_MESSAGE_ID = 1545844848815505439
 
 
 async def find_or_create_admin_panel_message(channel):
-    """Ищет якорь панели управления: сначала по сохранённому ID, затем по
-    известному захардкоженному ID (см. выше) — БЕЗ сверки заголовка эмбеда
-    (заголовок мог и должен был меняться), проверяется только то, что автор
-    сообщения — сам бот. Скан истории — последний fallback, и только потом
-    создание нового сообщения."""
+    """Ищет старую или новую панель комбата и возвращает её для обновления.
+
+    Приоритет: сохранённый ID -> известный ID -> история (старый embed или
+    новый Components V2 custom_id) -> создание нового Components V2 сообщения.
+    """
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
     candidate_id = anchors.get('panel_message_id') or KNOWN_ADMIN_PANEL_MESSAGE_ID
     if candidate_id:
         try:
-            message = await channel.fetch_message(candidate_id)
+            message = await channel.fetch_message(int(candidate_id))
             if message.author.id == client.user.id:
                 anchors['panel_message_id'] = message.id
                 save_json(ADMIN_ANCHORS_FILE, anchors)
@@ -3739,33 +3826,69 @@ async def find_or_create_admin_panel_message(channel):
         except Exception:
             pass  # сообщение удалено/недоступно — переходим к скану истории
 
-    async for message in channel.history(limit=50):
+    legacy_titles = {
+        es("🛠️ Панель управления комбата и заместителей"),
+        es("🛠️ Панель бота для комбата и заместителей"),
+    }
+    async for message in channel.history(limit=100):
         if message.author.id != client.user.id:
             continue
-        if message.embeds and message.embeds[0].title == es("🛠️ Панель управления комбата и заместителей"):
+        has_legacy_title = bool(
+            message.embeds and message.embeds[0].title in legacy_titles
+        )
+        has_v2_panel = _message_has_component_custom_id(message, "admin_create_event")
+        if has_legacy_title or has_v2_panel:
             anchors['panel_message_id'] = message.id
             save_json(ADMIN_ANCHORS_FILE, anchors)
             return message
 
-    message = await channel.send(embed=build_admin_panel_embed(), view=AdminMainMenuView())
+    message = await channel.send(
+        view=AdminMainMenuView(),
+        allowed_mentions=discord.AllowedMentions.none()
+    )
     anchors['panel_message_id'] = message.id
     save_json(ADMIN_ANCHORS_FILE, anchors)
     return message
 
 
 async def ensure_admin_channel_anchors():
-    """Находит (или создаёт при самом первом запуске) три якорных сообщения
-    в ADMIN_CHANNEL_ID. Панель управления ОБНОВЛЯЕТСЯ при каждом старте бота
-    (актуализация embed+view); уведомления/логирование — только создаются
-    один раз, их оформление актуализируется через синхронизацию шаблонов."""
+    """Находит/создаёт три якоря админ-канала и обновляет панель в Components V2.
+
+    Сообщение панели обновляется на месте, чтобы сохранить ID и закрепление.
+    Старые content/embed/attachments очищаются, поскольку Components V2
+    использует TextDisplay внутри LayoutView. Остальные два якоря и их ветки
+    уведомлений/логирования не меняются.
+    """
     channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
 
     panel_msg = await find_or_create_admin_panel_message(channel)
     try:
-        await panel_msg.edit(embed=build_admin_panel_embed(), view=AdminMainMenuView())
-    except Exception as e:
-        print(f"⚠️ Не удалось обновить панель управления: {e}")
+        await panel_msg.edit(
+            content=None,
+            embed=None,
+            embeds=[],
+            attachments=[],
+            view=AdminMainMenuView(),
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+    except Exception as edit_error:
+        print(f"⚠️ Не удалось преобразовать панель управления в Components V2: {edit_error}")
+        # Если преобразование старого сообщения невозможно, пересоздаём только
+        # саму панель. Ветки уведомлений и логирования ниже остаются нетронутыми.
+        try:
+            await panel_msg.delete()
+        except Exception as delete_error:
+            print(f"❌ Не удалось удалить старую панель управления: {delete_error}")
+            raise
+        panel_msg = await channel.send(
+            view=AdminMainMenuView(),
+            allowed_mentions=discord.AllowedMentions.none()
+        )
+        print(f"✅ Панель управления заново опубликована в Components V2 (ID: {panel_msg.id})")
+    else:
+        print(f"✅ Панель управления обновлена в Components V2 (ID: {panel_msg.id})")
+
     anchors['panel_message_id'] = panel_msg.id
     notif_msg, notif_thread = await _find_or_create_anchor(
         channel, es("ℹ️ Уведомления"),
@@ -3786,7 +3909,7 @@ async def ensure_admin_channel_anchors():
         anchors['logging_thread_id'] = log_thread.id
 
     save_json(ADMIN_ANCHORS_FILE, anchors)
-    print(f"✅ Якорные сообщения админ-канала готовы (панель, уведомления, логирование)")
+    print("✅ Якорные сообщения админ-канала готовы (панель, уведомления, логирование)")
 
 
 async def get_notifications_thread_id():
@@ -4234,7 +4357,7 @@ class EventSetupView(discord.ui.View):
 
         image_options = [discord.SelectOption(label="Без картинки", value="none", emoji="🚫", default=True)]
         for key, data in EVENT_IMAGES.items():
-            if player_mode and key in ATTENDANCE_ELIGIBLE_IMAGE_KEYS:
+            if player_mode and key in COMMAND_ONLY_EVENT_IMAGE_KEYS:
                 continue
             image_options.append(discord.SelectOption(label=data['title'], value=key, emoji="🖼️"))
         self.image_select = discord.ui.Select(placeholder="🖼️ Картинка (необязательно)...", options=image_options, row=0)
@@ -4302,7 +4425,7 @@ class EventEditSetupView(discord.ui.View):
         image_options = [discord.SelectOption(label="⏮️ Оставить текущую", value="__keep__", emoji="✅", default=True)]
         image_options.append(discord.SelectOption(label="Без картинки", value="none", emoji="🚫"))
         for key, data in EVENT_IMAGES.items():
-            if self.is_player_event and key in ATTENDANCE_ELIGIBLE_IMAGE_KEYS:
+            if self.is_player_event and key in COMMAND_ONLY_EVENT_IMAGE_KEYS:
                 continue
             image_options.append(discord.SelectOption(label=data['title'], value=key, emoji="🖼️"))
         self.image_select = discord.ui.Select(placeholder="🖼️ Картинка (по умолчанию — текущая)...", options=image_options, row=0)
@@ -4708,136 +4831,223 @@ class TechnicalWarningCompetitorIdsModal(discord.ui.Modal):
         await interaction.followup.send("\n".join(details), ephemeral=True)
 
 
-class TechnicalWarningPanelView(discord.ui.View):
+def _make_layout_button(label, style, custom_id, callback):
+    """Создаёт кнопку для ActionRow в Components V2 и привязывает callback."""
+    button = discord.ui.Button(
+        label=es(label),
+        style=style,
+        custom_id=custom_id
+    )
+    button.callback = callback
+    return button
+
+
+class TechnicalWarningPanelView(discord.ui.LayoutView):
+    """Панель технических уведомлений на Components V2."""
     def __init__(self):
         super().__init__(timeout=None)
 
+        children = [
+            discord.ui.TextDisplay(TECH_WARNING_PANEL_TEXT),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
+            discord.ui.TextDisplay("### Запуск уведомлений"),
+            discord.ui.ActionRow(
+                _make_layout_button(
+                    "📨 Уведомить наблюдавшихся онлайн", discord.ButtonStyle.primary,
+                    "technical_warning_start_online", self.start_online
+                ),
+                _make_layout_button(
+                    "🌙 Не наблюдались онлайн", discord.ButtonStyle.secondary,
+                    "technical_warning_start_offline", self.start_offline
+                ),
+            ),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay("### Управление кампанией"),
+            discord.ui.ActionRow(
+                _make_layout_button("⏸ Пауза", discord.ButtonStyle.secondary,
+                                    "technical_warning_pause", self.pause_campaign),
+                _make_layout_button("▶ Продолжить", discord.ButtonStyle.success,
+                                    "technical_warning_resume", self.resume_campaign),
+                _make_layout_button("⏹ Остановить", discord.ButtonStyle.danger,
+                                    "technical_warning_stop", self.stop_campaign),
+            ),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay("### Контроль и статистика"),
+            discord.ui.ActionRow(
+                _make_layout_button("📊 Статистика", discord.ButtonStyle.primary,
+                                    "technical_warning_stats", self.show_stats),
+                _make_layout_button("🚫 ID соперников", discord.ButtonStyle.secondary,
+                                    "technical_warning_competitor_ids", self.manage_competitors),
+            ),
+        ]
+        self.add_item(discord.ui.Container(*children, accent_color=9881319))
+
     async def _admin_check(self, interaction):
         if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+            await interaction.response.send_message(
+                es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True
+            )
             return False
         return True
 
-    @discord.ui.button(label=es("📨 Уведомить наблюдавшихся онлайн"), style=discord.ButtonStyle.primary, custom_id="technical_warning_start_online", row=0)
-    async def start_online(self, interaction, button):
+    async def start_online(self, interaction: discord.Interaction):
         if await self._admin_check(interaction):
             await interaction.response.send_modal(TechnicalWarningComposeModal("online"))
 
-    @discord.ui.button(label=es("🌙 Не наблюдались онлайн"), style=discord.ButtonStyle.secondary, custom_id="technical_warning_start_offline", row=0)
-    async def start_offline(self, interaction, button):
+    async def start_offline(self, interaction: discord.Interaction):
         if await self._admin_check(interaction):
             await interaction.response.send_modal(TechnicalWarningComposeModal("offline"))
 
-    @discord.ui.button(label=es("⏸ Пауза"), style=discord.ButtonStyle.secondary, custom_id="technical_warning_pause", row=1)
-    async def pause_campaign(self, interaction, button):
+    async def pause_campaign(self, interaction: discord.Interaction):
         if not await self._admin_check(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         success, message = await _tech_warning_set_campaign_status("pause")
         await interaction.followup.send(("✅ " if success else "⚠️ ") + message, ephemeral=True)
 
-    @discord.ui.button(label=es("▶ Продолжить"), style=discord.ButtonStyle.success, custom_id="technical_warning_resume", row=1)
-    async def resume_campaign(self, interaction, button):
+    async def resume_campaign(self, interaction: discord.Interaction):
         if not await self._admin_check(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         success, message = await _tech_warning_set_campaign_status("resume")
         await interaction.followup.send(("✅ " if success else "⚠️ ") + message, ephemeral=True)
 
-    @discord.ui.button(label=es("⏹ Остановить"), style=discord.ButtonStyle.danger, custom_id="technical_warning_stop", row=1)
-    async def stop_campaign(self, interaction, button):
+    async def stop_campaign(self, interaction: discord.Interaction):
         if not await self._admin_check(interaction):
             return
         await interaction.response.defer(ephemeral=True, thinking=True)
         success, message = await _tech_warning_set_campaign_status("stop")
         await interaction.followup.send(("✅ " if success else "⚠️ ") + message, ephemeral=True)
 
-    @discord.ui.button(label=es("📊 Статистика"), style=discord.ButtonStyle.primary, custom_id="technical_warning_stats", row=2)
-    async def show_stats(self, interaction, button):
+    async def show_stats(self, interaction: discord.Interaction):
         if not await self._admin_check(interaction):
             return
         await interaction.response.send_message(_tech_warning_stats_text(), ephemeral=True)
 
-    @discord.ui.button(label=es("🚫 ID соперников"), style=discord.ButtonStyle.secondary, custom_id="technical_warning_competitor_ids", row=2)
-    async def manage_competitors(self, interaction, button):
+    async def manage_competitors(self, interaction: discord.Interaction):
         if not await self._admin_check(interaction):
             return
         await interaction.response.send_modal(TechnicalWarningCompetitorIdsModal())
 
 
-class AdminMainMenuView(discord.ui.View):
+class AdminMainMenuView(discord.ui.LayoutView):
+    """Главная панель комбата и заместителей на Components V2."""
     def __init__(self):
         super().__init__(timeout=None)
-    
-    @discord.ui.button(label=es("📅 Создание единоразового мероприятия"), style=discord.ButtonStyle.primary, custom_id="admin_create_event", row=0)
-    async def create_event_button(self, interaction, button):
+
+        started_str = BOT_STARTED_AT.strftime('%d.%m.%Y %H:%M')
+        main_children = [
+            discord.ui.TextDisplay(
+                "## 🛠️ Панель бота для комбата и заместителей\n"
+                "Здесь вы можете управлять функциями бота через кнопки. "
+                "Доступные инструменты сгруппированы по назначению.\n"
+                f"*Последний запуск бота: {started_str} МСК*"
+            ),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
+            discord.ui.TextDisplay("### 📅 Мероприятия"),
+            discord.ui.ActionRow(
+                _make_layout_button("📅 Создание единоразового мероприятия", discord.ButtonStyle.primary,
+                                    "admin_create_event", self.create_event_button),
+                _make_layout_button("🔁 Управление шаблонами еженедельных мероприятий", discord.ButtonStyle.secondary,
+                                    "admin_weekly_events", self.weekly_events_button),
+            ),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay("### 💬 Сообщения"),
+            discord.ui.ActionRow(
+                _make_layout_button("📝 Отправка обычного сообщения от имени бота", discord.ButtonStyle.success,
+                                    "admin_send_message", self.send_message_button),
+                _make_layout_button("🗑️ Удаление сообщения", discord.ButtonStyle.danger,
+                                    "admin_delete_message", self.delete_message_button),
+            ),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay("### 🏖️ Отпуска"),
+            discord.ui.ActionRow(
+                _make_layout_button("🏖️ Принудительный отпуск для бойца", discord.ButtonStyle.primary,
+                                    "admin_vacation_for_player", self.vacation_for_player_button),
+                _make_layout_button("🏖️ Список активных отпусков", discord.ButtonStyle.secondary,
+                                    "admin_vacation_list", self.vacation_list_button),
+            ),
+        ]
+        utility_children = [
+            discord.ui.TextDisplay("### 🔍 Проверки и инструменты"),
+            discord.ui.ActionRow(
+                _make_layout_button("🔍 Принудительная проверка таблицы", discord.ButtonStyle.success,
+                                    "admin_check_table", self.check_table_button),
+                _make_layout_button("🔍 Извлечение кода сообщения", discord.ButtonStyle.secondary,
+                                    "admin_extract_message", self.extract_message_button),
+                _make_layout_button("🔄 Обновление оформления сообщений бота", discord.ButtonStyle.primary,
+                                    "admin_refresh_templates", self.refresh_templates_button),
+            ),
+            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
+            discord.ui.TextDisplay("### ⚙️ Управление ботом"),
+            discord.ui.ActionRow(
+                _make_layout_button("🧹 Очистка логов", discord.ButtonStyle.danger,
+                                    "admin_clear_logs", self.clear_logs_button),
+                _make_layout_button("🔧 Принудительный перезапуск бота", discord.ButtonStyle.danger,
+                                    "admin_force_restart", self.force_restart_button),
+            ),
+        ]
+        # Discord ограничивает каждый Container десятью непосредственными детьми.
+        self.add_item(discord.ui.Container(*main_children, accent_color=9881319))
+        self.add_item(discord.ui.Container(*utility_children, accent_color=9881319))
+
+    async def _admin_check(self, interaction):
         if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+            await interaction.response.send_message(
+                es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True
+            )
+            return False
+        return True
+
+    async def create_event_button(self, interaction: discord.Interaction):
+        if not await self._admin_check(interaction):
             return
         view = EventSetupView()
-        await interaction.response.send_message(es("📅 Настройте параметры мероприятия и нажмите Далее:"), view=view, ephemeral=True)
+        await interaction.response.send_message(
+            es("📅 Настройте параметры мероприятия и нажмите Далее:"),
+            view=view, ephemeral=True
+        )
 
-    @discord.ui.button(label=es("🔁 Управление шаблонами еженедельных мероприятий"), style=discord.ButtonStyle.secondary, custom_id="admin_weekly_events", row=0)
-    async def weekly_events_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+    async def weekly_events_button(self, interaction: discord.Interaction):
+        if not await self._admin_check(interaction):
             return
         ensure_weekly_events_file()
         await interaction.response.send_message(
             es("🔁 Управление еженедельными мероприятиями:"),
             view=WeeklyEventsManageSelectView(), ephemeral=True
         )
-    
-    @discord.ui.button(label=es("📝 Отправка обычного сообщения от имени бота"), style=discord.ButtonStyle.success, custom_id="admin_send_message", row=1)
-    async def send_message_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-            return
-        await interaction.response.send_modal(SendMessageModal())
-    
-    @discord.ui.button(label=es("🗑️ Удаление сообщения"), style=discord.ButtonStyle.danger, custom_id="admin_delete_message", row=1)
-    async def delete_message_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-            return
-        await interaction.response.send_modal(DeleteMessageModal())
-    
-    @discord.ui.button(label=es("🏖️ Принудительный отпуск для бойца"), style=discord.ButtonStyle.primary, custom_id="admin_vacation_for_player", row=2)
-    async def vacation_for_player_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-            return
-        await interaction.response.send_modal(AdminVacationModal())
-    
-    @discord.ui.button(label=es("🏖️ Список активных отпусков"), style=discord.ButtonStyle.secondary, custom_id="admin_vacation_list", row=2)
-    async def vacation_list_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-            return
-        await show_vacation_list(interaction)
-    
-    @discord.ui.button(label=es("🔍 Принудительная проверка таблицы"), style=discord.ButtonStyle.success, custom_id="admin_check_table", row=3)
-    async def check_table_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+
+    async def send_message_button(self, interaction: discord.Interaction):
+        if await self._admin_check(interaction):
+            await interaction.response.send_modal(SendMessageModal())
+
+    async def delete_message_button(self, interaction: discord.Interaction):
+        if await self._admin_check(interaction):
+            await interaction.response.send_modal(DeleteMessageModal())
+
+    async def vacation_for_player_button(self, interaction: discord.Interaction):
+        if await self._admin_check(interaction):
+            await interaction.response.send_modal(AdminVacationModal())
+
+    async def vacation_list_button(self, interaction: discord.Interaction):
+        if await self._admin_check(interaction):
+            await show_vacation_list(interaction)
+
+    async def check_table_button(self, interaction: discord.Interaction):
+        if not await self._admin_check(interaction):
             return
         if check_lock.locked():
             await interaction.response.send_message(es("⚠️ Проверка уже выполняется!"), ephemeral=True)
             return
         await interaction.response.send_message(es("🔍 Запускаю проверку таблицы..."), ephemeral=True)
         await check_spreadsheet()
-    
-    @discord.ui.button(label=es("🔍 Извлечение кода сообщения"), style=discord.ButtonStyle.secondary, custom_id="admin_extract_message", row=3)
-    async def extract_message_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
-            return
-        await interaction.response.send_modal(ExtractMessageModal())
-    
-    @discord.ui.button(label=es("🔄 Обновление оформления сообщений бота"), style=discord.ButtonStyle.primary, custom_id="admin_refresh_templates", row=3)
-    async def refresh_templates_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+
+    async def extract_message_button(self, interaction: discord.Interaction):
+        if await self._admin_check(interaction):
+            await interaction.response.send_modal(ExtractMessageModal())
+
+    async def refresh_templates_button(self, interaction: discord.Interaction):
+        if not await self._admin_check(interaction):
             return
         await interaction.response.send_message(
             es("🔄 Начинаю обновление шаблонов всех сообщений...\n"
@@ -4854,22 +5064,21 @@ class AdminMainMenuView(discord.ui.View):
             ephemeral=True
         )
 
-    @discord.ui.button(label=es("🧹 Очистка логов"), style=discord.ButtonStyle.danger, custom_id="admin_clear_logs", row=4)
-    async def clear_logs_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+    async def clear_logs_button(self, interaction: discord.Interaction):
+        if not await self._admin_check(interaction):
             return
         await interaction.response.send_message(
             es("⚠️ Это удалит все сообщения бота в ветке логирования. Продолжить?"),
             view=ConfirmClearLogsView(), ephemeral=True
         )
 
-    @discord.ui.button(label=es("🔧 Принудительный перезапуск бота"), style=discord.ButtonStyle.danger, custom_id="admin_force_restart", row=4)
-    async def force_restart_button(self, interaction, button):
-        if interaction.user.id not in ADMIN_USER_IDS:
-            await interaction.response.send_message(es("⛔ Доступно только комбату и его заместителям!"), ephemeral=True)
+    async def force_restart_button(self, interaction: discord.Interaction):
+        if not await self._admin_check(interaction):
             return
-        await interaction.response.send_message(es("🔧 Перезапускаю бота... Новый процесс запустится через несколько секунд."), ephemeral=True)
+        await interaction.response.send_message(
+            es("🔧 Перезапускаю бота... Новый процесс запустится через несколько секунд."),
+            ephemeral=True
+        )
         await asyncio.sleep(1)
         await force_restart_bot()
 
@@ -5255,11 +5464,10 @@ VACATION_MARK_NOTICE = (
 def build_personal_mark_status_text(event: dict, nickname: str) -> str:
     """Персональный статус отметки конкретного бойца на мероприятии —
     базовая часть ответа кнопки '📋 Отметки', доступная всем без исключения."""
-    project_role_key = get_event_project_role_key(event)
-    if project_role_key:
+    if get_event_required_role(event) is not None:
         member = member_index.get_exact(nickname) or member_index.get_fuzzy(nickname)
-        if not member_has_event_project_role(member, event):
-            return get_event_project_role_requirement_message(event)
+        if not member_has_event_required_role(member, event):
+            return get_event_role_requirement_message(event)
     if nickname in (event.get('accepted') or {}):
         return es("✅ Вы отметились: **Приду**")
     if (event.get('mandatory', True) or TRACK_DECLINED_MARKS_FOR_OPTIONAL_EVENTS) and nickname in (event.get('declined') or {}):
@@ -5356,7 +5564,7 @@ class ModsAnnounceModal(discord.ui.Modal, title=es("🧩 Объявление д
                 mention_block = await get_all_active_members_mentions(event_start, event=event)
             else:
                 # По умолчанию — только тем, кто отметился "Приду"
-                accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
+                accepted = await filter_event_eligible_nicknames(event.get('accepted', {}).keys(), event)
                 if accepted:
                     mention_block = await build_mentions_for_nicknames(accepted, event=event)
                 else:
@@ -5456,9 +5664,9 @@ async def build_marks_report_embed(event_id: str):
     active_members = await get_active_members(
         event_start_dt, registered_before=event_start_dt, vacation_set=vacation_set, event=event
     )
-    accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
+    accepted = await filter_event_eligible_nicknames(event.get('accepted', {}).keys(), event)
     if event.get('mandatory', True) or TRACK_DECLINED_MARKS_FOR_OPTIONAL_EVENTS:
-        declined = await filter_event_project_nicknames(event.get('declined', {}).keys(), event)
+        declined = await filter_event_eligible_nicknames(event.get('declined', {}).keys(), event)
     else:
         declined = []  # необязательные мероприятия не ведут список отказавшихся
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
@@ -5494,8 +5702,8 @@ async def build_marks_report_embed(event_id: str):
 
 def build_event_view(event: dict, event_id: str = None, _force_register: bool = False) -> discord.ui.View:
     """Строит нужный набор кнопок в зависимости от текущего статуса мероприятия.
-    Кнопка '📝 Явка' показывается ТОЛЬКО для мероприятий с картинкой из
-    ATTENDANCE_ELIGIBLE_IMAGE_KEYS (echo/asvdv/tt). Кнопка '📋 Отметки'
+    Кнопка '📝 Явка' показывается для мероприятий с картинкой из
+    ATTENDANCE_ELIGIBLE_IMAGE_KEYS (echo/asvdv/tt/ts/vylazka). Кнопка '📋 Отметки'
     показывается ТОЛЬКО когда обычные списки отметок скрыты экспериментом
     (см. is_marks_hidden_for_event).
 
@@ -6096,6 +6304,7 @@ async def _handle_roster_membership_change(uid: str, composition: str):
     await refresh_all_active_event_embeds()
 
 _player_dm_state_lock = asyncio.Lock()
+_clan_entry_role_grant_lock = asyncio.Lock()
 
 
 def _disc_word_verb_from_russian_type(type_str: str):
@@ -6177,7 +6386,7 @@ async def handle_player_dm_notifications(uid: str, member, composition: str, pos
     Момент САМОГО перехода в 'Отставка' (например, взыскание, ставшее
     причиной исключения) под это ограничение не подпадает."""
     if not member:
-        return
+        return None, False
 
     async with _player_dm_state_lock:
         state = load_json(PLAYER_DM_STATE_FILE, {})
@@ -6188,6 +6397,14 @@ async def handle_player_dm_notifications(uid: str, member, composition: str, pos
         previous_position = entry.get('position')
         previous_actions = entry.get('actions', {})
         prev_award_counts = entry.get('award_counts', {'game': {}, 'global': 0})
+
+        # Одноразовая выдача всех проектных ролей и роли вылазок при вступлении
+        # в клан: «Отбор» -> «Запас». Маркер сохраняется до успешного ответа
+        # Discord API, поэтому временная ошибка выдачи не теряет назначение.
+        if previous_composition == 'Отбор' and composition == 'Запас':
+            entry['clan_entry_roles_pending'] = True
+        elif composition != 'Запас':
+            entry.pop('clan_entry_roles_pending', None)
 
         current_actions_map = {a['id']: a for a in current_actions if a.get('id')}
         game_awards = data.get('gameAwards', {}) or {}
@@ -6261,6 +6478,57 @@ async def handle_player_dm_notifications(uid: str, member, composition: str, pos
         entry['award_counts'] = {'game': new_game_counts, 'global': len(global_awards)}
         state[uid] = entry
         save_json(PLAYER_DM_STATE_FILE, state)
+        return previous_composition, bool(entry.get('clan_entry_roles_pending'))
+
+
+async def _grant_clan_entry_optional_roles(member, uid: str) -> bool:
+    """Выдаёт полный набор проектных ролей и «Вылазки ArmA» при вступлении.
+    Возвращает True только если все требуемые роли найдены и Discord подтвердил
+    добавление. Отсутствующая роль/ошибка оставляет onboarding-маркер для повтора."""
+    roles_by_id = {role.id: role for role in member.roles}
+    roles_to_add = []
+    missing_names = []
+
+    for role_key in CLAN_ENTRY_OPTIONAL_ROLE_KEYS:
+        role_id = ROLE_IDS.get(role_key)
+        role = member.guild.get_role(role_id) if role_id else None
+        if role is None:
+            missing_names.append(role_key)
+        elif role.id not in roles_by_id:
+            roles_to_add.append(role)
+
+    if missing_names:
+        print(
+            f"⚠️ Не удалось полностью выдать роли при вступлении {member.display_name} (uid={uid}): "
+            f"на сервере отсутствуют роли/ID: {', '.join(sorted(set(missing_names)))}. Повтор будет выполнен при следующем обновлении профиля."
+        )
+        return False
+
+    try:
+        if roles_to_add:
+            await member.add_roles(
+                *roles_to_add,
+                reason="Вступление в клан: выдача ролей всех проектов и «Вылазки ArmA»"
+            )
+        return True
+    except Exception as e:
+        print(
+            f"⚠️ Не удалось выдать проектные роли и «Вылазки ArmA» при вступлении "
+            f"{member.display_name} (uid={uid}): {e}. Повтор будет выполнен при следующем обновлении профиля."
+        )
+        return False
+
+
+async def _clear_clan_entry_roles_pending(uid: str):
+    """Снимает retry-маркер только после успешной выдачи всех ролей."""
+    async with _player_dm_state_lock:
+        state = load_json(PLAYER_DM_STATE_FILE, {})
+        entry = state.get(uid)
+        if not entry:
+            return
+        entry.pop('clan_entry_roles_pending', None)
+        entry['clan_entry_roles_granted_at'] = datetime.now(MSK).isoformat()
+        save_json(PLAYER_DM_STATE_FILE, state)
 
 
 async def sync_arma_member_state(uid: str, data: dict):
@@ -6293,6 +6561,7 @@ async def sync_arma_member_state(uid: str, data: dict):
     composition = (game_role.get('composition') or '').strip()
     position = (game_role.get('position') or '').strip()
 
+    runtime_previous_composition = _LAST_KNOWN_ARMA_COMPOSITION.get(uid)
     await _handle_roster_membership_change(uid, composition)
 
     now_ms = int(datetime.now(MSK).timestamp() * 1000)
@@ -6300,7 +6569,21 @@ async def sync_arma_member_state(uid: str, data: dict):
     active_warnings = len([a for a in game_da if a.get('type') == 'Замечание' and a.get('expiresAtMs', 0) > now_ms])
     active_reprimands = len([a for a in game_da if a.get('type') == 'Выговор' and a.get('expiresAtMs', 0) > now_ms])
 
-    await handle_player_dm_notifications(uid, member, composition, position, game_da, data)
+    previous_composition, onboarding_roles_pending = await handle_player_dm_notifications(
+        uid, member, composition, position, game_da, data
+    )
+
+    # Резервный источник перехода — in-memory история, если постоянная запись
+    # PLAYER_DM_STATE_FILE отсутствовала/ещё не была создана до этого события.
+    if (previous_composition is None and runtime_previous_composition == 'Отбор'
+            and composition == 'Запас' and not onboarding_roles_pending):
+        async with _player_dm_state_lock:
+            state = load_json(PLAYER_DM_STATE_FILE, {})
+            entry = state.setdefault(uid, {})
+            if entry.get('composition') == 'Запас':
+                entry['clan_entry_roles_pending'] = True
+                save_json(PLAYER_DM_STATE_FILE, state)
+                onboarding_roles_pending = True
 
     result = compute_arma_role_keys(composition, position, active_warnings, active_reprimands)
     if result is None:
@@ -6318,6 +6601,7 @@ async def sync_arma_member_state(uid: str, data: dict):
     )
     if composition == 'Отставка' or is_expelled_by_discipline:
         managed_role_keys.update(PROJECT_ROLE_KEYS)
+        managed_role_keys.add('outings_arma')
     managed_role_ids = {ROLE_IDS[k] for k in managed_role_keys if ROLE_IDS.get(k)}
     current_managed_roles = {r for r in member.roles if r.id in managed_role_ids}
     desired_roles = {guild.get_role(rid) for rid in desired_role_ids}
@@ -6333,6 +6617,17 @@ async def sync_arma_member_state(uid: str, data: dict):
             await member.remove_roles(*to_remove, reason="Синхронизация состава/должности ArmA с сайтом")
     except Exception as e:
         print(f"⚠️ Не удалось синхронизировать роли ArmA для {member.display_name} (uid={uid}): {e}")
+
+    if onboarding_roles_pending and composition == 'Запас' and not is_expelled_by_discipline:
+        async with _clan_entry_role_grant_lock:
+            # Повторный watcher мог уже обработать этот переход параллельно.
+            # Перед API-вызовом перечитываем pending-флаг, чтобы не слать
+            # несколько одинаковых запросов на выдачу одной группы ролей.
+            latest_state = load_json(PLAYER_DM_STATE_FILE, {})
+            latest_entry = latest_state.get(uid, {})
+            if latest_entry.get('composition') == 'Запас' and latest_entry.get('clan_entry_roles_pending'):
+                if await _grant_clan_entry_optional_roles(member, uid):
+                    await _clear_clan_entry_roles_pending(uid)
 
     guest_role_id = ROLE_IDS.get(ARMA_GUEST_ROLE_KEY)
     guest_role = guild.get_role(guest_role_id) if guest_role_id else None
@@ -7284,8 +7579,8 @@ async def apply_false_acceptance_punishments(wizard, thread):
     event = load_json(EVENTS_FILE, {}).get(wizard.event_id, {})
     for nickname in (wizard.false_acceptance_punish or []):
         member = await find_member_by_nickname(nickname)
-        if not member_has_event_project_role(member, event):
-            print(f"ℹ️ Взыскание за ложную отметку для '{nickname}' пропущено: нет проектной роли.")
+        if not member_has_event_required_role(member, event):
+            print(f"ℹ️ Взыскание за ложную отметку для '{nickname}' пропущено: нет обязательной роли мероприятия.")
             continue
         uid = await get_uid_by_nickname(nickname)
         if not uid:
@@ -7942,10 +8237,10 @@ async def start_attendance_wizard(interaction, event_id):
     # нажатия кнопки), физически отсутствовал в селекте: его нельзя было
     # отметить, он не получал отыгрыш и не мог быть назначен командиром.
     clan_members = await load_clan_members_from_firebase()
-    clan_members = await filter_event_project_nicknames(clan_members, event)
+    clan_members = await filter_event_eligible_nicknames(clan_members, event)
     if not clan_members:
         await interaction.response.send_message(
-            es("❌ Нет бойцов с соответствующей проектной ролью для этого мероприятия."), ephemeral=True
+            es("❌ Нет бойцов с соответствующей ролью допуска для этого мероприятия."), ephemeral=True
         )
         return
 
@@ -7978,10 +8273,10 @@ async def show_commander_step(interaction, wizard):
     await interaction.followup.send(title_text, view=view, ephemeral=True)
 
 async def proceed_to_next_step(interaction, wizard):
-    # Полный состав без фильтра по отпускам, но с проектной ролью мероприятия.
+    # Полный состав без фильтра по отпускам, но с требуемой ролью мероприятия.
     clan_members = await load_clan_members_from_firebase()
     event = load_json(EVENTS_FILE, {}).get(wizard.event_id, {})
-    clan_members = await filter_event_project_nicknames(clan_members, event)
+    clan_members = await filter_event_eligible_nicknames(clan_members, event)
     
     if wizard.num_games == 0:
         await show_false_acceptance_step(interaction, wizard)
@@ -8005,7 +8300,7 @@ async def show_false_acceptance_step(interaction, wizard):
     таких бойцов нет — шаг автоматически пропускается."""
     events = load_json(EVENTS_FILE, {})
     event = events.get(wizard.event_id, {})
-    accepted = set(await filter_event_project_nicknames(
+    accepted = set(await filter_event_eligible_nicknames(
         event.get('accepted', {}).keys(), event
     ))
 
@@ -8348,6 +8643,13 @@ class OfficeMenuView(discord.ui.LayoutView):
 
         project_roles_select.callback = _project_roles_callback
 
+        outings_button = discord.ui.Button(
+            label=es("🏕️ Переключить участие в вылазках"),
+            style=discord.ButtonStyle.success,
+            custom_id="office_toggle_outings_role"
+        )
+        outings_button.callback = self._toggle_outings_role_callback
+
         # Ссылки остаются обычными link-кнопками Discord, но теперь находятся
         # в том же визуальном контейнере, сразу после выбора проектов.
         site_link_buttons = [
@@ -8377,8 +8679,8 @@ class OfficeMenuView(discord.ui.LayoutView):
             discord.ui.TextDisplay(
                 "## 🛠️  Панель бота для бойцов клана\n"
                 "Здесь есть полезные ссылки на сайте клана, а также можно "
-                "самостоятельно создать мероприятие или выбрать проекты, "
-                "на которых вы хотите играть."
+                "самостоятельно выбрать проекты, отметить участие в вылазках "
+                "или создать мероприятие."
             ),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
             discord.ui.TextDisplay(
@@ -8387,10 +8689,15 @@ class OfficeMenuView(discord.ui.LayoutView):
                 "Чтобы отказаться от игр на проекте, уберите соответствующую отметку."
             ),
             discord.ui.ActionRow(project_roles_select),
+            discord.ui.TextDisplay(
+                "### 🏕️ Участие на вылазках\n"
+                "Если хотите участвовать в клановых вылазках на публичных серверах, "
+                "нажмите кнопку. Повторное нажатие снимет отметку."
+            ),
+            discord.ui.ActionRow(outings_button),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
             discord.ui.TextDisplay("### Полезные ссылки"),
             discord.ui.ActionRow(*site_link_buttons),
-            discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.small),
             discord.ui.ActionRow(vacation_btn, create_btn),
         ]
         self.add_item(discord.ui.Container(*children, accent_color=9881319))
@@ -8400,6 +8707,62 @@ class OfficeMenuView(discord.ui.LayoutView):
             es(f"🏖️ Оформить отпуск можно здесь: {VACATION_RULES_MESSAGE_LINK}"),
             ephemeral=True
         )
+
+    async def _toggle_outings_role_callback(self, interaction: discord.Interaction):
+        member = interaction.user
+        guild = interaction.guild
+
+        if not guild:
+            await interaction.response.send_message(
+                es("⛔ Эта функция доступна только на сервере клана."),
+                ephemeral=True
+            )
+            return
+
+        role = guild.get_role(OUTINGS_ARMA_ROLE_ID)
+        if role is None:
+            await interaction.response.send_message(
+                es(f"❌ Роль «{OUTINGS_ARMA_ROLE_NAME}» не найдена на сервере. Обратитесь к командованию."),
+                ephemeral=True
+            )
+            return
+
+        already_has_role = role in member.roles
+        # Новую отметку могут поставить только действующие бойцы ArmA.
+        # Снять ранее выданную отметку можно и после выхода из состава,
+        # чтобы роль не оставалась у человека навсегда.
+        if not already_has_role and not member_has_klan_arma_role(member):
+            await interaction.response.send_message(
+                es("⛔ Отметка участия в вылазках доступна только бойцам клана ArmA."),
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        try:
+            if already_has_role:
+                await member.remove_roles(
+                    role,
+                    reason="Самостоятельный отказ от участия в клановых вылазках"
+                )
+                result = f"Вы сняли отметку участия в вылазках. Роль «{OUTINGS_ARMA_ROLE_NAME}» удалена."
+            else:
+                await member.add_roles(
+                    role,
+                    reason="Самостоятельная отметка участия в клановых вылазках"
+                )
+                result = f"Вы отметились для участия в клановых вылазках. Роль «{OUTINGS_ARMA_ROLE_NAME}» выдана."
+            await interaction.followup.send(es("✅ ") + result, ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send(
+                es(f"❌ Не удалось изменить роль «{OUTINGS_ARMA_ROLE_NAME}». Проверьте права бота и положение роли в иерархии."),
+                ephemeral=True
+            )
+        except discord.HTTPException as exc:
+            await interaction.followup.send(
+                f"❌ Discord не разрешил изменить роль «{OUTINGS_ARMA_ROLE_NAME}»: {exc}",
+                ephemeral=True
+            )
 
     async def _create_event_callback(self, interaction: discord.Interaction):
         if not member_has_klan_arma_role(interaction.user):
@@ -9140,9 +9503,9 @@ async def handle_event_response(interaction, event_id, response_type):
         await interaction.followup.send(es("⛔ Мероприятие отменено или уже завершено. Отметки не принимаются!"), ephemeral=True)
         return
     nickname = interaction.user.display_name
-    if not member_has_event_project_role(interaction.user, event):
+    if not member_has_event_required_role(interaction.user, event):
         await interaction.followup.send(
-            get_event_project_role_requirement_message(event), ephemeral=True
+            get_event_role_requirement_message(event), ephemeral=True
         )
         return
     current_date = datetime.now(MSK)
@@ -9600,9 +9963,9 @@ async def build_event_embed(event_id: str) -> discord.Embed:
     active_members = await get_active_members(
         event_start_dt, registered_before=event_start_dt, vacation_set=vacation_set, event=event
     )
-    accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
+    accepted = await filter_event_eligible_nicknames(event.get('accepted', {}).keys(), event)
     if event.get('mandatory', True) or TRACK_DECLINED_MARKS_FOR_OPTIONAL_EVENTS:
-        declined = await filter_event_project_nicknames(event.get('declined', {}).keys(), event)
+        declined = await filter_event_eligible_nicknames(event.get('declined', {}).keys(), event)
     else:
         declined = []  # необязательные мероприятия не ведут список отказавшихся
     unmarked = [m for m in active_members if m not in accepted and m not in declined]
@@ -9916,26 +10279,31 @@ async def publish_weekly_kickoff_announcement(week_key: str) -> bool:
             return True
 
         try:
-            week_start = datetime.strptime(f"{week_key}-1", "%G-W%V-%u").date()
-            week_end = week_start + timedelta(days=6)
             channel = await client.fetch_channel(EVENTS_CHANNEL_ID)
 
-            embed = discord.Embed(
-                title="🪖 Новая неделя в клане!",
-                description=(
-                    "Бойцы, началась новая неделя! Впереди тренировки, матчи и общие задачи. "
-                    "Заранее отметьтесь на мероприятиях и спланируйте время."
-                ),
-                color=discord.Color.blue(),
-            )
-            embed.add_field(
-                name="💬 Памятка",
-                value=f"*{random.choice(WEEKLY_KICKOFF_MOTIVATION_LINES)}*",
-                inline=False,
+            # Заметный недельный разделитель на Components V2:
+            # крупный H1, визуальные разделители и прежняя памятка без заголовка.
+            kickoff_view = discord.ui.LayoutView(timeout=None)
+            kickoff_view.add_item(
+                discord.ui.Container(
+                    discord.ui.TextDisplay("# 🪖 Новая неделя в клане!"),
+                    discord.ui.Separator(
+                        visible=True,
+                        spacing=discord.SeparatorSpacing.large,
+                    ),
+                    discord.ui.TextDisplay(
+                        f"*{random.choice(WEEKLY_KICKOFF_MOTIVATION_LINES)}*"
+                    ),
+                    discord.ui.Separator(
+                        visible=True,
+                        spacing=discord.SeparatorSpacing.large,
+                    ),
+                    accent_color=discord.Color.blue().value,
+                )
             )
 
             message = await channel.send(
-                embed=embed,
+                view=kickoff_view,
                 allowed_mentions=discord.AllowedMentions.none(),
             )
 
@@ -10128,7 +10496,7 @@ async def check_event_reminders():
                             mention_block = await build_mentions_for_nicknames(unmarked, event=event)
                             should_send = bool(unmarked)
                         else:
-                            accepted = await filter_event_project_nicknames(event.get('accepted', {}).keys(), event)
+                            accepted = await filter_event_eligible_nicknames(event.get('accepted', {}).keys(), event)
                             mention_block = await build_mentions_for_nicknames(accepted, event=event)
                             should_send = bool(accepted)
                         if should_send:
@@ -10270,10 +10638,10 @@ def event_has_other_acceptors(event: dict) -> bool:
     """True, если на мероприятие отметился «Приду» хотя бы один человек, кроме
     ответственного (создателя) — если он у мероприятия есть."""
     accepted = set((event.get('accepted') or {}).keys())
-    if get_event_project_role_key(event):
+    if get_event_required_role(event) is not None:
         accepted = {
             nickname for nickname in accepted
-            if member_has_event_project_role(
+            if member_has_event_required_role(
                 member_index.get_exact(nickname) or member_index.get_fuzzy(nickname), event
             )
         }
@@ -10406,7 +10774,15 @@ async def update_all_templates():
 
         try:
             panel_msg = await find_or_create_admin_panel_message(admin_channel)
-            await panel_msg.edit(embed=build_admin_panel_embed(), view=AdminMainMenuView())
+            await panel_msg.edit(
+                content=None,
+                embed=None,
+                embeds=[],
+                attachments=[],
+                view=AdminMainMenuView(),
+                allowed_mentions=discord.AllowedMentions.none()
+            )
+            anchors['panel_message_id'] = panel_msg.id
             anchors_fixed += 1
         except Exception as e:
             print(f"⚠️ Не удалось обновить якорь 'Панель управления': {e}")
@@ -11178,12 +11554,16 @@ async def on_member_update(before: discord.Member, after: discord.Member):
         _tech_warning_enqueue_new_online(after)
         _tech_warning_ensure_worker()
 
-    project_role_ids = {ROLE_IDS[key] for key in PROJECT_ROLE_KEYS if ROLE_IDS.get(key)}
+    event_eligibility_role_ids = {
+        ROLE_IDS[key] for key in PROJECT_ROLE_KEYS if ROLE_IDS.get(key)
+    }
+    if OUTINGS_ARMA_ROLE_ID:
+        event_eligibility_role_ids.add(OUTINGS_ARMA_ROLE_ID)
     before_role_ids = {role.id for role in before.roles}
     after_role_ids = {role.id for role in after.roles}
-    if project_role_ids.intersection(before_role_ids ^ after_role_ids):
-        # После смены проектной роли актуализируем списки «Придут / Не придут /
-        # Не отметились» во всех активных мероприятиях.
+    if event_eligibility_role_ids.intersection(before_role_ids ^ after_role_ids):
+        # После смены проектной роли или роли вылазок актуализируем списки
+        # «Придут / Не придут / Не отметились» во всех активных мероприятиях.
         try:
             await refresh_all_active_event_embeds()
         except Exception as e:
