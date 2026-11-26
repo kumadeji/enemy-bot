@@ -36,12 +36,7 @@ from collections import deque as _deque_early
 # идёт пачками раз в 15 секунд, чтобы не спамить и не упираться в rate limit.
 
 LOG_FORWARD_LEVEL = logging.INFO  # при желании поднять до logging.WARNING, если шумно
-# LOG_THREAD_ID больше НЕ используется как фиксированная константа — теперь
-# ветка логов находится динамически через якорное сообщение "🔧 Логирование"
-# в ADMIN_CHANNEL_ID (см. ensure_admin_channel_anchors). Значение ниже — просто
-# запасной ID на случай самого первого запуска ДО того, как якоря созданы
-# (форвардер логов стартует раньше, чем on_ready успевает создать якоря).
-_FALLBACK_LOG_THREAD_ID = None
+# Ветка логов определяется по сохранённому якорному сообщению.
 
 # ============== FILE LOGGING ==============
 
@@ -570,11 +565,14 @@ _ES_REPLACEMENTS = {
     '🖼️ ': '🖼️ㅤ', '🚫 ': '🚫ㅤ', '🎖️ ': '🎖️ㅤ', '🧩 ': '🧩ㅤ',
     '🏁 ': '🏁ㅤ', '🚀 ': '🚀ㅤ', '🔁 ': '🔁ㅤ', '🧹 ': '🧹ㅤ',
     '🎉 ': '🎉ㅤ', '👋 ': '👋ㅤ', '🔒 ': '🔒ㅤ',
+    '⏮️ ': '⏮️ㅤ', '⏸ ': '⏸ㅤ', '⏸️ ': '⏸️ㅤ', '⏹ ': '⏹ㅤ',
+    '▶ ': '▶ㅤ', '♻️ ': '♻️ㅤ', '⚙️ ': '⚙️ㅤ', '➕ ': '➕ㅤ',
+    '⬅️ ': '⬅️ㅤ', '🌙 ': '🌙ㅤ', '🏕️ ': '🏕️ㅤ', '📊 ': '📊ㅤ',
+    '📣 ': '📣ㅤ', '📦 ': '📦ㅤ', '📨 ': '📨ㅤ', '🖱️ ': '🖱️ㅤ',
+    '🗄️ ': '🗄️ㅤ', '🛟 ': '🛟ㅤ', '🧌 ': '🧌ㅤ', '🧟 ': '🧟ㅤ',
 }
-# Один скомпилированный regex вместо 64 последовательных str.replace()
-# на каждый вызов (раньше es() создавала словарь заново и делала 64 прохода
-# по строке при КАЖДОМ вызове — а вызывается она сотни раз за один рендер
-# embed'а/сообщения).
+# Один скомпилированный regex вместо последовательных str.replace()
+# на каждый вызов es(); длинные emoji-последовательности сортируются первыми.
 _ES_PATTERN = re.compile('|'.join(re.escape(k) for k in sorted(_ES_REPLACEMENTS, key=len, reverse=True)))
 
 def es(text):
@@ -3464,51 +3462,41 @@ async def _tech_warning_set_campaign_status(action: str):
 
 
 async def _tech_warning_ensure_panel():
-    """Находит и обновляет постоянную панель для рассылки в Components V2."""
+    """Обновляет постоянную панель технической рассылки без повторной публикации."""
     if not _TECH_WARNING_STATE_READY:
         return
     try:
         channel = client.get_channel(ADMIN_CHANNEL_ID) or await client.fetch_channel(ADMIN_CHANNEL_ID)
-        message = None
-        message_id = TECH_WARNING_STATE.get("panel_message_id")
-        if message_id:
-            try:
-                candidate = await channel.fetch_message(int(message_id))
-                if candidate.author.id == client.user.id:
-                    message = candidate
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException, ValueError, TypeError):
-                message = None
-
-        if message is not None:
-            try:
-                await message.edit(
-                    content=None,
-                    embed=None,
-                    embeds=[],
-                    attachments=[],
-                    view=TechnicalWarningPanelView(),
-                    allowed_mentions=discord.AllowedMentions.none()
-                )
-            except Exception as edit_error:
-                print(f"⚠️ Не удалось преобразовать панель рассылки в Components V2: {edit_error}")
-                try:
-                    await message.delete()
-                except Exception as delete_error:
-                    print(f"❌ Не удалось удалить старую панель рассылки: {delete_error}")
-                    return
-                message = None
+        message = await _find_persistent_bot_message(
+            channel,
+            saved_message_ids=(TECH_WARNING_STATE.get("panel_message_id"),),
+            component_custom_ids=(
+                "technical_warning_start_online",
+                "technical_warning_start_offline",
+                "technical_warning_pause",
+                "technical_warning_resume",
+            ),
+            legacy_titles=(
+                es("🛠️ Панель технических уведомлений"),
+                es("📣 Панель рассылки"),
+            ),
+            history_limit=150,
+        )
 
         if message is None:
             message = await channel.send(
                 view=TechnicalWarningPanelView(),
-                allowed_mentions=discord.AllowedMentions.none()
+                allowed_mentions=discord.AllowedMentions.none(),
             )
+        else:
+            await _edit_persistent_components_v2_message(message, TechnicalWarningPanelView())
 
         TECH_WARNING_STATE["panel_message_id"] = message.id
         _tech_warning_save_state()
-        print(f"✅ Панель рассылки готова в Components V2 (ID: {message.id})")
+        print(f"✅ Панель технической рассылки обновлена (ID: {message.id})")
     except Exception as exc:
-        print(f"⚠️ Не удалось создать/обновить панель рассылки: {exc}")
+        # Не удаляем старое сообщение и не создаём новый дубль при сбое Discord.
+        print(f"⚠️ Не удалось найти или обновить панель технической рассылки: {exc}")
 
 
 def build_vacation_set_for_date(vacations: dict, target_date: datetime) -> set:
@@ -3690,12 +3678,6 @@ async def update_vacation_role(member, has_vacation: bool):
 
 ANCHOR_EMBED_COLOR = discord.Color.blue()
 
-ADMIN_PANEL_DESCRIPTION = (
-    "Здесь вы можете управлять всеми функциями бота через кнопки. "
-    "Функции бота разделены по разделам:\n\n"
-    "1. Мероприятия \n2. Сообщения \n3. Отпуски \n4. Утилиты\n"
-)
-
 NOTIFICATIONS_ANCHOR_DESCRIPTION = (
     "Здесь в ветке публикуются все уведомления с сайта для игроков — "
     "дисциплинарные взыскания, зачтённые отыгрыши и т.п."
@@ -3709,15 +3691,6 @@ LOGGING_ANCHOR_DESCRIPTION = (
 
 BOT_STARTED_AT = datetime.now(MSK)
 
-def build_admin_panel_embed():
-    """Legacy embed builder retained only for identifying old panel messages."""
-    embed = discord.Embed(title=es("🛠️ Панель бота для комбата и заместителей"),
-                           description=ADMIN_PANEL_DESCRIPTION, color=ANCHOR_EMBED_COLOR)
-    started_str = BOT_STARTED_AT.strftime('%d.%m.%Y %H:%M')
-    embed.set_footer(text=f"Последний запуск бота: {started_str} МСК")
-    return embed
-
-
 def _message_has_component_custom_id(message, target_custom_id: str) -> bool:
     """Ищет custom_id рекурсивно в обычных и Components V2 компонентах сообщения."""
     pending = list(getattr(message, "components", ()) or ())
@@ -3727,6 +3700,82 @@ def _message_has_component_custom_id(message, target_custom_id: str) -> bool:
             return True
         pending.extend(getattr(component, "children", ()) or ())
     return False
+
+
+async def _find_persistent_bot_message(
+    channel,
+    *,
+    saved_message_ids=(),
+    fallback_message_ids=(),
+    component_custom_ids=(),
+    legacy_titles=(),
+    history_limit=100,
+):
+    """Ищет уже опубликованное сообщение бота, не создавая дубликат.
+
+    Сначала проверяются сохранённые и известные ID, затем история по custom_id
+    Components V2 или заголовку старого embed. Отсутствующее сообщение
+    (NotFound) допускает переход к следующему способу поиска; ошибки доступа
+    и HTTP пробрасываются вызывающему коду, чтобы он не опубликовал дубль.
+    """
+    candidate_ids = []
+    seen_ids = set()
+    for raw_id in (*tuple(saved_message_ids or ()), *tuple(fallback_message_ids or ())):
+        if raw_id is None or raw_id == "":
+            continue
+        try:
+            message_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if message_id not in seen_ids:
+            seen_ids.add(message_id)
+            candidate_ids.append(message_id)
+
+    for message_id in candidate_ids:
+        try:
+            candidate = await channel.fetch_message(message_id)
+        except discord.NotFound:
+            continue
+        except (discord.Forbidden, discord.HTTPException):
+            raise
+        if client.user and candidate.author.id == client.user.id:
+            return candidate
+
+    custom_ids = tuple(component_custom_ids or ())
+    titles = set(legacy_titles or ())
+    if not custom_ids and not titles:
+        return None
+
+    async for candidate in channel.history(limit=history_limit):
+        if not client.user or candidate.author.id != client.user.id:
+            continue
+        has_legacy_title = any(
+            embed.title in titles for embed in (candidate.embeds or ())
+        )
+        has_component = any(
+            _message_has_component_custom_id(candidate, custom_id)
+            for custom_id in custom_ids
+        )
+        if has_legacy_title or has_component:
+            return candidate
+
+    return None
+
+
+async def _edit_persistent_components_v2_message(message, view, *, attachments=None):
+    """Обновляет постоянное сообщение на месте, сохраняя его ID и закрепление.
+
+    Для очистки старых embeds используется только параметр списка embeds.
+    Это исключает конфликт аргументов discord.py. При ошибке сообщение
+    сохраняется, чтобы не создавать вторую панель поверх первой.
+    """
+    await message.edit(
+        content=None,
+        embeds=[],
+        attachments=[] if attachments is None else attachments,
+        view=view,
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
 
 
 def build_notifications_anchor_embed():
@@ -3740,152 +3789,92 @@ def build_logging_anchor_embed():
 
 
 async def _find_or_create_anchor(channel, title: str, embed_builder, thread_name: str = None, view=None, saved_message_id: int = None):
-    """Ищет якорное сообщение с данным title. Порядок поиска:
-    1) По сохранённому ID (saved_message_id) — самый дешёвый и надёжный
-       способ, добавлен вместо того, чтобы ВСЕГДА сканировать последние
-       50 сообщений канала. Раньше сохранённые ID из ADMIN_ANCHORS_FILE
-       вообще не использовались как первичный путь поиска — при активном
-       админ-канале (50+ сообщений после якоря) скан истории мог не найти
-       старый якорь и создать ДУБЛИКАТ панели/анкоры при каждом рестарте.
-    2) Скан последних 50 сообщений по title — fallback, если сохранённого
-       ID нет или сообщение по нему не найдено (удалено).
-    3) Создание нового сообщения — если не нашли ни первым, ни вторым
-       способом.
-    Возвращает (message, thread_or_None)."""
+    """Находит якорь, обновляет его содержимое и при необходимости ветку.
+
+    Сохранённый ID является главным идентификатором: смена заголовка или
+    описания не должна приводить к публикации нового сообщения. История
+    используется только как fallback, если сохранённое сообщение удалено.
+    Возвращает (message, thread_or_None).
+    """
+    message = None
     if saved_message_id:
         try:
-            message = await channel.fetch_message(saved_message_id)
-            if message.embeds and message.embeds[0].title == title:
-                thread = None
-                if thread_name and message.thread:
-                    thread = message.thread
-                elif thread_name:
-                    try:
-                        thread = await message.create_thread(name=thread_name)
-                    except Exception:
-                        thread = None
-                return message, thread
-        except Exception:
-            pass  # сообщение удалено/недоступно — переходим к скану истории
+            candidate = await channel.fetch_message(int(saved_message_id))
+            if client.user and candidate.author.id == client.user.id:
+                message = candidate
+        except discord.NotFound:
+            pass
+        except (TypeError, ValueError):
+            pass
 
-    async for message in channel.history(limit=50):
-        if message.author.id != client.user.id:
-            continue
-        if message.embeds and message.embeds[0].title == title:
-            thread = None
-            if thread_name and message.thread:
-                thread = message.thread
-            elif thread_name:
-                try:
-                    thread = await message.create_thread(name=thread_name)
-                except Exception:
-                    thread = None
-            return message, thread
+    if message is None:
+        async for candidate in channel.history(limit=100):
+            if not client.user or candidate.author.id != client.user.id:
+                continue
+            if candidate.embeds and candidate.embeds[0].title == title:
+                message = candidate
+                break
 
-    message = await channel.send(embed=embed_builder(), view=view)
+    if message is None:
+        message = await channel.send(embed=embed_builder(), view=view)
+    else:
+        await message.edit(embed=embed_builder(), view=view)
+
     thread = None
     if thread_name:
-        try:
-            thread = await message.create_thread(name=thread_name)
-        except Exception as e:
-            print(f"⚠️ Не удалось создать ветку '{thread_name}': {e}")
+        thread = message.thread
+        if thread is None:
+            try:
+                thread = await message.create_thread(name=thread_name)
+            except Exception as e:
+                print(f"⚠️ Не удалось создать ветку '{thread_name}': {e}")
     return message, thread
 
 
-# Известный ID уже существующего сообщения с панелью управления — используется
-# КАК ПРИОРИТЕТНЫЙ fallback, если ADMIN_ANCHORS_FILE ещё не содержит
-# сохранённый panel_message_id, ИЛИ если заголовок эмбеда с тех пор менялся
-# (например, "Панель управления комбата и заместителей" -> "Панель бота для
-# комбата и заместителей") — старый _find_or_create_anchor сверял заголовок
-# СОХРАНЁННОГО сообщения с ТЕКУЩИМ (новым) заголовком из build_admin_panel_embed
-# и, не найдя совпадения (естественно — заголовок ведь и должен был смениться
-# именно РЕДАКТИРОВАНИЕМ этого сообщения, а не поиском по старому тексту),
-# создавал НОВОЕ сообщение вместо обновления старого.
+# Известный ID ранее опубликованной панели комбата. Нужен как fallback,
+# если локальное хранилище якорей было очищено или восстановлено из старой копии.
 KNOWN_ADMIN_PANEL_MESSAGE_ID = 1545844848815505439
 
 
-async def find_or_create_admin_panel_message(channel):
-    """Ищет старую или новую панель комбата и возвращает её для обновления.
-
-    Приоритет: сохранённый ID -> известный ID -> история (старый embed или
-    новый Components V2 custom_id) -> создание нового Components V2 сообщения.
-    """
-    anchors = load_json(ADMIN_ANCHORS_FILE, {})
-    candidate_id = anchors.get('panel_message_id') or KNOWN_ADMIN_PANEL_MESSAGE_ID
-    if candidate_id:
-        try:
-            message = await channel.fetch_message(int(candidate_id))
-            if message.author.id == client.user.id:
-                anchors['panel_message_id'] = message.id
-                save_json(ADMIN_ANCHORS_FILE, anchors)
-                return message
-        except Exception:
-            pass  # сообщение удалено/недоступно — переходим к скану истории
-
-    legacy_titles = {
-        es("🛠️ Панель управления комбата и заместителей"),
-        es("🛠️ Панель бота для комбата и заместителей"),
-    }
-    async for message in channel.history(limit=100):
-        if message.author.id != client.user.id:
-            continue
-        has_legacy_title = bool(
-            message.embeds and message.embeds[0].title in legacy_titles
-        )
-        has_v2_panel = _message_has_component_custom_id(message, "admin_create_event")
-        if has_legacy_title or has_v2_panel:
-            anchors['panel_message_id'] = message.id
-            save_json(ADMIN_ANCHORS_FILE, anchors)
-            return message
-
-    message = await channel.send(
-        view=AdminMainMenuView(),
-        allowed_mentions=discord.AllowedMentions.none()
+async def _ensure_admin_panel_message(channel, anchors: dict):
+    """Обновляет найденную панель комбата или создаёт её только при отсутствии."""
+    message = await _find_persistent_bot_message(
+        channel,
+        saved_message_ids=(anchors.get('panel_message_id'),),
+        fallback_message_ids=(KNOWN_ADMIN_PANEL_MESSAGE_ID,),
+        component_custom_ids=("admin_create_event", "admin_refresh_templates"),
+        legacy_titles=(
+            es("🛠️ Панель управления комбата и заместителей"),
+            es("🛠️ Панель бота для комбата и заместителей"),
+        ),
+        history_limit=150,
     )
+
+    if message is None:
+        message = await channel.send(
+            view=AdminMainMenuView(),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+    else:
+        await _edit_persistent_components_v2_message(message, AdminMainMenuView())
+
     anchors['panel_message_id'] = message.id
     save_json(ADMIN_ANCHORS_FILE, anchors)
     return message
 
 
 async def ensure_admin_channel_anchors():
-    """Находит/создаёт три якоря админ-канала и обновляет панель в Components V2.
-
-    Сообщение панели обновляется на месте, чтобы сохранить ID и закрепление.
-    Старые content/embed/attachments очищаются, поскольку Components V2
-    использует TextDisplay внутри LayoutView. Остальные два якоря и их ветки
-    уведомлений/логирования не меняются.
-    """
+    """Обновляет постоянную панель комбата и два якоря веток админ-канала."""
     channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
 
-    panel_msg = await find_or_create_admin_panel_message(channel)
     try:
-        await panel_msg.edit(
-            content=None,
-            embed=None,
-            embeds=[],
-            attachments=[],
-            view=AdminMainMenuView(),
-            allowed_mentions=discord.AllowedMentions.none()
-        )
-    except Exception as edit_error:
-        print(f"⚠️ Не удалось преобразовать панель управления в Components V2: {edit_error}")
-        # Если преобразование старого сообщения невозможно, пересоздаём только
-        # саму панель. Ветки уведомлений и логирования ниже остаются нетронутыми.
-        try:
-            await panel_msg.delete()
-        except Exception as delete_error:
-            print(f"❌ Не удалось удалить старую панель управления: {delete_error}")
-            raise
-        panel_msg = await channel.send(
-            view=AdminMainMenuView(),
-            allowed_mentions=discord.AllowedMentions.none()
-        )
-        print(f"✅ Панель управления заново опубликована в Components V2 (ID: {panel_msg.id})")
-    else:
-        print(f"✅ Панель управления обновлена в Components V2 (ID: {panel_msg.id})")
+        panel_msg = await _ensure_admin_panel_message(channel, anchors)
+        print(f"✅ Панель управления обновлена (ID: {panel_msg.id})")
+    except Exception as e:
+        # Не удаляем найденную панель и не публикуем копию при ошибке edit/fetch.
+        print(f"⚠️ Не удалось обновить панель управления: {e}")
 
-    anchors['panel_message_id'] = panel_msg.id
     notif_msg, notif_thread = await _find_or_create_anchor(
         channel, es("ℹ️ Уведомления"),
         build_notifications_anchor_embed, thread_name="ℹ️ Уведомления",
@@ -3905,7 +3894,8 @@ async def ensure_admin_channel_anchors():
         anchors['logging_thread_id'] = log_thread.id
 
     save_json(ADMIN_ANCHORS_FILE, anchors)
-    print("✅ Якорные сообщения админ-канала готовы (панель, уведомления, логирование)")
+    print("✅ Якорные сообщения админ-канала проверены (панель, уведомления, логирование)")
+
 
 
 async def get_notifications_thread_id():
@@ -4074,61 +4064,63 @@ class ServerIntroLayoutView(discord.ui.LayoutView):
 
 
 async def ensure_self_assign_roles_message():
-    """Публикует (или обновляет) приветственное сообщение сервера с выбором
-    ролей в SELF_ASSIGN_CHANNEL_ID. Старое embed-сообщение с выбором ролей
-    удаляется: сообщение Components V2 нельзя получить редактированием
-    обычного сообщения. Имя функции сохранено, чтобы не менять on_ready."""
+    """Обновляет постоянное приветственное сообщение с выбором ролей на месте."""
     channel = await client.fetch_channel(SELF_ASSIGN_CHANNEL_ID)
     image_path = os.path.join(IMAGES_DIR, SERVER_INTRO_IMAGE_FILENAME)
     if not os.path.exists(image_path):
-        print(f"⚠️ Файл {image_path} не найден — приветственное сообщение сервера не опубликовано.")
+        print(f"⚠️ Файл {image_path} не найден — приветственное сообщение сервера не обновлено.")
         return
 
-    no_mentions = discord.AllowedMentions.none()  # упоминания отображаются, но уведомлений не шлют
+    no_mentions = discord.AllowedMentions.none()
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
-
-    # 1) Новое сообщение уже есть — просто обновляем его (текст, вид, картинку).
-    saved_id = anchors.get('server_intro_message_id')
-    if saved_id:
-        try:
-            msg = await channel.fetch_message(saved_id)
-            await msg.edit(
-                view=ServerIntroLayoutView(),
-                attachments=[discord.File(image_path, filename=SERVER_INTRO_IMAGE_FILENAME)],
-                allowed_mentions=no_mentions
-            )
-            return
-        except discord.NotFound:
-            pass  # удалено вручную — создадим заново ниже
-        except Exception as e:
-            print(f"⚠️ Не удалось обновить приветственное сообщение сервера: {e}")
-            return
-
-    # 2) Удаляем старое embed-сообщение с выбором ролей (по сохранённому ID, затем сканом истории).
-    old_id = anchors.get('self_assign_roles_message_id')
-    if old_id:
-        try:
-            old_msg = await channel.fetch_message(old_id)
-            await old_msg.delete()
-        except Exception:
-            pass
     try:
-        async for m in channel.history(limit=50):
-            if m.author.id == client.user.id and m.embeds and m.embeds[0].title == es("🎮 Гостевые роли"):
-                await m.delete()
-    except Exception as e:
-        print(f"⚠️ Не удалось просканировать канал на старое сообщение выбора ролей: {e}")
-    anchors.pop('self_assign_roles_message_id', None)
+        message = await _find_persistent_bot_message(
+            channel,
+            saved_message_ids=(
+                anchors.get('server_intro_message_id'),
+                anchors.get('self_assign_roles_message_id'),
+            ),
+            component_custom_ids=("self_assign_guest_roles",),
+            legacy_titles=(es("🎮 Гостевые роли"),),
+            history_limit=100,
+        )
 
-    # 3) Публикуем новое.
-    msg = await channel.send(
-        view=ServerIntroLayoutView(),
-        file=discord.File(image_path, filename=SERVER_INTRO_IMAGE_FILENAME),
-        allowed_mentions=no_mentions
-    )
-    anchors['server_intro_message_id'] = msg.id
-    save_json(ADMIN_ANCHORS_FILE, anchors)
-    print(f"✅ Опубликовано приветственное сообщение сервера (ID: {msg.id})")
+        image_file = discord.File(image_path, filename=SERVER_INTRO_IMAGE_FILENAME)
+        if message is None:
+            message = await channel.send(
+                view=ServerIntroLayoutView(),
+                file=image_file,
+                allowed_mentions=no_mentions,
+            )
+        else:
+            await _edit_persistent_components_v2_message(
+                message,
+                ServerIntroLayoutView(),
+                attachments=[image_file],
+            )
+
+        anchors['server_intro_message_id'] = message.id
+
+        # Если после предыдущей миграции осталась отдельная старая панель ролей,
+        # удаляем только её — основное приветственное сообщение сохраняет свой ID.
+        legacy_roles_id = anchors.get('self_assign_roles_message_id')
+        if legacy_roles_id and str(legacy_roles_id) != str(message.id):
+            try:
+                legacy_message = await channel.fetch_message(int(legacy_roles_id))
+                if client.user and legacy_message.author.id == client.user.id:
+                    await legacy_message.delete()
+            except discord.NotFound:
+                pass
+            except Exception as cleanup_error:
+                print(f"⚠️ Не удалось удалить отдельную старую панель ролей: {cleanup_error}")
+
+        anchors.pop('self_assign_roles_message_id', None)
+        save_json(ADMIN_ANCHORS_FILE, anchors)
+        print(f"✅ Приветственное сообщение сервера обновлено (ID: {message.id})")
+    except Exception as e:
+        # Не удаляем старое сообщение при временной ошибке редактирования.
+        print(f"⚠️ Не удалось найти или обновить приветственное сообщение сервера: {e}")
+
 
 class IgnoringCommandButtonView(discord.ui.View):
     """Кнопка на еженедельном отчёте проверки бойцов (см. check_spreadsheet) —
@@ -4644,19 +4636,6 @@ class WeeklyEventManageActionsView(discord.ui.View):
             await interaction.response.send_message(es(f"✅ «{name}» удалено."), ephemeral=True)
         else:
             await interaction.response.send_message(es("❌ Не найдено!"), ephemeral=True)
-
-
-def _publish_all_existing_anketas_sync():
-    """Синхронно (в executor) читает ВСЕ документы profiles, сортирует по
-    дате регистрации (createdAt) по возрастанию (сначала самые старые)."""
-    docs = fs_db.collection('profiles').stream()
-    items = []
-    for doc in docs:
-        data = doc.to_dict() or {}
-        created_at_dt = _parse_firestore_dt(data.get('createdAt'))
-        items.append((created_at_dt or datetime.min.replace(tzinfo=pytz.UTC), doc.id, data))
-    items.sort(key=lambda x: x[0])
-    return items
 
 
 async def clear_logging_thread():
@@ -5207,10 +5186,6 @@ def user_can_manage_event_id(user_id: int, event_id: str) -> bool:
     if not event:
         return False
     return user_can_manage_event(user_id, event)
-
-
-def user_can_manage_wizard(user_id: int, wizard) -> bool:
-    return user_can_manage_event_id(user_id, wizard.event_id)
 
 
 def event_created_late(event: dict) -> bool:
@@ -8556,30 +8531,24 @@ KNOWN_VACATION_RULES_MESSAGE_ID = 1536512525535944726
 
 
 async def find_or_create_vacation_rules_message(channel):
-    """Ищет сообщение с правилами отпусков: сначала по сохранённому ID из
-    файла, затем по известному захардкоженному ID (см. выше), затем скан
-    истории как последний fallback, и только потом создаёт новое."""
+    """Находит сообщение с правилами отпусков по сохранённому/известному ID,
+    затем по заголовку. Новое публикуется только если существующее не найдено.
+    """
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
-    candidate_id = anchors.get('vacation_rules_message_id') or KNOWN_VACATION_RULES_MESSAGE_ID
-    if candidate_id:
-        try:
-            message = await channel.fetch_message(candidate_id)
-            if message.author.id == client.user.id:
-                anchors['vacation_rules_message_id'] = message.id
-                save_json(ADMIN_ANCHORS_FILE, anchors)
-                return message
-        except Exception:
-            pass  # сообщение удалено/недоступно — переходим к скану истории
+    message = await _find_persistent_bot_message(
+        channel,
+        saved_message_ids=(anchors.get('vacation_rules_message_id'),),
+        fallback_message_ids=(KNOWN_VACATION_RULES_MESSAGE_ID,),
+        legacy_titles=(es("🏖️ Оформление отпусков"),),
+        history_limit=300,
+    )
 
-    async for message in channel.history(limit=200):
-        if message.author.id != client.user.id:
-            continue
-        if message.embeds and message.embeds[0].title == es("🏖️ Оформление отпусков"):
-            anchors['vacation_rules_message_id'] = message.id
-            save_json(ADMIN_ANCHORS_FILE, anchors)
-            return message
+    if message is None:
+        message = await channel.send(
+            embed=build_vacation_rules_embed(),
+            view=VacationRequestView(),
+        )
 
-    message = await channel.send(embed=build_vacation_rules_embed(), view=VacationRequestView())
     anchors['vacation_rules_message_id'] = message.id
     save_json(ADMIN_ANCHORS_FILE, anchors)
     return message
@@ -8639,12 +8608,23 @@ class OfficeMenuView(discord.ui.LayoutView):
 
         project_roles_select.callback = _project_roles_callback
 
-        outings_button = discord.ui.Button(
-            label=es("🏕️ Переключить участие в вылазках"),
-            style=discord.ButtonStyle.success,
-            custom_id="office_toggle_outings_role"
+        outings_select = discord.ui.Select(
+            placeholder="Участие в вылазках",
+            options=[
+                discord.SelectOption(
+                    label="Переключить участие в вылазках",
+                    value="toggle_outings_role",
+                )
+            ],
+            min_values=1,
+            max_values=1,
+            custom_id="office_outings_role_select",
         )
-        outings_button.callback = self._toggle_outings_role_callback
+
+        async def _outings_select_callback(interaction: discord.Interaction):
+            await self._toggle_outings_role_callback(interaction)
+
+        outings_select.callback = _outings_select_callback
 
         # Ссылки остаются обычными link-кнопками Discord, но теперь находятся
         # в том же визуальном контейнере, сразу после выбора проектов.
@@ -8688,10 +8668,10 @@ class OfficeMenuView(discord.ui.LayoutView):
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
             discord.ui.TextDisplay(
                 "### Участие на вылазках\n"
-                "Отметьте, хотите ли вы участвовать в клановых вылазках на публичных серверах. "
-                "Чтобы отказаться от вылазок, уберите отметку."
+                "Чтобы изменить отметку участия в клановых вылазках на публичных серверах, "
+                "откройте список и выберите единственный пункт. Повторный выбор переключает статус."
             ),
-            discord.ui.ActionRow(outings_button),
+            discord.ui.ActionRow(outings_select),
             discord.ui.Separator(visible=True, spacing=discord.SeparatorSpacing.large),
             discord.ui.TextDisplay("### Полезные ссылки"),
             discord.ui.ActionRow(*site_link_buttons),
@@ -8777,13 +8757,7 @@ class OfficeMenuView(discord.ui.LayoutView):
 
 
 async def ensure_office_message():
-    """Находит и обновляет постоянную панель канцелярии в Components V2.
-
-    Сначала обновляет существующее сообщение на месте: старый Embed/content
-    очищается, а LayoutView становится содержимым того же сообщения. Это
-    сохраняет его ID и закрепление. Если Discord не принимает преобразование,
-    старое сообщение удаляется и панель публикуется заново.
-    """
+    """Обновляет постоянную панель канцелярии на существующем сообщении."""
     guild = member_index.guild
     if not guild:
         return
@@ -8792,77 +8766,33 @@ async def ensure_office_message():
         return
 
     anchors = load_json(ADMIN_ANCHORS_FILE, {})
-    saved_id = anchors.get('office_message_id')
-    message = None
-
-    if saved_id:
-        try:
-            message = await channel.fetch_message(saved_id)
-        except discord.NotFound:
-            message = None
-        except Exception as e:
-            print(f"⚠️ Не удалось найти сохранённую панель канцелярии: {e}")
-            return
-
-    # Если ID якоря отсутствует/устарел, ищем прежнюю панель по заголовку.
-    if message is None:
-        try:
-            async for old_message in channel.history(limit=100):
-                if old_message.author.id != client.user.id:
-                    continue
-                if old_message.embeds and old_message.embeds[0].title == es("🛠️ Панель бота для бойцов клана"):
-                    message = old_message
-                    break
-        except Exception as e:
-            print(f"⚠️ Не удалось просканировать историю канцелярии: {e}")
-
-    # Discord позволяет преобразовать старое Embed-сообщение в Components V2,
-    # если при редактировании явно очистить content, embeds и attachments.
-    # Обновляем на месте, чтобы не менять ссылку/ID и не снимать закрепление.
-    if message is not None:
-        try:
-            await message.edit(
-                content=None,
-                embed=None,
-                embeds=[],
-                attachments=[],
-                view=OfficeMenuView(),
-                allowed_mentions=discord.AllowedMentions.none()
-            )
-            anchors['office_message_id'] = message.id
-            save_json(ADMIN_ANCHORS_FILE, anchors)
-            print(f"✅ Панель канцелярии обновлена в Components V2 (ID: {message.id})")
-            return
-        except Exception as e:
-            print(f"⚠️ Не удалось преобразовать существующую панель в Components V2: {e}")
-            try:
-                await message.delete()
-            except Exception as delete_error:
-                print(f"❌ Не удалось удалить старую панель канцелярии: {delete_error}")
-                return
-
     try:
-        message = await channel.send(
-            view=OfficeMenuView(),
-            allowed_mentions=discord.AllowedMentions.none()
+        message = await _find_persistent_bot_message(
+            channel,
+            saved_message_ids=(anchors.get('office_message_id'),),
+            component_custom_ids=(
+                "office_project_roles_select",
+                "office_outings_role_select",
+                "office_toggle_outings_role",
+            ),
+            legacy_titles=(es("🛠️ Панель бота для бойцов клана"),),
+            history_limit=150,
         )
+
+        if message is None:
+            message = await channel.send(
+                view=OfficeMenuView(),
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        else:
+            await _edit_persistent_components_v2_message(message, OfficeMenuView())
+
+        anchors['office_message_id'] = message.id
+        save_json(ADMIN_ANCHORS_FILE, anchors)
+        print(f"✅ Панель канцелярии обновлена (ID: {message.id})")
     except Exception as e:
-        print(f"❌ Не удалось опубликовать панель канцелярии Components V2: {e}")
-        return
-
-    anchors['office_message_id'] = message.id
-    save_json(ADMIN_ANCHORS_FILE, anchors)
-    print(f"✅ Панель канцелярии опубликована в Components V2 (ID: {message.id})")
-
-
-async def publish_vacation_info(interaction):
-    try:
-        channel = await client.fetch_channel(VACATION_CHANNEL_ID)
-        message = await find_or_create_vacation_rules_message(channel)
-        await message.edit(embed=build_vacation_rules_embed(), view=VacationRequestView())
-        await interaction.response.send_message(es("✅ Правила отпусков опубликованы/обновлены!"), ephemeral=True)
-    except Exception as e:
-        await interaction.response.send_message(f"❌ Ошибка: {e}", ephemeral=True)
+        # Ошибка редактирования не является основанием удалять панель/создавать дубль.
+        print(f"⚠️ Не удалось найти или обновить панель канцелярии: {e}")
 
 
 async def handle_vacation_request(interaction, nickname, start_str, end_str, reason, by_admin):
@@ -10283,7 +10213,7 @@ async def publish_weekly_kickoff_announcement(week_key: str) -> bool:
             kickoff_view = discord.ui.LayoutView(timeout=None)
             kickoff_view.add_item(
                 discord.ui.Container(
-                    discord.ui.TextDisplay("# 🪖 Новая неделя в клане!"),
+                    discord.ui.TextDisplay("# 🚩🚩🚩 Новая неделя в клане!"),
                     discord.ui.Separator(
                         visible=True,
                         spacing=discord.SeparatorSpacing.large,
@@ -10770,16 +10700,7 @@ async def update_all_templates():
         admin_channel = await client.fetch_channel(ADMIN_CHANNEL_ID)
 
         try:
-            panel_msg = await find_or_create_admin_panel_message(admin_channel)
-            await panel_msg.edit(
-                content=None,
-                embed=None,
-                embeds=[],
-                attachments=[],
-                view=AdminMainMenuView(),
-                allowed_mentions=discord.AllowedMentions.none()
-            )
-            anchors['panel_message_id'] = panel_msg.id
+            panel_msg = await _ensure_admin_panel_message(admin_channel, anchors)
             anchors_fixed += 1
         except Exception as e:
             print(f"⚠️ Не удалось обновить якорь 'Панель управления': {e}")
